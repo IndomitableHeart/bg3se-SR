@@ -27,6 +27,8 @@ struct ExtenderConfig
     bool SendCrashReports{ true };
     bool ForceCrashReporting{ false };
     bool EnableAchievements{ true };
+    // Enable Ext.Tolk.* Lua functions for modding (requires Tolk.dll)
+    bool EnableTolkFunctions{ false };
     bool DisableLauncher{ false };
     bool DisableStoryPatching{ false };
     bool DisableStoryCompilation{ true };

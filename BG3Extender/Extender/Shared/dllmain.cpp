@@ -2,6 +2,7 @@
 #include <Extender/Shared/DWriteWrapper.h>
 #include <Extender/Shared/ExtenderConfig.h>
 #include <Extender/ScriptExtender.h>
+#include <Lua/Libs/LuaTolk.h>
 #include "json/json.h"
 #include <ShellAPI.h>
 #include <KnownFolders.h>
@@ -75,6 +76,7 @@ void LoadConfig(std::wstring const & configPath, ExtenderConfig & config)
     ConfigGetBool(root, "ClearOnReset", config.ClearOnReset);
     ConfigGetBool(root, "ShowPerfWarnings", config.ShowPerfWarnings);
     ConfigGetBool(root, "EnableAchievements", config.EnableAchievements);
+    ConfigGetBool(root, "EnableTolkFunctions", config.EnableTolkFunctions);
     ConfigGetBool(root, "DisableLauncher", config.DisableLauncher);
     ConfigGetBool(root, "DisableStoryPatching", config.DisableStoryPatching);
     ConfigGetBool(root, "DisableStoryCompilation", config.DisableStoryCompilation);
@@ -93,7 +95,7 @@ void SetupScriptExtender(HMODULE hModule)
     gExtender = std::make_unique<ScriptExtender>();
     auto & config = gExtender->GetConfig();
     LoadConfig(L"ScriptExtenderSettings.json", config);
-
+    bg3se::lua::tolk::SetAccessibilityEnabled(config.EnableTolkFunctions);
     DisableThreadLibraryCalls(hModule);
     if (config.CreateConsole) {
         gCoreLibPlatformInterface.GlobalConsole->Create();

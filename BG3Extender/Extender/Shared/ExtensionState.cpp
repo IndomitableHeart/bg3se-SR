@@ -2,6 +2,7 @@
 #include <Extender/ScriptExtender.h>
 #include <Extender/Shared/ExtensionState.h>
 #include <Extender/Version.h>
+#include <Lua/Libs/LuaTolk.h>
 #include <fstream>
 #include "json/json.h"
 
@@ -483,8 +484,10 @@ namespace bg3se
 
         // Destroy previous instance first to make sure that no dangling
         // references are made to the old state while constructing the new
+		bg3se::lua::tolk::ShutdownTolkGlobally();
         DoLuaReset();
         OsiWarn("LUA VM reset.");
+		bg3se::lua::tolk::InitializeTolkGlobally();
 
         // Make sure that we won't get destroyed during startup
         IncLuaRefs();

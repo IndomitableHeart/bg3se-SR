@@ -10,6 +10,7 @@
 #include <Lua/Libs/Level.inl>
 #include <Lua/Libs/Localization.inl>
 #include <Lua/Libs/Log.inl>
+#include <Lua/Libs/LuaTolk.inl>
 #include <Lua/Libs/Math.inl>
 #include <Lua/Libs/Mod.inl>
 #include <Lua/Libs/StatAttributes.inl>
@@ -106,6 +107,7 @@ void RegisterSharedLibraries()
     vars::RegisterVarsLib();
     timer::RegisterTimerLib();
     level::RegisterLevelLib();
+    bg3se::lua::tolk::RegisterTolkLib();
 }
 
 void RegisterLibraries()

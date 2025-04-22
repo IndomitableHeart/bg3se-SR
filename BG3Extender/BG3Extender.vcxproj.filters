@@ -504,6 +504,9 @@
     <ClInclude Include="GameDefinitions\Controllers\CharacterTask.h" />
     <ClInclude Include="GameDefinitions\Input.h" />
     <ClInclude Include="GameDefinitions\Controllers\Input.h" />
+    <ClInclude Include="Lua\Libs\LuaTolk.h">
+      <Filter>Lua\Libs</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="BG3Extender.rc" />
@@ -754,6 +757,9 @@
     <None Include="GameDefinitions\DragDrop.inl" />
     <None Include="Lua\Libs\ClientUI\ClassCache.inl" />
     <None Include="GameDefinitions\Controllers\CharacterTask.inl" />
+    <None Include="Lua\Libs\LuaTolk.inl">
+      <Filter>Lua\Libs</Filter>
+    </None>
   </ItemGroup>
   <ItemGroup>
     <Filter Include="GameDefinitions">

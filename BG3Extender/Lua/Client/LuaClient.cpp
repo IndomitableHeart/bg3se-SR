@@ -12,6 +12,12 @@
 
 #include <Lua/Client/ClientEntityReplicationEvents.inl>
 
+// Forward declarations for GlobalFocusMonitor (defined in Module.inl).
+namespace bg3se::ecl::lua::ui {
+    void TickGlobalFocusMonitor();
+    void ResetGlobalFocusMonitor();
+}
+
 BEGIN_NS(ecl::lua)
 
 using namespace bg3se::lua;
@@ -104,6 +110,7 @@ bool ClientState::IsClient()
 void ClientState::OnUpdate(GameTime const& time)
 {
     State::OnUpdate(time);
+    ui::TickGlobalFocusMonitor();
     replicationHooks_.PostUpdate();
     deferredUIEvents_.PostUpdate();
 }
@@ -127,6 +134,7 @@ EntityReplicationEventHooks* ClientState::GetReplicationEventHooks()
 
 void ClientState::OnGameStateChanged(GameState fromState, GameState toState)
 {
+    ui::ResetGlobalFocusMonitor();
     GameStateChangedEvent params{
         .FromState = fromState, 
         .ToState = toState

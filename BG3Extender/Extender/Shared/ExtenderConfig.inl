@@ -47,6 +47,8 @@ void ApplyConfig(ExtenderConfig& config, Document& root)
     ConfigGet(root, "ProfilerLoadCallbackThreshold", config.ProfilerLoadCallbackThreshold);
     ConfigGet(root, "ProfilerCallbackThreshold", config.ProfilerCallbackThreshold);
     ConfigGet(root, "ProfilerClientCallbackThreshold", config.ProfilerClientCallbackThreshold);
+
+    ConfigGet(root, "AccessibilityEnabled", config.AccessibilityEnabled);
 }
 
 void LoadConfig(std::wstring const& configPath, ExtenderConfig& config)

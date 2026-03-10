@@ -1,5 +1,7 @@
 #pragma once
 
+#include <NsGui/UIElement.h>
+
 BEGIN_NS(ecl::lua)
 
 using namespace bg3se::lua;
@@ -55,6 +57,12 @@ struct ViewportResizedEvent : public lua::EventBase
 {
     int Width;
     int Height;
+};
+
+struct UIFocusChangedEvent : public lua::EventBase
+{
+    Noesis::UIElement* OldFocus{ nullptr };
+    Noesis::UIElement* NewFocus{ nullptr };
 };
 
 END_NS()

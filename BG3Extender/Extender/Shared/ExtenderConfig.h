@@ -67,6 +67,8 @@ struct ExtenderConfig
     ProfilerThreshold ProfilerLoadCallbackThreshold{ 50000 };
     ProfilerThreshold ProfilerCallbackThreshold{ 5000 };
     ProfilerThreshold ProfilerClientCallbackThreshold{ 2000 };
+
+    bool AccessibilityEnabled{ false };
 };
 
 inline bool ProfilerShouldReport(uint64_t took, ExtenderConfig const& config, ProfilerThreshold const& threshold)

@@ -9,6 +9,7 @@
 #include <sstream>
 #include <fstream>
 #include <Extender/Shared/ExtenderConfig.inl>
+#include <Lua/Libs/Tolk.h>
 
 using namespace bg3se;
 
@@ -29,6 +30,8 @@ void SetupScriptExtender(HMODULE hModule)
     }
 
     gExtender->Initialize();
+
+    bg3se::lua::tolk::SetAccessibilityEnabled(config.AccessibilityEnabled);
 
 #if 0
     DEBUG(" ***** ScriptExtender setup completed ***** ");

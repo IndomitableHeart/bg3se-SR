@@ -30,6 +30,7 @@
 #include <Lua/Libs/ClientInput.inl>
 #include <Lua/Libs/ClientUI/Module.inl>
 #include <Lua/Libs/ClientIMGUI.inl>
+#include <Lua/Libs/Tolk.inl>
 
 BEGIN_NS(ecl::lua)
 
@@ -132,6 +133,7 @@ void RegisterSharedLibraries()
     table::RegisterTableLib();
     timer::RegisterTimerLib();
     level::RegisterLevelLib();
+    tolk::RegisterTolkLib();
 }
 
 void RegisterLibraries()

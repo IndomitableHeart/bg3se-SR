@@ -2,6 +2,7 @@
 #include <Extender/Client/ExtensionStateClient.h>
 #include <GameDefinitions/Symbols.h>
 #include <Extender/ScriptExtender.h>
+#include <Lua/Libs/Tolk.h>
 
 BEGIN_NS(ecl)
 
@@ -51,6 +52,7 @@ void ExtensionState::OnUpdate(GameTime const& time)
 
 void ExtensionState::ShutdownLuaState()
 {
+    lua::tolk::ShutdownTolkGlobally();
     EnteredCheck();
     if (Lua) {
         Lua->OnShutdown();
@@ -67,6 +69,7 @@ void ExtensionState::InitializeLuaState()
 
     Lua = std::make_unique<lua::ClientState>(*this, nextGenerationId_++);
     Lua->Initialize();
+    lua::tolk::InitializeTolkGlobally();
 }
 
 void ExtensionState::BootstrapLua()

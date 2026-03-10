@@ -125,18 +125,29 @@ private:
 // Forward declarations for focus detection.
 static const Noesis::DependencyProperty* sIsFocusedProp = nullptr;
 static const Noesis::DependencyProperty* sFocusedElementProp = nullptr;
+static const Noesis::DependencyProperty* sIsSelectedProp = nullptr;
+static const Noesis::DependencyProperty* sDataContextProp = nullptr;
+static const Noesis::TypeClass* sListBoxItemType = nullptr;
 void InitFocusProperties(Noesis::FrameworkElement* root);
 Noesis::UIElement* TryFocusManager(Noesis::Visual* elem, int depth,
                                     Noesis::DependencyObject** outScopeRoot = nullptr);
 Noesis::UIElement* FindFocusedInTree(Noesis::Visual* elem, int depth);
+Noesis::UIElement* FindSelectedTabInTree(Noesis::Visual* elem, int depth);
 
 // Forward declaration — defined below, after InitFocusProperties.
 Noesis::UIElement* GetFocusedElement();
 
-// GlobalFocusMonitor: per-frame focus change detector.
-// Checks GetFocusedElement() once per frame during ClientState::OnUpdate.
-// If the focused element changed since last frame, fires a Lua callback
-// via DeferredUIEvents (thread-safe, dispatched in PostUpdate).
+// GlobalFocusMonitor: per-frame focus/selection change detector.
+// Runs Strategies 1+2 (focus) and Strategy 3 (selection) independently.
+// Tracks focus and selection SEPARATELY so neither suppresses the other.
+// Selection changes take priority (tab switch); when the tab is stable,
+// focus changes drive the callback (d-pad navigation, button focus).
+//
+// RECYCLING DETECTION: Noesis carousels virtualise ListBoxItems — the
+// same element object gets reused with swapped DataContext when the user
+// presses RB/LB.  Pointer comparison alone would miss the change.
+// We also compare the selected element's DataContext pointer each frame.
+//
 // No routed event subscriptions — zero HashMap corruption risk.
 class GlobalFocusMonitor
 {
@@ -151,6 +162,9 @@ public:
         lua_pop(L, 1);
         lastFocused_ = nullptr;
         lastFocusedRef_.Reset();
+        lastSelected_ = nullptr;
+        lastSelectedRef_.Reset();
+        lastSelectedDC_ = nullptr;
         return true;
     }
 
@@ -159,6 +173,9 @@ public:
         callback_ = {};
         lastFocused_ = nullptr;
         lastFocusedRef_.Reset();
+        lastSelected_ = nullptr;
+        lastSelectedRef_.Reset();
+        lastSelectedDC_ = nullptr;
     }
 
     bool IsActive() const { return callback_.operator bool(); }
@@ -169,23 +186,108 @@ public:
     {
         if (!callback_) return;
 
-        auto focused = GetFocusedElement();
+        auto root = GetRoot();
+        if (!root) return;
+        InitFocusProperties(root);
 
-        bool changed = (focused != lastFocused_);
-        bool forced = forceNext_;
-        forceNext_ = false;
+        // Strategies 1+2: focus detection.
+        // Also capture the focus scope root for Strategy 3 scoping.
+        Noesis::UIElement* focused = nullptr;
+        Noesis::DependencyObject* scopeRoot = nullptr;
+        if (sFocusedElementProp) {
+            focused = TryFocusManager(root, 20, &scopeRoot);
+        }
+        if (!focused && sIsFocusedProp) {
+            focused = FindFocusedInTree(root, 20);
+        }
 
-        if (changed) {
-            lastFocused_ = focused;
-            if (focused) {
-                lastFocusedRef_ = Noesis::Ptr<Noesis::UIElement>(focused);
-            } else {
-                lastFocusedRef_.Reset();
+        // Strategy 3: tab/selection detection — scoped to the current
+        // focus scope.  Searching from scopeRoot (not the global root)
+        // excludes stale IsSelected items in other panels (e.g., main
+        // menu ListBoxItems behind the Options overlay).
+        // Only matches ListBoxItem-derived types (carousel tabs).
+        Noesis::UIElement* selected = nullptr;
+        if (sIsSelectedProp && sListBoxItemType) {
+            auto searchRoot = scopeRoot
+                ? static_cast<Noesis::Visual*>(scopeRoot)
+                : static_cast<Noesis::Visual*>(root);
+            selected = FindSelectedTabInTree(searchRoot, 20);
+        }
+
+        // Read the selected element's DataContext pointer.
+        // Carousels recycle ListBoxItem containers — the same element
+        // pointer is reused with a different DataContext when the user
+        // presses RB/LB.  Comparing only the element pointer would miss
+        // the tab switch entirely.
+        const void* selectedDC = nullptr;
+        if (selected && sDataContextProp) {
+            auto depObj = static_cast<Noesis::DependencyObject const*>(selected);
+            auto dcVal = sDataContextProp->GetValue(depObj);
+            if (dcVal) {
+                selectedDC = *reinterpret_cast<const void* const*>(dcVal);
             }
         }
 
-        if (changed || forced) {
+        bool forced = forceNext_;
+        forceNext_ = false;
+
+        // Track focus and selection independently — always update both.
+        bool focusChanged = (focused != lastFocused_);
+        // Selection changed if EITHER the element pointer OR its
+        // DataContext changed (handles virtualised/recycled items).
+        bool selectionChanged = (selected != lastSelected_)
+                             || (selectedDC != lastSelectedDC_);
+
+        // ---------------------------------------------------------------
+        // DIAGNOSTIC LOGGING — fires only when something changes.
+        // Shows all key values so we can see exactly what each strategy
+        // found and why we fire (or don't fire) the callback.
+        // ---------------------------------------------------------------
+        if (focusChanged || selectionChanged || forced) {
+            WARN("[BG3Access] Tick: focused=%p scopeRoot=%p selected=%p selDC=%p prevSelDC=%p focChg=%d selChg=%d forced=%d",
+                focused, scopeRoot, selected, selectedDC, lastSelectedDC_, focusChanged, selectionChanged, forced);
+            if (selected) {
+                // Log the type of the selected element so we can verify it's a ListBoxItem.
+                auto selType = selected->GetClassType();
+                auto selTypeId = selType ? selType->GetTypeId() : Noesis::Symbol::Null();
+                WARN("[BG3Access]   selected type=%s", selTypeId.Str() ? selTypeId.Str() : "(null)");
+            }
+            if (!selected && (sIsSelectedProp && sListBoxItemType)) {
+                WARN("[BG3Access]   FindSelectedTabInTree returned NULL (scopeRoot=%p root=%p searched=%s)",
+                    scopeRoot, root, scopeRoot ? "scopeRoot" : "root");
+            }
+        }
+
+        if (focusChanged) {
+            lastFocused_ = focused;
+            lastFocusedRef_ = focused
+                ? Noesis::Ptr<Noesis::UIElement>(focused)
+                : Noesis::Ptr<Noesis::UIElement>();
+        }
+
+        if (selectionChanged) {
+            lastSelected_ = selected;
+            lastSelectedRef_ = selected
+                ? Noesis::Ptr<Noesis::UIElement>(selected)
+                : Noesis::Ptr<Noesis::UIElement>();
+            lastSelectedDC_ = selectedDC;
+        }
+
+        // Fire callback: selection changes take priority (tab switch via
+        // carousel's IsSelected).  When the tab is stable, focus changes
+        // drive the callback (d-pad option navigation, button focus).
+        if (selectionChanged && selected) {
+            WARN("[BG3Access]   -> FIRE selection (tab)");
+            FireCallback(selected);
+        } else if (focusChanged && focused) {
+            WARN("[BG3Access]   -> FIRE focus");
             FireCallback(focused);
+        } else if (forced) {
+            auto best = selected ? selected : focused;
+            if (best) {
+                WARN("[BG3Access]   -> FIRE forced");
+                FireCallback(best);
+            }
         }
     }
 
@@ -193,23 +295,29 @@ public:
     {
         lastFocused_ = nullptr;
         lastFocusedRef_.Reset();
+        lastSelected_ = nullptr;
+        lastSelectedRef_.Reset();
+        lastSelectedDC_ = nullptr;
     }
 
 private:
-    void FireCallback(Noesis::UIElement* focused)
+    void FireCallback(Noesis::UIElement* elem)
     {
         ContextGuardAnyThread ctx(ContextType::Client);
         if (gExtender->GetClient().HasExtensionState()) {
             LuaClientPin pin(gExtender->GetClient().GetExtensionState());
             if (pin) {
                 pin->GetDeferredUIEvents().OnPropertyChanged(
-                    callback_, focused, Noesis::Symbol("FocusedElement"));
+                    callback_, elem, Noesis::Symbol("FocusedElement"));
             }
         }
     }
 
     Noesis::UIElement* lastFocused_ = nullptr;
     Noesis::Ptr<Noesis::UIElement> lastFocusedRef_;
+    Noesis::UIElement* lastSelected_ = nullptr;
+    Noesis::Ptr<Noesis::UIElement> lastSelectedRef_;
+    const void* lastSelectedDC_ = nullptr;    // DataContext ptr — detects recycling
     lua::PersistentRegistryEntry callback_;
     bool forceNext_ = false;
 };
@@ -234,6 +342,27 @@ void InitFocusProperties(Noesis::FrameworkElement* root)
         sFocusedElementProp = Noesis::TypeHelpers::GetDependencyProperty(
             fmClass, bg3se::FixedString("FocusedElement"));
     }
+
+    auto selectorType = Noesis::Reflection::GetType(Noesis::Symbol("Selector"));
+    if (selectorType) {
+        auto selectorClass = static_cast<Noesis::TypeClass const*>(selectorType);
+        sIsSelectedProp = Noesis::TypeHelpers::GetDependencyProperty(
+            selectorClass, bg3se::FixedString("IsSelected"));
+    }
+
+    auto lbiType = Noesis::Reflection::GetType(Noesis::Symbol("ListBoxItem"));
+    if (lbiType) {
+        sListBoxItemType = static_cast<Noesis::TypeClass const*>(lbiType);
+    }
+
+    // DataContext — used to detect ListBoxItem recycling (carousel
+    // virtualisation reuses the same element with swapped data).
+    sDataContextProp = Noesis::TypeHelpers::GetDependencyProperty(
+        root->GetClassType(), bg3se::FixedString("DataContext"));
+
+    // Diagnostic: show what resolved.
+    WARN("[BG3Access] InitFocusProperties: IsFocused=%p FocusedElement=%p IsSelected=%p DataContext=%p ListBoxItemType=%p",
+        sIsFocusedProp, sFocusedElementProp, sIsSelectedProp, sDataContextProp, sListBoxItemType);
 }
 
 // Strategy 1: Walk tree checking FocusManager.FocusedElement.
@@ -285,7 +414,53 @@ Noesis::UIElement* FindFocusedInTree(Noesis::Visual* elem, int depth)
     return nullptr;
 }
 
-// Combined: try FocusManager first, then IsFocused fallback.
+// Helper: check if an element's class derives from ListBoxItem.
+static bool IsListBoxItemType(Noesis::Visual const* elem)
+{
+    if (!sListBoxItemType) return false;
+    auto cls = elem->GetClassType();
+    while (cls) {
+        if (cls == sListBoxItemType) return true;
+        cls = cls->GetBase();
+    }
+    return false;
+}
+
+// Strategy 3: Walk tree checking Selector.IsSelected, filtered to
+// ListBoxItem-derived types only.  Returns FIRST match.
+//
+// WHY filter by type?  In the Options menu, BOTH the carousel tabs
+// (ListBoxItem / LSListBoxItem) AND the content-area options (also
+// wrapped in ListBoxItems by their parent Selector) have IsSelected.
+// Content options from *previously-visited* tabs keep stale IsSelected
+// values.  By returning the FIRST ListBoxItem match and scoping the
+// search to the current focus scope (see Tick), we reliably get the
+// carousel tab — which sits above the content area in the visual tree.
+//
+// Content-area option navigation is handled by Strategies 1+2 (focus).
+Noesis::UIElement* FindSelectedTabInTree(Noesis::Visual* elem, int depth)
+{
+    if (!elem || depth <= 0) return nullptr;
+
+    auto depObj = static_cast<Noesis::DependencyObject const*>(elem);
+    auto val = sIsSelectedProp->GetValue(depObj);
+    if (val && *static_cast<const bool*>(val)) {
+        if (IsListBoxItemType(elem)) {
+            return static_cast<Noesis::UIElement*>(const_cast<Noesis::Visual*>(elem));
+        }
+    }
+
+    auto count = elem->GetVisualChildrenCount();
+    for (uint32_t i = 0; i < count; i++) {
+        auto child = elem->GetVisualChild(i);
+        auto result = FindSelectedTabInTree(child, depth - 1);
+        if (result) return result;
+    }
+
+    return nullptr;
+}
+
+// Combined: try FocusManager first, then IsFocused fallback, then IsSelected.
 Noesis::UIElement* GetFocusedElement()
 {
     auto root = GetRoot();
@@ -302,6 +477,13 @@ Noesis::UIElement* GetFocusedElement()
     // Strategy 2: IsFocused tree walk (keyboard focus required)
     if (sIsFocusedProp) {
         auto focused = FindFocusedInTree(root, 20);
+        if (focused) return focused;
+    }
+
+    // Strategy 3: IsSelected tree walk (for ListBoxItem-derived tab items).
+    // Catches selected tabs that don't have keyboard focus.
+    if (sIsSelectedProp && sListBoxItemType) {
+        auto focused = FindSelectedTabInTree(root, 20);
         if (focused) return focused;
     }
 

@@ -287,6 +287,11 @@ public:
             if (best) {
                 WARN("[BG3Access]   -> FIRE forced");
                 FireCallback(best);
+            } else {
+                // Both null — UI is rebuilding (e.g. Cross-Play tab
+                // destroys and recreates the ListBoxItem tree).
+                // Keep forcing until something reappears.
+                forceNext_ = true;
             }
         }
     }

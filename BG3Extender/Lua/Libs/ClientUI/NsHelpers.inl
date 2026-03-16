@@ -536,13 +536,14 @@ void StoredValueHelpers::PushValue(lua_State* L, Type const* type, StoredValue c
         return;
     }
 
-    // TODO - complex values not supported yet
     if (o->flags.isComplex) {
-        if (o->flags.isExpression) {
-            lua::push(L, nullptr);
-        } else {
-            PushValue(L, type, o->value.complex->base, objectType, propertyName);
-        }
+        // ComplexValue::base holds either the source value (SetValue) or
+        // the cached result of evaluating a binding expression -- see
+        // DependencyObjectValueData.h comment on ComplexValue::base.
+        // Previously this pushed nil for expressions (isExpression=true),
+        // but the framework caches the evaluated result in base, so we
+        // can read it the same way as any other complex value.
+        PushValue(L, type, o->value.complex->base, objectType, propertyName);
     } else {
         PushValue(L, type, o->value.simple, objectType, propertyName);
     }

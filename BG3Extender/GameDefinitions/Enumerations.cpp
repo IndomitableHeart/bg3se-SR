@@ -81,7 +81,7 @@ void RegisterEnumerationTypeInformation()
     for (auto i = 0; i < std::size(gEnumRegistrationTable); i++) {
         auto const& entry = gEnumRegistrationTable[i];
         if (entry.Type == EnumRegistrationType::EnumType) {
-            if (typeInfos.size() <= entry.TypeId) {
+            if (typeInfos.size() <= static_cast<size_t>(entry.TypeId)) {
                 typeInfos.resize(entry.TypeId + 1);
             }
 

@@ -39,6 +39,7 @@ typedef void (*Tolk_Unload_t)();
 typedef bool (*Tolk_Output_t)(const wchar_t* str, bool interrupt);
 typedef bool (*Tolk_Speak_t)(const wchar_t* str, bool interrupt);
 typedef bool (*Tolk_Silence_t)();
+typedef bool (*Tolk_IsSpeaking_t)();
 
 // --- Static Variables for Tolk DLL Handle and Function Pointers ---
 static HMODULE g_tolkModule = nullptr;
@@ -47,6 +48,7 @@ static Tolk_Unload_t g_Tolk_Unload = nullptr;
 static Tolk_Output_t g_Tolk_Output = nullptr;
 static Tolk_Speak_t g_Tolk_Speak = nullptr;
 static Tolk_Silence_t g_Tolk_Silence = nullptr;
+static Tolk_IsSpeaking_t g_Tolk_IsSpeaking = nullptr;
 
 // Protects g_tolkModule handle and function pointers during init/shutdown and access from Lua calls.
 static std::mutex g_tolkFunctionPtrMutex;
@@ -63,7 +65,8 @@ namespace {
         {"Tolk_Unload", (void**)&g_Tolk_Unload},
         {"Tolk_Output", (void**)&g_Tolk_Output},
         {"Tolk_Speak", (void**)&g_Tolk_Speak},
-        {"Tolk_Silence", (void**)&g_Tolk_Silence}
+        {"Tolk_Silence", (void**)&g_Tolk_Silence},
+        {"Tolk_IsSpeaking", (void**)&g_Tolk_IsSpeaking}
     };
     constexpr size_t g_numTolkFuncs = sizeof(g_tolkFunctionMap) / sizeof(g_tolkFunctionMap[0]);
 } // end anonymous namespace
@@ -307,6 +310,34 @@ static UserReturn TolkSilence(lua_State* L) {
     return UserReturn(1);
 }
 
+/// <lua_function>Ext.Tolk.IsSpeaking</lua_function>
+/// Returns true if the screen reader is currently speaking.
+/// Used by the speech queue state machine to drain follow-up text
+/// only when the screen reader is idle, eliminating timing guesses.
+static UserReturn TolkIsSpeaking(lua_State* L) {
+    if (g_tolkState.load() != TolkState::Loaded) {
+        lua_pushboolean(L, false);
+        return UserReturn(1);
+    }
+    bool result = false;
+
+    Tolk_IsSpeaking_t funcPtr = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_tolkFunctionPtrMutex);
+        funcPtr = g_Tolk_IsSpeaking;
+    }
+
+    if (funcPtr) {
+        try {
+            result = funcPtr();
+        } catch (...) {
+            result = false;
+        }
+    }
+    lua_pushboolean(L, result);
+    return UserReturn(1);
+}
+
 /// <lua_function>Ext.Tolk.IsEnabled</lua_function>
 static UserReturn TolkIsEnabled(lua_State* L) {
     lua_pushboolean(L, g_accessibilityEnabled.load());
@@ -324,6 +355,7 @@ void RegisterTolkLib() {
         MODULE_NAMED_FUNCTION("Output", TolkOutput)
         MODULE_NAMED_FUNCTION("Speak", TolkSpeak)
         MODULE_NAMED_FUNCTION("Silence", TolkSilence)
+        MODULE_NAMED_FUNCTION("IsSpeaking", TolkIsSpeaking)
         END_MODULE()
 }
 

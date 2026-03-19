@@ -127,13 +127,172 @@ DeferredUIEvents::DeferredUIEvents(ClientState& state)
     : state_(state)
 {}
 
+// ---------------------------------------------------------------------------
+// PushFocusEventTable: builds a Lua table on the stack from FocusEventData.
+// No Noesis pointers involved -- all data is C++ primitives.
+// ---------------------------------------------------------------------------
+static void PushFocusEventTable(lua_State* L, FocusEventData const& data)
+{
+    lua_newtable(L);
+
+    // eventType (nil for FocusChanged, "PropertyChanged" for INPC)
+    if (!data.eventType.empty()) {
+        lua_pushstring(L, "eventType");
+        lua_pushstring(L, data.eventType.c_str());
+        lua_settable(L, -3);
+    }
+
+    // elemType
+    lua_pushstring(L, "elemType");
+    lua_pushstring(L, data.elemType.c_str());
+    lua_settable(L, -3);
+
+    // elemName
+    lua_pushstring(L, "elemName");
+    if (!data.elemName.empty()) {
+        lua_pushstring(L, data.elemName.c_str());
+    } else {
+        lua_pushnil(L);
+    }
+    lua_settable(L, -3);
+
+    // elemId
+    lua_pushstring(L, "elemId");
+    lua_pushstring(L, data.elemId.c_str());
+    lua_settable(L, -3);
+
+    // isTab
+    lua_pushstring(L, "isTab");
+    lua_pushboolean(L, data.isTab);
+    lua_settable(L, -3);
+
+    // isFocusable
+    lua_pushstring(L, "isFocusable");
+    lua_pushboolean(L, data.isFocusable);
+    lua_settable(L, -3);
+
+    // dcType
+    lua_pushstring(L, "dcType");
+    if (!data.dcType.empty()) {
+        lua_pushstring(L, data.dcType.c_str());
+    } else {
+        lua_pushnil(L);
+    }
+    lua_settable(L, -3);
+
+    // dcProps: flat table with scalar values + nested sub-tables
+    lua_pushstring(L, "dcProps");
+    if (!data.dcScalarProps.empty() || !data.dcObjectProps.empty()) {
+        lua_newtable(L);
+
+        // Scalar properties
+        for (auto const& kv : data.dcScalarProps) {
+            lua_pushstring(L, kv.first.c_str());
+            lua_pushstring(L, kv.second.c_str());
+            lua_settable(L, -3);
+        }
+
+        // Object properties (nested tables)
+        for (auto const& obj : data.dcObjectProps) {
+            lua_newtable(L);
+            // _type field
+            lua_pushstring(L, "_type");
+            lua_pushstring(L, obj.typeName.c_str());
+            lua_settable(L, -3);
+            // Sub-properties
+            for (auto const& kv : obj.props) {
+                lua_pushstring(L, kv.first.c_str());
+                lua_pushstring(L, kv.second.c_str());
+                lua_settable(L, -3);
+            }
+            // Set as dcProps[propName]
+            lua_pushstring(L, obj.propName.c_str());
+            lua_insert(L, -2);  // swap key and nested table
+            lua_settable(L, -3);
+        }
+    } else {
+        lua_pushnil(L);
+    }
+    lua_settable(L, -3);
+
+    // elemText
+    lua_pushstring(L, "elemText");
+    if (!data.elemText.empty()) {
+        lua_pushstring(L, data.elemText.c_str());
+    } else {
+        lua_pushnil(L);
+    }
+    lua_settable(L, -3);
+
+    // tabName
+    lua_pushstring(L, "tabName");
+    if (!data.tabName.empty()) {
+        lua_pushstring(L, data.tabName.c_str());
+    } else {
+        lua_pushnil(L);
+    }
+    lua_settable(L, -3);
+
+    // widgetRootId
+    lua_pushstring(L, "widgetRootId");
+    if (!data.widgetRootId.empty()) {
+        lua_pushstring(L, data.widgetRootId.c_str());
+    } else {
+        lua_pushnil(L);
+    }
+    lua_settable(L, -3);
+
+    // bindings: array of {property, path, value} tables
+    if (!data.bindings.empty()) {
+        lua_pushstring(L, "bindings");
+        lua_newtable(L);
+        int bindingIndex = 1;
+        for (auto const& bindingInfo : data.bindings) {
+            lua_newtable(L);
+
+            lua_pushstring(L, "property");
+            lua_pushstring(L, bindingInfo.propertyName.c_str());
+            lua_settable(L, -3);
+
+            lua_pushstring(L, "path");
+            lua_pushstring(L, bindingInfo.bindingPath.c_str());
+            lua_settable(L, -3);
+
+            lua_pushstring(L, "value");
+            if (!bindingInfo.resolvedValue.empty()) {
+                lua_pushstring(L, bindingInfo.resolvedValue.c_str());
+            } else {
+                lua_pushnil(L);
+            }
+            lua_settable(L, -3);
+
+            lua_rawseti(L, -2, bindingIndex++);
+        }
+        lua_settable(L, -3);
+    }
+
+    // namedTexts: {elementName = resolvedText, ...} from NameScope iteration
+    if (!data.namedTexts.empty()) {
+        lua_pushstring(L, "namedTexts");
+        lua_newtable(L);
+        for (auto const& entry : data.namedTexts) {
+            lua_pushstring(L, entry.first.c_str());
+            lua_pushstring(L, entry.second.c_str());
+            lua_settable(L, -3);
+        }
+        lua_settable(L, -3);
+    }
+}
+
 void DeferredUIEvents::PostUpdate()
 {
     Array<DeferredCommand> commands;
     Array<DeferredPropertyChange> propertyChanges;
-    // Avoid corruption if commands/prop changes are queued during update
+    Array<DeferredFocusChange> focusChanges;
+    // Avoid corruption if events are queued during update
     std::swap(commands, commands_);
     std::swap(propertyChanges, propertyChanges_);
+    std::swap(focusChanges, focusChanges_);
 
     auto L = state_.GetState();
     for (auto const& command : commands) {
@@ -141,6 +300,25 @@ void DeferredUIEvents::PostUpdate()
         handler.Call(L, { command.Command.GetPtr(), command.Parameter.GetPtr() });
     }
 
+    // Focus changes: push data table + prop name to Lua callback.
+    // The callback receives (table, "FocusedElement") instead of (element, symbol).
+    for (auto const& change : focusChanges) {
+        if (!change.Handler.TryPush(L)) continue;
+        // Stack: handler_function
+        PushFocusEventTable(L, change.Data);
+        // Stack: handler_function, data_table
+        lua_pushstring(L, "FocusedElement");
+        // Stack: handler_function, data_table, "FocusedElement"
+        if (lua_pcall(L, 2, 0, 0) != LUA_OK) {
+            auto err = lua_tostring(L, -1);
+            ERR("[BG3Access] Focus callback error: %s", err ? err : "(unknown)");
+            lua_pop(L, 1);
+        }
+    }
+
+    // Property change events: used by INPCMonitor, DPMonitor, and
+    // custom property write callbacks.  Widget-added events now use
+    // the focus change path (data tables, no Noesis elements).
     for (auto const& change : propertyChanges) {
         LuaDelegate<void(Noesis::BaseComponent*, Noesis::Symbol)> handler(L, change.Handler.ToRef(L));
         handler.Call(L, { change.Object.GetPtr(), change.Property });
@@ -162,6 +340,14 @@ void DeferredUIEvents::OnPropertyChanged(lua::PersistentRegistryEntry const& han
         .Handler = handler,
         .Object = Noesis::Ptr(object),
         .Property = property
+    });
+}
+
+void DeferredUIEvents::OnFocusChanged(lua::PersistentRegistryEntry const& handler, FocusEventData&& data)
+{
+    focusChanges_.push_back(DeferredFocusChange{
+        .Handler = handler,
+        .Data = std::move(data)
     });
 }
 

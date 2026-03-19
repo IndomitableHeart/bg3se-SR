@@ -8,18 +8,48 @@ Symbol StaticSymbol()
     return SymbolInfo<T>::Name;
 }
 
+// SEH probe: tests whether a BaseObject pointer is still alive by touching
+// its vtable.  Pure C-style function -- no C++ objects with destructors
+// allowed inside __try.  WARN uses printf-style formatting (no C++ objects).
+static bool ProbeObjectAlive(BaseObject const* o)
+{
+    __try {
+            volatile TypeClass const* probe = o->GetClassType();
+        (void)probe;
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 TypeClass* ObjectHelpers::GetClassType(BaseObject const* o)
 {
+    if (!o) return nullptr;
+    if (!ProbeObjectAlive(o)) {
+        WARN("[BG3Access] SEH: dead object in GetClassType, ptr=%p", o);
+        return nullptr;
+    }
     return const_cast<TypeClass*>(o->GetClassType());
 }
 
 Symbol ObjectHelpers::GetClassTypeName(BaseObject const* o)
 {
+    if (!o) return {};
+    if (!ProbeObjectAlive(o)) {
+        WARN("[BG3Access] SEH: dead object in GetClassTypeName, ptr=%p", o);
+        return {};
+    }
     return o->GetClassType()->GetTypeId();
 }
 
 bg3se::STDString ObjectHelpers::ToString(BaseObject const* o)
 {
+    if (!o) return {};
+    if (!ProbeObjectAlive(o)) {
+        WARN("[BG3Access] SEH: dead object in ToString, ptr=%p", o);
+        return {};
+    }
     return o->ToString().Str();
 }
 

@@ -187,14 +187,37 @@ struct SelectionDirtyDelegate
 {
     void Handler(Noesis::BaseComponent* source, const Noesis::RoutedEventArgs& args)
     {
-        sSelectionDirtyFlag = true;
-        // Store the address of the newly selected item (never dereferenced).
+        // Only fire for tab carousel selections, not inline carousels.
+        // Tab carousels select ListBoxItems; inline carousels (Face,
+        // Skin Colour) select content items that are NOT ListBoxItems.
+        // Without this filter, pressing left/right on an inline carousel
+        // triggers a 6-frame settle and suppresses speech.
         auto& selArgs = static_cast<const Noesis::SelectionChangedEventArgs&>(args);
         if (selArgs.addedItems.Size() > 0) {
-            sSelectionChangedItemAddr = reinterpret_cast<uintptr_t>(selArgs.addedItems[0].GetPtr());
+            auto addedItem = selArgs.addedItems[0].GetPtr();
+            if (addedItem && sListBoxItemType) {
+                // Walk the type hierarchy to check for ListBoxItem.
+                bool isListBoxItem = false;
+                auto itemClass = addedItem->GetClassType();
+                while (itemClass) {
+                    if (itemClass == sListBoxItemType) {
+                        isListBoxItem = true;
+                        break;
+                    }
+                    itemClass = itemClass->GetBase();
+                }
+                if (!isListBoxItem) {
+                    // Inline carousel selection -- ignore.
+                    return;
+                }
+            }
+            sSelectionChangedItemAddr = reinterpret_cast<uintptr_t>(addedItem);
         } else {
-            sSelectionChangedItemAddr = 0;
+            // No items added (deselection or focus-follows-selection in
+            // ItemsControl).  Not a tab switch -- ignore.
+            return;
         }
+        sSelectionDirtyFlag = true;
     }
 };
 
@@ -319,35 +342,6 @@ public:
         if (!root) return;
         InitFocusProperties(root);
 
-        // ----- Tree settle: countdown -----
-        // While settling, skip the entire tick body.  Noesis is rebuilding
-        // the visual tree; walking it would hit destroyed nodes.
-        if (treeSettleFrames_ > 0) {
-            treeSettleFrames_--;
-            // Swallow any SelectionChanged events that fire during settle.
-            // These are Noesis rebuild noise (element teardown/recreation),
-            // not user input.  Without this, each rebuild event chains
-            // another 3-frame settle, delaying speech indefinitely.
-            sSelectionDirtyFlag = false;
-            if (treeSettleFrames_ == 0) {
-                WARN("[BG3Access] Tree settle complete -- forcing re-scan");
-                forceNext_ = true;
-                postSettle_ = true;
-                // Wipe focus/selection state so the post-settle tick
-                // re-detects them as fresh changes.
-                // Do NOT wipe prevWidgetAddrs_ -- the widget set didn't
-                // necessarily change.  If a widget was genuinely added
-                // during settle, its new address won't match the old set
-                // and Strategy 4 will detect it.  Wiping would make every
-                // existing widget look "new" and trigger false widgetAdded
-                // events that race with NameScope population.
-                lastFocusedAddr_ = 0;
-                lastSelectedAddr_ = 0;
-                lastSelectedDCAddr_ = 0;
-            }
-            return;
-        }
-
         // ----- Dynamic widget container discovery -----
         auto rootAddr = reinterpret_cast<uintptr_t>(root);
         if (rootAddr != cachedRootAddr_) {
@@ -381,32 +375,63 @@ public:
             }
         }
 
-        // ----- Tree settle: arm on ANY structural change -----
-        // SelectionChanged or widget set change means Noesis is building
-        // or rebuilding UI elements.  Bindings, NameScope entries, and
-        // layout haven't resolved yet.  Arm a 6-frame settle window:
-        // NO strategies, NO tree walks, NO snapshots.
-        // After 6 frames, ONE normal tick grabs everything fresh.
-        bool shouldArmSettle = false;
+        // ----- Dynamic tree settle -----
+        // Instead of a fixed frame count, wait until NOTHING changes for
+        // 3 consecutive frames.  "Change" = SelectionChanged event OR
+        // widget set change.  This adapts to however long Noesis takes
+        // to finish building -- no guessing, no double-settle chaining.
+        // Hard cap at 30 frames (~500ms) to prevent infinite settling.
+        bool somethingChanged = false;
         if (sSelectionDirtyFlag) {
-            WARN("[BG3Access] SelectionChanged event -- arming settle (6 frames)");
             sSelectionDirtyFlag = false;
             sSelectionChangedItemAddr = 0;
-            shouldArmSettle = true;
+            somethingChanged = true;
         }
         if (widgetSetJustChanged && hadFocusBefore_) {
-            WARN("[BG3Access] Widget set changed -- arming settle (6 frames)");
-            // Update widget baseline so the post-settle tick doesn't
-            // re-detect the same change and loop forever.
+            // Update widget baseline so next tick can detect further changes.
             prevWidgetCount_ = widgetCount;
             for (uint32_t i = 0; i < kMaxWidgets; i++)
                 prevWidgetAddrs_[i] = (i < widgetCount)
                     ? reinterpret_cast<uintptr_t>(widgets[i]) : 0;
-            shouldArmSettle = true;
+            somethingChanged = true;
         }
-        if (shouldArmSettle) {
-            treeSettleFrames_ = 6;
-            return;
+
+        if (somethingChanged) {
+            if (!settling_) {
+                WARN("[BG3Access] Settle: started (waiting for stability)");
+                settling_ = true;
+                settleStableCount_ = 0;
+                settleTotalCount_ = 0;
+            } else {
+                // Something changed during settle -- reset stability counter.
+                settleStableCount_ = 0;
+            }
+        }
+
+        if (settling_) {
+            settleTotalCount_++;
+            if (somethingChanged) {
+                settleStableCount_ = 0;
+            } else {
+                settleStableCount_++;
+            }
+
+            if (settleStableCount_ >= 3 || settleTotalCount_ >= 30) {
+                // Stable for 3 frames or hard cap reached.
+                WARN("[BG3Access] Settle: complete after %u frames (%u stable)",
+                     settleTotalCount_, settleStableCount_);
+                settling_ = false;
+                settleStableCount_ = 0;
+                settleTotalCount_ = 0;
+                forceNext_ = true;
+                postSettle_ = true;
+                lastFocusedAddr_ = 0;
+                lastSelectedAddr_ = 0;
+                lastSelectedDCAddr_ = 0;
+            } else {
+                // Still settling -- skip tick body.
+                return;
+            }
         }
 
         // ----- Normal tick: tree is stable, safe to walk -----
@@ -612,12 +637,8 @@ public:
             }
         }
 
-        // When widgets change, cancel any pending deferred work that
-        // references elements from the old widget set.
+        // When widgets change, reset selection tracking.
         if (widgetSetChanged) {
-            pendingNamedTexts_ = false;
-            namedTextsSettleCount_ = 0;
-            pendingNamedTextsWidgetAddr_ = 0;
             initialSelectionDone_ = false;
         }
 
@@ -675,23 +696,7 @@ public:
                     cls = cls->GetBase();
                 }
             }
-            if (isTab) {
-                pendingNamedTexts_ = true;
-                namedTextsSettleCount_ = 10;  // fallback only; WidgetDCChanged is the primary path
-                // Store the widget root address for deferred collection.
-                // Walk up from the selected element NOW (it's valid this
-                // tick) and save the address as uintptr_t.  The deferred
-                // path will re-find this widget in the live widget list.
-                pendingNamedTextsWidgetAddr_ = 0;
-                Noesis::Visual* cur = static_cast<Noesis::Visual*>(selected);
-                for (int depth = 0; depth < 64 && cur; depth++) {
-                    if (IsUIWidgetType(cur)) {
-                        pendingNamedTextsWidgetAddr_ = reinterpret_cast<uintptr_t>(cur);
-                        break;
-                    }
-                    cur = cur->mVisualParent;
-                }
-            }
+            (void)isTab;  // Used only for diagnostic/future expansion.
         }
 
         // ----- Fire callbacks (priority: selection > focus > forced) -----
@@ -809,45 +814,14 @@ public:
 
         // ----- Deferred namedTexts re-collection on tab switch -----
         // After a tab switch, wait for Noesis to update Visibility states
-        // then re-collect namedTexts from the widget.  Fires a dedicated
-        // "TabNamedTexts" event so Lua can speak tab-specific authored text.
-        // ----- Deferred tab speech fallback -----
-        // After a tab switch, Lua stores pendingTabData and waits for
-        // WidgetDCChanged (which carries fresh namedTexts) to assemble
-        // speech.  This timer is a fallback for menus where WidgetDCChanged
-        // doesn't fire (e.g. difficulty selection).  Sends an EMPTY
-        // TabNamedTexts event -- no stale NameScope collection.  Lua
-        // speaks with whatever data pendingTabData already has (tab name,
-        // dcBody, etc.).
-        if (pendingNamedTexts_) {
-            // If the widget DC is dirty, the batched WidgetDCChanged fire
-            // (below) will deliver namedTexts with fresh data.  Don't let
-            // the fallback race ahead and consume pendingTabData with empty
-            // namedTexts.
-            if (widgetDCDirty_) {
-                // Reset the settle counter so the fallback doesn't fire
-                // on the same tick as the batched WidgetDCChanged.
-                // If WidgetDCChanged clears pendingNamedTexts_, this is moot.
-            } else {
-                namedTextsSettleCount_--;
-                if (namedTextsSettleCount_ <= 0) {
-                    pendingNamedTexts_ = false;
-                    WARN("[BG3Access]   -> TabNamedTexts fallback (0 entries) -> snapshot");
-                    // Signal the snapshot that tab content is ready.
-                    // Empty namedTexts -- Lua uses whatever pendingTabData already has.
-                    if (!snapshot->selectionChanged) {
-                        snapshot->selectionChanged = true;
-                    }
-                }
-            }
-        }
-
         // Track whether we've ever had focus (for Strategy 4 guard).
         if (focused || selected) hadFocusBefore_ = true;
 
         // Keep polling when nothing is focused (give new widgets time
-        // to settle and acquire focus).
-        if (!focused && !selected) {
+        // to settle and acquire focus).  Cap at 30 ticks to avoid
+        // infinite loops when focus never arrives (e.g., CC cutscene
+        // transition where selected stays non-null but focused stays null).
+        if (!focused) {
             if (widgetSetChanged) overlayPollCount_ = 0;
             if (overlayPollCount_ < 30) {
                 forceNext_ = true;
@@ -865,10 +839,14 @@ public:
         // callback (SubscribeElementINPC) already carries the full DC data
         // for the newly selected element.  Firing INPC on the same tick
         // would double-speak the exact same text.
-        // Element INPC: just clear the dirty flag.  The snapshot builder
-        // at the end of Tick() re-reads DC props and does delta comparison.
-        // No separate dispatch needed.
-        inpcDirty_ = false;
+        // Element INPC: the ViewModel notified us that a property changed.
+        // Trust the notification and set valueChanged in the snapshot.
+        // The delta comparison on dcScalarProps misses sub-object changes
+        // (e.g. SelectedItem in comboboxes), so INPC is the reliable trigger.
+        if (inpcDirty_) {
+            inpcDirty_ = false;
+            snapshot->valueChanged = true;
+        }
 
         if (widgetDCDirty_ && callback_ && widgetInpcWidgetAddr_ != 0) {
             widgetDCDirty_ = false;
@@ -940,12 +918,19 @@ public:
         // ----- Inline carousel detection -----
         // Appearance rows have child ListBoxes (face, skin colour, etc.).
         // When left/right changes the SelectedItem, no focus event fires.
-        // Each tick, if focus hasn't changed, find the child ListBox under
-        // the focused element, read SelectedItem.Name or SelectedItem.ColorName,
-        // and fire a focus callback if the text changed.
-        // Only runs when focus is stable (no focus/selection change this tick).
+        // Each tick, find the child ListBox under the focused element, read
+        // SelectedItem.Name or SelectedItem.ColorName, and include the
+        // value in the snapshot if it changed.
+        // Runs on EVERY tick with a focused element, including focus changes,
+        // so the carousel value arrives in the SAME snapshot as the category.
         // Uses the THIS-FRAME focused pointer (not the stored address).
-        if (focused && !focusChanged) {
+        //
+        // Clear previous carousel text on focus change so the new element's
+        // carousel value is always detected as a change.
+        if (focusChanged) {
+            lastInlineCarouselText_.clear();
+        }
+        if (focused) {
             auto focusedElement = static_cast<Noesis::FrameworkElement*>(focused);
             // BFS for a child TextBlock named "selectionName" (the
             // AppearanceCarousel template's value display).  Also look
@@ -1012,12 +997,8 @@ public:
             }
         }
 
-        // Clear inline carousel state on focus change so the next
-        // carousel row starts fresh and INPC suppression ends.
-        if (focusChanged) {
-            lastInlineCarouselText_.clear();
-
-        }
+        // (Focus-change clear moved above carousel scan so the value
+        // is detected as a change on the same tick as the focus change.)
 
         // ===== SNAPSHOT FINALIZATION =====
         // The snapshot has been populated throughout Tick().
@@ -1054,25 +1035,18 @@ public:
             // into snapshot by ExtractWidgetData() and the widgetDCDirty
             // handler above.  No accumulator reads needed.
 
-            // Settling logic: after tab selection change, wait a few frames
-            if (selectionChanged && snapshot->focusedElement.isTab) {
-                settleFramesRemaining_ = 3;
-            }
-            if (settleFramesRemaining_ > 0) {
-                settleFramesRemaining_--;
-                if (settleFramesRemaining_ == 0 && pendingINPCSubscription_) {
-                    // UI has settled -- use THIS frame's fresh element.
-                    CommitINPCSubscription(focused ? focused : selected);
-                }
-            } else if (pendingINPCSubscription_) {
-                // No settling needed (non-tab focus change).
+            // Commit pending INPC subscription immediately.
+            // The old settleFramesRemaining_ mechanism delayed this for
+            // 3 frames after tab changes, but also suppressed focus
+            // dispatches (lobby focus on multiplayer entry).  The 6-frame
+            // tree settle window already handles timing; no second settle.
+            if (pendingINPCSubscription_) {
                 CommitINPCSubscription(focused ? focused : selected);
             }
 
             // Delta comparison: has anything meaningful changed?
             bool shouldDispatch = false;
-            if (snapshot->focusChanged &&
-                snapshot->focusedElement.elemId != previousSnapshotElemId_) {
+            if (snapshot->focusChanged) {
                 shouldDispatch = true;
             }
             if (snapshot->inlineCarouselChanged) {
@@ -1091,15 +1065,13 @@ public:
                 shouldDispatch = true;
             }
 
-            // Suppress during settling (except the initial tab change,
-            // widget adds, and carousels)
-            if (settleFramesRemaining_ > 0
-                && !snapshot->selectionChanged
-                && !snapshot->widgetAdded
-                && !snapshot->inlineCarouselChanged) {
-                shouldDispatch = false;
-            }
-
+            // After settle, wait for focus to arrive before dispatching.
+            // On menus like multiplayer, the tab selection settles first
+            // but focus on the first item takes one extra tick.  Without
+            // this, the screen entry dispatches without the focused item,
+            // then the focused item dispatches separately and interrupts.
+            // When focus arrives, selectionChanged is re-detected (lastSelectedAddr_
+            // was wiped) so the snapshot contains BOTH sel=1 and focus=1.
             // If a SelectionChanged event fired DURING this tick (carousel
             // recycling, binding updates), the tree isn't truly stable yet.
             // Suppress this dispatch and re-arm settle so the next post-settle
@@ -1108,7 +1080,9 @@ public:
                 WARN("[BG3Access] SelectionChanged during tick -- re-arming settle, suppressing dispatch");
                 sSelectionDirtyFlag = false;
                 sSelectionChangedItemAddr = 0;
-                treeSettleFrames_ = 6;
+                settling_ = true;
+                settleStableCount_ = 0;
+                settleTotalCount_ = 0;
                 return;
             }
 
@@ -1177,14 +1151,13 @@ public:
         hadFocusBefore_ = false;
         initialSelectionDone_ = false;
         sSelectionDirtyFlag = false;
-        pendingNamedTexts_ = false;
-        namedTextsSettleCount_ = 0;
-        pendingNamedTextsWidgetAddr_ = 0;
         inpcDirty_ = false;
         widgetDCDirty_ = false;
         widgetInpcDCAddr_ = 0;
         widgetInpcWidgetAddr_ = 0;
-        treeSettleFrames_ = 0;
+        settling_ = false;
+        settleStableCount_ = 0;
+        settleTotalCount_ = 0;
         for (uint32_t i = 0; i < kMaxWidgets; i++) {
             prevWidgetAddrs_[i] = 0;
         }
@@ -1353,9 +1326,7 @@ private:
     {
         // Batch per frame: just set dirty flag.  The tick fires ONE
         // WidgetDCChanged event instead of one per property change.
-        // Also cancel the fallback timer since we know the DC changed.
         widgetDCDirty_ = true;
-        pendingNamedTexts_ = false;
     }
 
     // Focus/selection tracking.
@@ -1416,9 +1387,6 @@ private:
     // Deferred namedTexts re-collection after tab switch.
     // Waits for Noesis to update Visibility states before collecting
     // so IsElementVisible can reliably filter cross-tab TextBlocks.
-    bool pendingNamedTexts_ = false;
-    int namedTextsSettleCount_ = 0;
-    uintptr_t pendingNamedTextsWidgetAddr_ = 0;  // widget address, verified against live widgets before use
 
     // Widgets that already have a SelectionChanged handler.
     // Subscribe-only pattern (never Remove) -- track addresses to avoid
@@ -1435,14 +1403,15 @@ private:
     std::string previousSnapshotElemId_;    // Delta: last sent elemId
     std::string previousSnapshotCarousel_;  // Delta: last sent inline carousel value
     std::vector<std::pair<std::string, std::string>> previousSnapshotDCProps_; // Delta: last sent DC props
-    int settleFramesRemaining_ = 0;        // Settling: frames left before sending
 
     // Tree settle: number of frames to skip ALL tree walks after a
     // selection change or widget set change.  Noesis tears down and
     // rebuilds parts of the visual tree during tab switches; walking
     // it mid-rebuild crashes on destroyed nodes.  This gives the layout
     // engine time to finish before we re-enter the tree.
-    int treeSettleFrames_ = 0;
+    bool settling_ = false;
+    uint32_t settleStableCount_ = 0;
+    uint32_t settleTotalCount_ = 0;
 
     // (Accumulators removed -- snapshot is a local in Tick(), populated directly.)
 

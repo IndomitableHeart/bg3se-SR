@@ -284,21 +284,29 @@ static void PushFocusEventTable(lua_State* L, FocusEventData const& data)
     }
 }
 
+// Forward declaration (defined after PostUpdate).
+static void PushTickSnapshotTable(lua_State* L, TickSnapshot const& snapshot);
+
 void DeferredUIEvents::PostUpdate()
 {
     Array<DeferredCommand> commands;
     Array<DeferredPropertyChange> propertyChanges;
     Array<DeferredFocusChange> focusChanges;
+    Array<DeferredTickSnapshot> tickSnapshots;
     // Avoid corruption if events are queued during update
     std::swap(commands, commands_);
     std::swap(propertyChanges, propertyChanges_);
     std::swap(focusChanges, focusChanges_);
+    std::swap(tickSnapshots, tickSnapshots_);
 
     auto L = state_.GetState();
     for (auto const& command : commands) {
         LuaDelegate<void(Noesis::BaseCommand*, Noesis::BaseComponent*)> handler(L, command.Handler.ToRef(L));
         handler.Call(L, { command.Command.GetPtr(), command.Parameter.GetPtr() });
     }
+
+    // Legacy priority filter deleted -- snapshot system handles all
+    // event resolution in Tick() via delta comparison.
 
     // Focus changes: push data table + prop name to Lua callback.
     // The callback receives (table, "FocusedElement") instead of (element, symbol).
@@ -322,6 +330,19 @@ void DeferredUIEvents::PostUpdate()
     for (auto const& change : propertyChanges) {
         LuaDelegate<void(Noesis::BaseComponent*, Noesis::Symbol)> handler(L, change.Handler.ToRef(L));
         handler.Call(L, { change.Object.GetPtr(), change.Property });
+    }
+
+    // Tick snapshots: one-per-frame state packages.
+    // The snapshot callback receives (snapshotTable, "TickSnapshot").
+    for (auto const& snapshot : tickSnapshots) {
+        if (!snapshot.Handler.TryPush(L)) continue;
+        PushTickSnapshotTable(L, snapshot.Snapshot);
+        lua_pushstring(L, "TickSnapshot");
+        if (lua_pcall(L, 2, 0, 0) != LUA_OK) {
+            auto err = lua_tostring(L, -1);
+            ERR("[BG3Access] Tick snapshot callback error: %s", err ? err : "(unknown)");
+            lua_pop(L, 1);
+        }
     }
 }
 
@@ -349,6 +370,65 @@ void DeferredUIEvents::OnFocusChanged(lua::PersistentRegistryEntry const& handle
         .Handler = handler,
         .Data = std::move(data)
     });
+}
+
+void DeferredUIEvents::OnTickSnapshot(lua::PersistentRegistryEntry const& handler, TickSnapshot&& snapshot)
+{
+    tickSnapshots_.push_back(DeferredTickSnapshot{
+        .Handler = handler,
+        .Snapshot = std::move(snapshot)
+    });
+}
+
+// ---------------------------------------------------------------------------
+// PushTickSnapshotTable: builds a Lua table from a TickSnapshot.
+// Contains change flags + full focused element data + inline carousel value.
+// ---------------------------------------------------------------------------
+static void PushTickSnapshotTable(lua_State* L, TickSnapshot const& snapshot)
+{
+    lua_newtable(L);
+
+    // Change flags
+    lua_pushstring(L, "focusChanged");
+    lua_pushboolean(L, snapshot.focusChanged);
+    lua_settable(L, -3);
+
+    lua_pushstring(L, "selectionChanged");
+    lua_pushboolean(L, snapshot.selectionChanged);
+    lua_settable(L, -3);
+
+    lua_pushstring(L, "valueChanged");
+    lua_pushboolean(L, snapshot.valueChanged);
+    lua_settable(L, -3);
+
+    lua_pushstring(L, "inlineCarouselChanged");
+    lua_pushboolean(L, snapshot.inlineCarouselChanged);
+    lua_settable(L, -3);
+
+    lua_pushstring(L, "widgetAdded");
+    lua_pushboolean(L, snapshot.widgetAdded);
+    lua_settable(L, -3);
+
+    // Inline carousel value
+    lua_pushstring(L, "inlineCarouselValue");
+    if (!snapshot.inlineCarouselValue.empty()) {
+        lua_pushstring(L, snapshot.inlineCarouselValue.c_str());
+    } else {
+        lua_pushnil(L);
+    }
+    lua_settable(L, -3);
+
+    // Focused element data (nested table using existing builder)
+    lua_pushstring(L, "focusedElement");
+    PushFocusEventTable(L, snapshot.focusedElement);
+    lua_settable(L, -3);
+
+    // Widget data (nested table, only if widgetAdded)
+    if (snapshot.widgetAdded) {
+        lua_pushstring(L, "widgetData");
+        PushFocusEventTable(L, snapshot.widgetData);
+        lua_settable(L, -3);
+    }
 }
 
 END_NS()

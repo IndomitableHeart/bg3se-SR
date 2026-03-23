@@ -83,104 +83,8 @@ Noesis::FrameworkElement* GetRoot()
 // Lua invocation during PostUpdate().
 // ---------------------------------------------------------------------------
 
-// INPCMonitor: subscribes to INotifyPropertyChanged on a ViewModel.
-// Used to detect value changes (tickbox toggle, slider adjust, combo select).
-class INPCMonitor
-{
-public:
-    static INPCMonitor& Instance() { static INPCMonitor inst; return inst; }
-
-    bool Subscribe(lua_State* L, Noesis::BaseComponent* target, lua::RegistryEntry&& callback)
-    {
-        Unsubscribe();
-        auto notifies = Noesis::DynamicCast<Noesis::INotifyPropertyChanged*, Noesis::BaseComponent*>(target);
-        if (!notifies) return false;
-
-        target_ = notifies;
-        callback.Push(L);
-        callback_ = lua::PersistentRegistryEntry(L, -1);
-        lua_pop(L, 1);
-
-        notifies->PropertyChanged().Add(
-            Noesis::MakeDelegate(this, &INPCMonitor::OnChanged));
-        return true;
-    }
-
-    void Unsubscribe()
-    {
-        // Don't call Remove on a potentially dead object.
-        target_ = nullptr;
-        callback_ = {};
-    }
-
-private:
-    void OnChanged(Noesis::BaseComponent* sender,
-                   const Noesis::PropertyChangedEventArgs& args)
-    {
-        if (!callback_) return;
-        ContextGuardAnyThread ctx(ContextType::Client);
-        if (gExtender->GetClient().HasExtensionState()) {
-            LuaClientPin pin(gExtender->GetClient().GetExtensionState());
-            if (pin) {
-                pin->GetDeferredUIEvents().OnPropertyChanged(
-                    callback_, sender, args.propertyName);
-            }
-        }
-    }
-
-    Noesis::INotifyPropertyChanged* target_ = nullptr;
-    lua::PersistentRegistryEntry callback_;
-};
-
-// DPMonitor: subscribes to DependencyPropertyChanged on a UI element.
-// Used to detect when a data-bound property (e.g. TextBlock.Text) resolves.
-// Mirrors INPCMonitor's singleton pattern and deferred callback mechanism.
-class DPMonitor
-{
-public:
-    static DPMonitor& Instance() { static DPMonitor inst; return inst; }
-
-    bool Subscribe(lua_State* L, Noesis::DependencyObject* target, lua::RegistryEntry&& callback)
-    {
-        Unsubscribe();
-        if (!target) return false;
-
-        target_ = target;
-        callback.Push(L);
-        callback_ = lua::PersistentRegistryEntry(L, -1);
-        lua_pop(L, 1);
-
-        target->mDependencyPropertyChangedEvent.Add(
-            Noesis::MakeDelegate(this, &DPMonitor::OnChanged));
-        return true;
-    }
-
-    void Unsubscribe()
-    {
-        // Don't call Remove on a potentially dead object.
-        target_ = nullptr;
-        callback_ = {};
-    }
-
-private:
-    void OnChanged(Noesis::BaseComponent* sender,
-                   const Noesis::DependencyPropertyChangedEventArgs& args)
-    {
-        if (!callback_) return;
-        ContextGuardAnyThread ctx(ContextType::Client);
-        if (gExtender->GetClient().HasExtensionState()) {
-            LuaClientPin pin(gExtender->GetClient().GetExtensionState());
-            if (pin) {
-                // Reuse OnPropertyChanged -- same signature (handler, sender, propName).
-                pin->GetDeferredUIEvents().OnPropertyChanged(
-                    callback_, sender, args.prop->GetName());
-            }
-        }
-    }
-
-    Noesis::DependencyObject* target_ = nullptr;
-    lua::PersistentRegistryEntry callback_;
-};
+// Legacy INPCMonitor and DPMonitor deleted -- snapshot system handles all
+// property change detection via dirty flags and delta comparison in Tick().
 
 // Forward declarations for focus detection.
 static const Noesis::DependencyProperty* sIsFocusedProp = nullptr;
@@ -215,10 +119,10 @@ static Noesis::RoutedEvent* sSelectionChangedEvent = nullptr;
 // SelectionChanged event handler outputs.  Read and cleared in Tick().
 // Single-threaded: Noesis events fire on the main thread, stable during Tick.
 static bool sSelectionDirtyFlag = false;
-// The newly selected element from the last SelectionChanged event.
-// May be a ListBoxItem (container) or a ViewModel (data object).
-// Strategy 3 uses this directly instead of tree-walking.
-static Noesis::BaseComponent* sSelectionChangedItem = nullptr;
+// Address of the newly selected element from the last SelectionChanged event.
+// Stored as uintptr_t -- NEVER cast back to a pointer.  Used only to check
+// whether the selected item is a ListBoxItem by finding it fresh in the tree.
+static uintptr_t sSelectionChangedItemAddr = 0;
 void InitFocusProperties(Noesis::FrameworkElement* root);
 Noesis::UIElement* TryFocusManager(Noesis::Visual* elem, int depth,
                                     Noesis::DependencyObject** outScopeRoot = nullptr);
@@ -284,12 +188,12 @@ struct SelectionDirtyDelegate
     void Handler(Noesis::BaseComponent* source, const Noesis::RoutedEventArgs& args)
     {
         sSelectionDirtyFlag = true;
-        // Extract the newly selected item from SelectionChangedEventArgs.
+        // Store the address of the newly selected item (never dereferenced).
         auto& selArgs = static_cast<const Noesis::SelectionChangedEventArgs&>(args);
         if (selArgs.addedItems.Size() > 0) {
-            sSelectionChangedItem = selArgs.addedItems[0].GetPtr();
+            sSelectionChangedItemAddr = reinterpret_cast<uintptr_t>(selArgs.addedItems[0].GetPtr());
         } else {
-            sSelectionChangedItem = nullptr;
+            sSelectionChangedItemAddr = 0;
         }
     }
 };
@@ -299,11 +203,60 @@ struct SelectionDirtyDelegate
 static SelectionDirtyDelegate* const kSelectionDirtyDelegatePtr =
     reinterpret_cast<SelectionDirtyDelegate*>(static_cast<uintptr_t>(0xACC5E1));
 
+// Forward declarations for free functions used by GlobalFocusMonitor::Tick().
+static std::string ShallowChildTextScan(Noesis::FrameworkElement* elem);
+static std::string ExtractTabName(Noesis::FrameworkElement* elem);
+
+// Forward declaration for ReadTypePropertyAsString (defined later in file).
+static std::string ReadTypePropertyAsString(Noesis::BaseObject const* obj,
+                                             Noesis::TypeProperty const* prop);
+
+// Inner SEH-safe function: finds the SelectedItem's BaseObject pointer
+// from a ListBox.  No C++ objects with destructors -- SEH compatible.
+// Resolve the SelectedItem FixedString once, outside SEH.
+static FixedString sSelectedItemKey;
+
+static Noesis::BaseObject* GetListBoxSelectedItem(Noesis::FrameworkElement* listBox)
+{
+    if (!sSelectedItemKey) {
+        sSelectedItemKey = FixedString("SelectedItem");
+    }
+    auto const& listBoxClass = Noesis::gClassCache.GetClass(
+        listBox->GetClassType());
+    auto selectedItemProp = listBoxClass.Names.try_get(sSelectedItemKey);
+    if (!selectedItemProp || !selectedItemProp->Property) return nullptr;
+
+    auto selectedItemRaw = selectedItemProp->Property->Get(listBox);
+    if (!selectedItemRaw) return nullptr;
+
+    return *reinterpret_cast<Noesis::BaseObject* const*>(selectedItemRaw);
+}
+
+// Outer function: reads Name/ColorName/Title from the SelectedItem.
+// Uses std::string so cannot contain __try.
+static std::string TryReadInlineCarouselText(Noesis::FrameworkElement* listBox)
+{
+    auto selectedItem = GetListBoxSelectedItem(listBox);
+    if (!selectedItem) return {};
+
+    auto const& selectedItemClass = Noesis::gClassCache.GetClass(
+        selectedItem->GetClassType());
+    const char* propertyNames[] = {"Name", "ColorName", "Title"};
+    for (auto candidatePropName : propertyNames) {
+        auto propKey = FixedString(candidatePropName);
+        auto propInfo = selectedItemClass.Names.try_get(propKey);
+        if (propInfo && propInfo->Property) {
+            auto text = ReadTypePropertyAsString(selectedItem, propInfo->Property);
+            if (!text.empty()) return text;
+        }
+    }
+    return {};
+}
+
 class GlobalFocusMonitor
 {
 public:
     static constexpr uint32_t kMaxWidgets = 16;
-    static constexpr int kWidgetSettleTicks = 10;  // ~150ms at 60fps, ~70ms at 144fps
     // Max recursion depth for tree walks.  IsVisible pruning eliminates
     // collapsed branches, so only visible nodes are visited.  100 is safe
     // (~6KB stack) and prevents silent truncation in deeply templated menus
@@ -318,34 +271,30 @@ public:
         callback.Push(L);
         callback_ = lua::PersistentRegistryEntry(L, -1);
         lua_pop(L, 1);
-        lastFocused_ = nullptr;
-        lastSelected_ = nullptr;
-        lastSelectedDC_ = nullptr;
-        cachedRoot_ = nullptr;
+        lastFocusedAddr_ = 0;
+        lastSelectedAddr_ = 0;
+        lastSelectedDCAddr_ = 0;
+        cachedRootAddr_ = 0;
         widgetContainer_ = nullptr;
         prevWidgetCount_ = 0;
         hadFocusBefore_ = false;
-        pendingWidgetFire_ = false;
-        widgetSettleCount_ = 0;
         initialSelectionDone_ = false;
         sSelectionDirtyFlag = false;
         for (uint32_t i = 0; i < kMaxWidgets; i++) {
-            prevWidgets_[i] = nullptr;
-            preAddWidgets_[i] = nullptr;
+            prevWidgetAddrs_[i] = 0;
         }
-        preAddWidgetCount_ = 0;
         return true;
     }
 
     void Unsubscribe()
     {
-        UnsubscribeINPC();
-        UnsubscribeWidgetINPC();
         UnsubscribeAllSelectionChanged();
         callback_ = {};
-        lastFocused_ = nullptr;
-        lastSelected_ = nullptr;
-        lastSelectedDC_ = nullptr;
+        lastFocusedAddr_ = 0;
+        lastSelectedAddr_ = 0;
+        lastSelectedDCAddr_ = 0;
+        widgetInpcDCAddr_ = 0;
+        widgetInpcWidgetAddr_ = 0;
     }
 
     bool IsActive() const { return callback_.operator bool(); }
@@ -356,15 +305,53 @@ public:
     {
         if (!callback_) return;
 
+        // Guard: Noesis visual trees are single-threaded.  Larian's job
+        // system may dispatch OnUpdate on a worker thread during async
+        // operations (e.g. lobby loading).  Skip Tick() if we're not on
+        // the thread that initialized the monitor.
+        if (mainThreadId_ == 0) {
+            mainThreadId_ = GetCurrentThreadId();
+        } else if (GetCurrentThreadId() != mainThreadId_) {
+            return;
+        }
+
         auto root = GetRoot();
         if (!root) return;
         InitFocusProperties(root);
 
+        // ----- Tree settle: countdown -----
+        // While settling, skip the entire tick body.  Noesis is rebuilding
+        // the visual tree; walking it would hit destroyed nodes.
+        if (treeSettleFrames_ > 0) {
+            treeSettleFrames_--;
+            // Swallow any SelectionChanged events that fire during settle.
+            // These are Noesis rebuild noise (element teardown/recreation),
+            // not user input.  Without this, each rebuild event chains
+            // another 3-frame settle, delaying speech indefinitely.
+            sSelectionDirtyFlag = false;
+            if (treeSettleFrames_ == 0) {
+                WARN("[BG3Access] Tree settle complete -- forcing re-scan");
+                forceNext_ = true;
+                postSettle_ = true;
+                // Wipe focus/selection state so the post-settle tick
+                // re-detects them as fresh changes.
+                // Do NOT wipe prevWidgetAddrs_ -- the widget set didn't
+                // necessarily change.  If a widget was genuinely added
+                // during settle, its new address won't match the old set
+                // and Strategy 4 will detect it.  Wiping would make every
+                // existing widget look "new" and trigger false widgetAdded
+                // events that race with NameScope population.
+                lastFocusedAddr_ = 0;
+                lastSelectedAddr_ = 0;
+                lastSelectedDCAddr_ = 0;
+            }
+            return;
+        }
+
         // ----- Dynamic widget container discovery -----
-        // When root changes (state transition rebuilds the entire tree),
-        // re-discover the container.  Also retry if previously null.
-        if (root != cachedRoot_) {
-            cachedRoot_ = root;
+        auto rootAddr = reinterpret_cast<uintptr_t>(root);
+        if (rootAddr != cachedRootAddr_) {
+            cachedRootAddr_ = rootAddr;
             widgetContainer_ = FindWidgetContainer(root);
         }
         if (!widgetContainer_) {
@@ -381,9 +368,54 @@ public:
                 widgets[i] = widgetContainer_->GetVisualChild(i);
         }
 
+        // ----- Quick widget set change check -----
+        bool widgetSetJustChanged = false;
+        if (widgetCount != prevWidgetCount_) {
+            widgetSetJustChanged = true;
+        } else if (widgetCount > 0) {
+            for (uint32_t i = 0; i < widgetCount; i++) {
+                if (reinterpret_cast<uintptr_t>(widgets[i]) != prevWidgetAddrs_[i]) {
+                    widgetSetJustChanged = true;
+                    break;
+                }
+            }
+        }
+
+        // ----- Tree settle: arm on ANY structural change -----
+        // SelectionChanged or widget set change means Noesis is building
+        // or rebuilding UI elements.  Bindings, NameScope entries, and
+        // layout haven't resolved yet.  Arm a 6-frame settle window:
+        // NO strategies, NO tree walks, NO snapshots.
+        // After 6 frames, ONE normal tick grabs everything fresh.
+        bool shouldArmSettle = false;
+        if (sSelectionDirtyFlag) {
+            WARN("[BG3Access] SelectionChanged event -- arming settle (6 frames)");
+            sSelectionDirtyFlag = false;
+            sSelectionChangedItemAddr = 0;
+            shouldArmSettle = true;
+        }
+        if (widgetSetJustChanged && hadFocusBefore_) {
+            WARN("[BG3Access] Widget set changed -- arming settle (6 frames)");
+            // Update widget baseline so the post-settle tick doesn't
+            // re-detect the same change and loop forever.
+            prevWidgetCount_ = widgetCount;
+            for (uint32_t i = 0; i < kMaxWidgets; i++)
+                prevWidgetAddrs_[i] = (i < widgetCount)
+                    ? reinterpret_cast<uintptr_t>(widgets[i]) : 0;
+            shouldArmSettle = true;
+        }
+        if (shouldArmSettle) {
+            treeSettleFrames_ = 6;
+            return;
+        }
+
+        // ----- Normal tick: tree is stable, safe to walk -----
+
+        // Per-tick snapshot: heap-allocated to reduce Tick() stack frame.
+        auto snapshotPtr = std::make_unique<ecl::lua::TickSnapshot>();
+        auto snapshot = snapshotPtr.get();
+
         // ----- Lazy FocusedElement property discovery -----
-        // FocusManager type may not resolve via Reflection::GetType() in
-        // the Indie SDK.  Scan widget mValues to find the attached property.
         if (!sFocusedElementProp && widgetCount > 0) {
             TryDiscoverFocusedElementProp(widgets, widgetCount);
         }
@@ -401,6 +433,11 @@ public:
                 focused = TryFocusManager(widgets[i], kMaxTreeDepth, &scopeRoot);
                 if (focused) break;
             }
+        } else if (root) {
+            // FALLBACK: Some menus (e.g. Character Creation) attach
+            // elements directly under the root Canvas without ls.UIWidget
+            // wrappers.  widgetCount is 0 but focus still exists.
+            focused = TryFocusManager(root, kMaxTreeDepth, &scopeRoot);
         }
 
         // ----- Strategy 2: IsFocused + ls:MoveFocus.IsFocused tree walk -----
@@ -408,13 +445,21 @@ public:
         // Walks the visual tree checking ls:MoveFocus.IsFocused first
         // (controller focus), then UIElement.IsFocused (keyboard focus).
         // IsVisible pruning skips collapsed branches for speed.
-        if (!focused && (sIsFocusedProp || sLSMoveFocusIsFocusedProp) && widgetCount > 0) {
-            for (int i = (int)widgetCount - 1; i >= 0; i--) {
-                if (!widgets[i] || !IsVisibleDP(widgets[i])) continue;
-                focused = FindFocusedInTree(widgets[i], kMaxTreeDepth);
+        if (!focused && (sIsFocusedProp || sLSMoveFocusIsFocusedProp)) {
+            if (widgetCount > 0) {
+                for (int i = (int)widgetCount - 1; i >= 0; i--) {
+                    if (!widgets[i] || !IsVisibleDP(widgets[i])) continue;
+                    focused = FindFocusedInTree(widgets[i], kMaxTreeDepth);
+                    if (focused) {
+                        scopeRoot = static_cast<Noesis::DependencyObject*>(widgets[i]);
+                        break;
+                    }
+                }
+            } else if (root) {
+                // FALLBACK: Scan the root directly when no widgets exist.
+                focused = FindFocusedInTree(root, kMaxTreeDepth);
                 if (focused) {
-                    scopeRoot = static_cast<Noesis::DependencyObject*>(widgets[i]);
-                    break;
+                    scopeRoot = static_cast<Noesis::DependencyObject*>(root);
                 }
             }
         }
@@ -430,24 +475,16 @@ public:
         }
 
         // ----- Strategy 3: IsSelected (event-gated when available) -----
-        bool selectionEventFired = sSelectionDirtyFlag;
-        sSelectionDirtyFlag = false;
+        // sSelectionDirtyFlag is already consumed at the top of Tick()
+        // (it arms the settle window).  By the time we reach here, any
+        // selection event has been through settle and the tree is stable.
+        // The only ways Strategy 3 runs on this tick are: forceNext_
+        // (post-settle), !initialSelectionDone_ (first entry), or no
+        // event subscription (polling fallback).
 
-        // Quick widget change check for Strategy 3 gating (full detection
-        // is in Strategy 4 below).  New widgets may have pre-selected tabs.
-        bool widgetsLikelyChanged = (widgetCount != prevWidgetCount_);
-        if (!widgetsLikelyChanged && widgetCount > 0) {
-            // Check first and last widget pointers as a fast heuristic.
-            if (widgets[0] != prevWidgets_[0]
-                || widgets[widgetCount - 1] != prevWidgets_[widgetCount - 1])
-                widgetsLikelyChanged = true;
-        }
         // Only reset initialSelectionDone_ when widgets are ADDED (new
         // menu entry), not when they're swapped (tab content change).
-        // Tab switches within the same menu fire SelectionChanged which
-        // already triggers Strategy 3 via the dirty flag -- resetting
-        // initialSelectionDone_ would cause a redundant second run.
-        if (widgetsLikelyChanged && widgetCount > prevWidgetCount_) {
+        if (widgetSetJustChanged && widgetCount > prevWidgetCount_) {
             initialSelectionDone_ = false;
         }
 
@@ -455,7 +492,6 @@ public:
         // Without subscription, falls back to polling every frame.
         bool shouldRunStrategy3 = !sSelectionChangedEvent
                                || subscribedWidgetCount_ == 0
-                               || selectionEventFired
                                || !initialSelectionDone_
                                || forceNext_;
 
@@ -463,27 +499,12 @@ public:
         if (sIsSelectedProp && sListBoxItemType && shouldRunStrategy3) {
             strategy3Runs_++;
             initialSelectionDone_ = true;
+            sSelectionChangedItemAddr = 0;
 
-            // FAST PATH: use the element from SelectionChanged event args.
-            // The event handler already extracted addedItems[0] -- use it
-            // directly if it's a ListBoxItem.  Zero tree walking.
-            if (selectionEventFired && sSelectionChangedItem) {
-                auto itemCls = sSelectionChangedItem->GetClassType();
-                bool isListBoxItem = false;
-                while (itemCls) {
-                    if (itemCls == sListBoxItemType) { isListBoxItem = true; break; }
-                    itemCls = itemCls->GetBase();
-                }
-                if (isListBoxItem) {
-                    selected = static_cast<Noesis::UIElement*>(sSelectionChangedItem);
-                    WARN("[BG3Access]   Strategy3: got selected from event args: %p", selected);
-                }
-            }
-            sSelectionChangedItem = nullptr;
-
-            // SLOW PATH: tree walk fallback for initial detection (no event
-            // fired yet) or when the event item wasn't a ListBoxItem.
-            if (!selected) {
+            // Tree walk: find the currently selected ListBoxItem fresh.
+            // The SelectionChanged event's dirty flag told us SOMETHING
+            // changed; the walk finds exactly WHAT is selected now.
+            {
                 if (scopeRoot) {
                     selected = FindSelectedTabInTree(
                         static_cast<Noesis::Visual*>(scopeRoot), kMaxTreeDepth);
@@ -499,7 +520,7 @@ public:
                 }
             }
 
-            if (selected != lastSelected_) strategy3Changes_++;
+            if (reinterpret_cast<uintptr_t>(selected) != lastSelectedAddr_) strategy3Changes_++;
             if (strategy3Runs_ % 300 == 0) {
                 WARN("[BG3Access] Strategy3 stats: %u runs, %u changes (%.1f%% wasted)",
                     strategy3Runs_, strategy3Changes_,
@@ -508,24 +529,31 @@ public:
                         : 0.0);
             }
         } else if (sIsSelectedProp && sListBoxItemType) {
-            // Strategy 3 skipped -- preserve last known state for
-            // VALUE COMPARISON ONLY.  Do not dereference this pointer.
-            selected = lastSelected_;
-            sSelectionChangedItem = nullptr;  // consume stale event data
+            // Strategy 3 skipped -- preserve last known address for
+            // comparison only.  selected stays null (not safe to dereference).
+            // selectedAddr below handles the comparison.
+            sSelectionChangedItemAddr = 0;  // consume stale event data
         }
 
         // Track whether selected was found fresh this tick (safe to
-        // dereference) vs preserved from a previous tick (comparison only).
-        bool selectedIsFresh = (selected != nullptr && selected != lastSelected_)
-                            || (selected != nullptr && shouldRunStrategy3);
+        // dereference) vs not found (Strategy 3 was skipped).
+        // selected is always fresh when non-null because it was obtained
+        // from this frame's focus strategies or event args.
+        bool selectedIsFresh = (selected != nullptr);
+        auto selectedAddr = reinterpret_cast<uintptr_t>(selected);
+
+        // When Strategy 3 was skipped, use the stored address for
+        // comparison only (selected pointer is null, cannot dereference).
+        uintptr_t effectiveSelectedAddr = selectedIsFresh ? selectedAddr : lastSelectedAddr_;
 
         // ----- DataContext for recycling detection -----
-        const void* selectedDC = nullptr;
+        uintptr_t selectedDCAddr = 0;
         if (selected && selectedIsFresh && sDataContextProp) {
             auto depObj = static_cast<Noesis::DependencyObject const*>(selected);
             auto dcVal = sDataContextProp->GetValue(depObj);
             if (dcVal) {
-                selectedDC = *reinterpret_cast<const void* const*>(dcVal);
+                auto dataContext = *reinterpret_cast<const void* const*>(dcVal);
+                selectedDCAddr = reinterpret_cast<uintptr_t>(dataContext);
             }
         }
 
@@ -533,32 +561,51 @@ public:
         forceNext_ = false;
 
         // Track focus and selection independently.
-        bool focusChanged = (focused != lastFocused_);
+        bool focusChanged = (reinterpret_cast<uintptr_t>(focused) != lastFocusedAddr_);
         // Selection change fires when:
-        // - DataContext pointer changed (carousel recycling: same element,
+        // - DataContext address changed (carousel recycling: same element,
         //   new DC -- fires once).
-        // - Element pointer changed (static tabs like multiplayer: different
+        // - Element address changed (static tabs like multiplayer: different
         //   ListBoxItem, but DC may be null for all of them).
         // - Selection appeared/disappeared (null transitions).
         //
         // Widget rebuild creates a new element for the same DC.  When DC is
         // non-null, the DC check catches recycling.  When DC is null, the
-        // element pointer check catches the tab switch.
-        bool selectionChanged = (selectedDC != lastSelectedDC_)
-                             || (selected != lastSelected_);
+        // element address check catches the tab switch.
+        // Detect genuine selection changes:
+        // - DC changed to a DIFFERENT non-null value (carousel recycling)
+        // - Element address changed (different tab selected)
+        // - New selection appeared (null -> non-null element)
+        //
+        // IGNORE: DC going null while the element stays the same.
+        // This happens every other frame during options scrolling --
+        // the carousel tab's DC pointer temporarily clears and returns.
+        // Without this guard, the false selectionChanged suppresses
+        // focus callbacks, making d-pad navigation through options silent.
+        bool selectionChanged = false;
+        if (effectiveSelectedAddr != lastSelectedAddr_) {
+            // Different element (or appeared/disappeared) -- real change
+            selectionChanged = true;
+        } else if (selectedDCAddr != lastSelectedDCAddr_
+                   && selectedDCAddr != 0 && lastSelectedDCAddr_ != 0) {
+            // Same element, DC changed to a different non-null value
+            // (carousel recycling: same ListBoxItem, swapped ViewModel)
+            selectionChanged = true;
+        }
 
         // ----- Strategy 4: Widget set change detection -----
+        // Compare current widget addresses against stored addresses.
         uint32_t oldWidgetCount = prevWidgetCount_;
-        Noesis::Visual* oldWidgets[kMaxWidgets] = {};
+        uintptr_t oldWidgetAddrs[kMaxWidgets] = {};
         for (uint32_t i = 0; i < oldWidgetCount && i < kMaxWidgets; i++)
-            oldWidgets[i] = prevWidgets_[i];
+            oldWidgetAddrs[i] = prevWidgetAddrs_[i];
 
         bool widgetSetChanged = false;
         if (widgetCount != oldWidgetCount) {
             widgetSetChanged = true;
         } else {
             for (uint32_t i = 0; i < widgetCount; i++) {
-                if (widgets[i] != oldWidgets[i]) {
+                if (reinterpret_cast<uintptr_t>(widgets[i]) != oldWidgetAddrs[i]) {
                     widgetSetChanged = true;
                     break;
                 }
@@ -566,25 +613,20 @@ public:
         }
 
         // When widgets change, cancel any pending deferred work that
-        // references elements from the old widget set.  Without this,
-        // pendingNamedTexts_ from a previous menu's tab switch would fire
-        // after the old widgets are destroyed, hitting freed pointers.
+        // references elements from the old widget set.
         if (widgetSetChanged) {
             pendingNamedTexts_ = false;
             namedTextsSettleCount_ = 0;
-            pendingNamedTextsWidget_ = nullptr;
+            pendingNamedTextsWidgetAddr_ = 0;
             initialSelectionDone_ = false;
         }
 
-        // Update cached widget set.  Raw pointers only -- do NOT hold
-        // Ptr<> refs.  Noesis owns the widget lifecycle and may destroy
-        // widgets during internal layout teardown, bypassing ref counting.
-        // Calling Release() on an already-dead widget crashes.  We only
-        // use these pointers for value comparison (detecting widget set
-        // changes), never for dereferencing.
+        // Update cached widget addresses.  Stored as uintptr_t -- NEVER
+        // cast back to pointers.  Used only for equality comparison to
+        // detect widget set changes between ticks.
         prevWidgetCount_ = widgetCount;
         for (uint32_t i = 0; i < kMaxWidgets; i++) {
-            prevWidgets_[i] = (i < widgetCount) ? widgets[i] : nullptr;
+            prevWidgetAddrs_[i] = (i < widgetCount) ? reinterpret_cast<uintptr_t>(widgets[i]) : 0;
         }
 
         // ----- Diagnostic logging -----
@@ -595,26 +637,34 @@ public:
                         && !widgetSetChanged && !focused && !selected;
         if ((focusChanged || selectionChanged || forced || widgetSetChanged)
             && !forcedNoOp) {
-            WARN("[BG3Access] Tick: focused=%p scopeRoot=%p selected=%p selDC=%p prevSelDC=%p focChg=%d selChg=%d forced=%d wChg=%d widgets=%u",
-                focused, scopeRoot, selected, selectedDC, lastSelectedDC_,
+            WARN("[BG3Access] Tick: focused=%p scopeRoot=%p selected=%p selDC=0x%llx prevSelDC=0x%llx focChg=%d selChg=%d forced=%d wChg=%d widgets=%u",
+                focused, scopeRoot, selected, (unsigned long long)selectedDCAddr, (unsigned long long)lastSelectedDCAddr_,
                 focusChanged, selectionChanged, forced, widgetSetChanged, widgetCount);
         }
 
-        // ----- Update last known state -----
+        // ----- Update last known state (addresses only) -----
         if (focusChanged) {
-            lastFocused_ = focused;
+            lastFocusedAddr_ = reinterpret_cast<uintptr_t>(focused);
         }
 
         if (selectionChanged) {
-            lastSelected_ = selected;
-            lastSelectedDC_ = selectedDC;
+            lastSelectedAddr_ = effectiveSelectedAddr;
+            lastSelectedDCAddr_ = selectedDCAddr;
+            // Cache tab name for carousel text-change detection.
+            // selected is a fresh pointer (obtained this frame), safe to dereference.
+            if (selected && selectedIsFresh) {
+                lastSelectedElemText_ = ExtractTabName(
+                    static_cast<Noesis::FrameworkElement*>(selected));
+            } else {
+                lastSelectedElemText_.clear();
+            }
         }
 
         // ----- Schedule deferred namedTexts on tab switch -----
         // When a tab changes, Noesis hasn't updated Visibility states yet
         // in the same frame.  Schedule a re-collection after a settle delay
         // so IsElementVisible can reliably filter cross-tab TextBlocks.
-        if (selectionChanged && selected) {
+        if (selectionChanged && selected && selectedIsFresh) {
             auto selData = static_cast<Noesis::FrameworkElement*>(selected);
             // Check isTab by type
             bool isTab = false;
@@ -630,13 +680,13 @@ public:
                 namedTextsSettleCount_ = 10;  // fallback only; WidgetDCChanged is the primary path
                 // Store the widget root address for deferred collection.
                 // Walk up from the selected element NOW (it's valid this
-                // tick) and save the address.  The deferred path will
-                // re-find this widget in the live widget list.
-                pendingNamedTextsWidget_ = nullptr;
+                // tick) and save the address as uintptr_t.  The deferred
+                // path will re-find this widget in the live widget list.
+                pendingNamedTextsWidgetAddr_ = 0;
                 Noesis::Visual* cur = static_cast<Noesis::Visual*>(selected);
                 for (int depth = 0; depth < 64 && cur; depth++) {
                     if (IsUIWidgetType(cur)) {
-                        pendingNamedTextsWidget_ = cur;
+                        pendingNamedTextsWidgetAddr_ = reinterpret_cast<uintptr_t>(cur);
                         break;
                     }
                     cur = cur->mVisualParent;
@@ -648,18 +698,23 @@ public:
         // Only dereference elements that were found FRESH this tick.
         // focused is always fresh (GetFocusedElement runs every tick).
         // selected is only fresh when Strategy 3 actually ran.
+        // Tag selection changes as "TabChange" so PostUpdate() can
+        // drop them when an inline carousel fires in the same frame.
         if (selectionChanged && selected && selectedIsFresh) {
             WARN("[BG3Access]   -> FIRE selection (tab)");
-            FireFocusCallback(selected);
+
+            SubscribeElementINPC(selected);
         } else if (focusChanged && focused) {
             WARN("[BG3Access]   -> FIRE focus");
-            FireFocusCallback(focused);
+
+            SubscribeElementINPC(focused);
         } else if (forced) {
             // For forced re-fire, only use pointers that are fresh.
             auto best = (selected && selectedIsFresh) ? selected : focused;
             if (best) {
                 WARN("[BG3Access]   -> FIRE forced");
-                FireFocusCallback(best);
+
+                SubscribeElementINPC(best);
             } else {
                 // Both null -- UI is rebuilding (e.g. Cross-Play tab
                 // destroys and recreates the ListBoxItem tree).
@@ -680,64 +735,77 @@ public:
             if (widgetCount > oldWidgetCount) {
                 widgetAdded = true;
             } else {
-                // Same count but different pointers -- check if any are new
+                // Same count but different addresses -- check if any are new
                 for (uint32_t i = 0; i < widgetCount; i++) {
                     bool found = false;
+                    auto currentAddr = reinterpret_cast<uintptr_t>(widgets[i]);
                     for (uint32_t j = 0; j < oldWidgetCount; j++) {
-                        if (widgets[i] == oldWidgets[j]) { found = true; break; }
+                        if (currentAddr == oldWidgetAddrs[j]) { found = true; break; }
                     }
                     if (!found) { widgetAdded = true; break; }
                 }
             }
 
             if (widgetAdded) {
-                pendingWidgetFire_ = true;
-                widgetSettleCount_ = kWidgetSettleTicks;
-                // Save the pre-addition widget set for comparison at fire time.
-                preAddWidgetCount_ = oldWidgetCount;
-                for (uint32_t i = 0; i < kMaxWidgets; i++) {
-                    preAddWidgets_[i] = (i < oldWidgetCount) ? oldWidgets[i] : nullptr;
-                }
-            }
-        }
-
-        if (pendingWidgetFire_) {
-            widgetSettleCount_--;
-            if (widgetSettleCount_ <= 0) {
-                pendingWidgetFire_ = false;
-                // Fire for EACH new visible widget (not just the first).
-                // Lua handler uses a guard to act on the first widget that
-                // yields convention content, ignoring subsequent calls.
+                // Widget changes now always go through the settle window
+                // at the top of Tick().  By the time we reach here, the tree
+                // is stable (post-settle).  Fire for EACH new visible widget.
+                // widgets[] array contains fresh pointers from THIS tick.
                 bool fired = false;
                 for (int i = (int)widgetCount - 1; i >= 0; i--) {
                     if (!widgets[i] || !IsVisibleDP(widgets[i])) continue;
                     bool isNew = true;
-                    for (uint32_t j = 0; j < preAddWidgetCount_; j++) {
-                        if (widgets[i] == preAddWidgets_[j]) { isNew = false; break; }
+                    auto currentAddr = reinterpret_cast<uintptr_t>(widgets[i]);
+                    for (uint32_t j = 0; j < oldWidgetCount; j++) {
+                        if (currentAddr == oldWidgetAddrs[j]) { isNew = false; break; }
                     }
                     if (isNew) {
                         WARN("[BG3Access]   -> FIRE widgetAdded (widget[%d])", i);
-                        FireWidgetCallback(
+                        ExtractWidgetData(
                             static_cast<Noesis::UIElement*>(
-                                const_cast<Noesis::Visual*>(widgets[i])));
+                                const_cast<Noesis::Visual*>(widgets[i])),
+                            *snapshot);
                         fired = true;
-                        // No break -- fire for each new widget so Lua can
-                        // pick the one that has convention content.
                     }
                 }
                 if (!fired) {
-                    // All pointers swapped -- fire topmost visible as fallback.
+                    // All addresses swapped -- fire topmost visible as fallback.
                     for (int i = (int)widgetCount - 1; i >= 0; i--) {
                         if (!widgets[i] || !IsVisibleDP(widgets[i])) continue;
                         WARN("[BG3Access]   -> FIRE widgetAdded fallback (widget[%d])", i);
-                        FireWidgetCallback(
+                        ExtractWidgetData(
                             static_cast<Noesis::UIElement*>(
-                                const_cast<Noesis::Visual*>(widgets[i])));
+                                const_cast<Noesis::Visual*>(widgets[i])),
+                            *snapshot);
                         break;
                     }
                 }
             }
         }
+
+        // ----- Post-settle: always extract widget data -----
+        // After a settle window, grab widget data regardless of whether
+        // the widget is "new."  Tab switches within the same widget
+        // (e.g., Options tabs) don't change the widget address, but the
+        // NameScope content (ListTitle, etc.) does change.  The settle
+        // window ensures the tree is stable; just grab everything.
+        // Only runs ONCE on the actual post-settle tick, not on every
+        // forced tick (forced re-arms when nothing has focus).
+        if (postSettle_ && widgetCount > 0) {
+            // Collect NameScope texts (ListTitle, etc.) from ALL visible
+            // widgets into focusedElement.namedTexts.  The Options menu
+            // has 8 widgets and ListTitle lives in the main content widget,
+            // not the topmost overlay.  Iterate all of them.
+            for (int i = (int)widgetCount - 1; i >= 0; i--) {
+                if (!widgets[i] || !IsVisibleDP(widgets[i])) continue;
+                auto widgetElem = static_cast<Noesis::FrameworkElement*>(
+                    const_cast<Noesis::Visual*>(widgets[i]));
+                WARN("[BG3Access]   -> Post-settle NameScope (widget[%d])", i);
+                TryCollectNamedTexts(widgetElem, snapshot->focusedElement.namedTexts);
+            }
+        }
+        bool wasPostSettle = postSettle_;
+        postSettle_ = false;
 
         // ----- Deferred namedTexts re-collection on tab switch -----
         // After a tab switch, wait for Noesis to update Visibility states
@@ -752,18 +820,23 @@ public:
         // speaks with whatever data pendingTabData already has (tab name,
         // dcBody, etc.).
         if (pendingNamedTexts_) {
-            namedTextsSettleCount_--;
-            if (namedTextsSettleCount_ <= 0) {
-                pendingNamedTexts_ = false;
-                FocusEventData namedData;
-                namedData.eventType = "TabNamedTexts";
-                WARN("[BG3Access]   -> FIRE TabNamedTexts (fallback, 0 entries)");
-                ContextGuardAnyThread ctx(ContextType::Client);
-                if (gExtender->GetClient().HasExtensionState()) {
-                    LuaClientPin pin(gExtender->GetClient().GetExtensionState());
-                    if (pin) {
-                        pin->GetDeferredUIEvents().OnFocusChanged(
-                            callback_, std::move(namedData));
+            // If the widget DC is dirty, the batched WidgetDCChanged fire
+            // (below) will deliver namedTexts with fresh data.  Don't let
+            // the fallback race ahead and consume pendingTabData with empty
+            // namedTexts.
+            if (widgetDCDirty_) {
+                // Reset the settle counter so the fallback doesn't fire
+                // on the same tick as the batched WidgetDCChanged.
+                // If WidgetDCChanged clears pendingNamedTexts_, this is moot.
+            } else {
+                namedTextsSettleCount_--;
+                if (namedTextsSettleCount_ <= 0) {
+                    pendingNamedTexts_ = false;
+                    WARN("[BG3Access]   -> TabNamedTexts fallback (0 entries) -> snapshot");
+                    // Signal the snapshot that tab content is ready.
+                    // Empty namedTexts -- Lua uses whatever pendingTabData already has.
+                    if (!snapshot->selectionChanged) {
+                        snapshot->selectionChanged = true;
                     }
                 }
             }
@@ -783,58 +856,368 @@ public:
         } else {
             overlayPollCount_ = 0;
         }
+
+        // ----- Batched INPC: fire at most once per frame -----
+        // OnINPCChanged / OnWidgetINPCChanged just set dirty flags.
+        // Fire one callback each here, with fresh DC properties.
+        //
+        // Suppress element INPC on selection-change ticks.  The focus
+        // callback (SubscribeElementINPC) already carries the full DC data
+        // for the newly selected element.  Firing INPC on the same tick
+        // would double-speak the exact same text.
+        // Element INPC: just clear the dirty flag.  The snapshot builder
+        // at the end of Tick() re-reads DC props and does delta comparison.
+        // No separate dispatch needed.
+        inpcDirty_ = false;
+
+        if (widgetDCDirty_ && callback_ && widgetInpcWidgetAddr_ != 0) {
+            widgetDCDirty_ = false;
+
+            // Re-discover the widget from the live widget list using its
+            // stored address.  NEVER dereference stored addresses directly.
+            Noesis::FrameworkElement* freshWidget = nullptr;
+            if (widgetContainer_) {
+                auto containerChildCount = widgetContainer_->GetVisualChildrenCount();
+                for (uint32_t i = 0; i < containerChildCount; i++) {
+                    auto child = widgetContainer_->GetVisualChild(i);
+                    if (reinterpret_cast<uintptr_t>(child) == widgetInpcWidgetAddr_) {
+                        freshWidget = static_cast<Noesis::FrameworkElement*>(child);
+                        break;
+                    }
+                }
+            }
+
+            if (freshWidget) {
+                // Re-read DC from the fresh widget pointer (obtained this frame).
+                Noesis::BaseComponent* freshDC = nullptr;
+                if (sDataContextProp) {
+                    auto depObj = static_cast<Noesis::DependencyObject const*>(freshWidget);
+                    auto dcVal = sDataContextProp->GetValue(depObj);
+                    if (dcVal) {
+                        freshDC = *reinterpret_cast<Noesis::BaseComponent* const*>(dcVal);
+                    }
+                }
+
+                if (freshDC) {
+                    // Write widget DC data directly into snapshot.
+                    auto widgetDCData = std::make_unique<FocusEventData>();
+                    widgetDCData->eventType = "WidgetDCChanged";
+                    widgetDCData->dcType = freshDC->GetClassType()->GetName();
+                    CollectDCProperties(*widgetDCData, freshDC);
+
+                    // Collect namedTexts from the fresh widget.
+                    WARN("[BG3Access]   INPC: collecting namedTexts from widget %p", freshWidget);
+                    TryCollectNamedTexts(freshWidget, widgetDCData->namedTexts);
+
+                    // Merge into snapshot: namedTexts are appended (not replaced)
+                    // so post-settle NameScope data isn't overwritten.
+                    // DC props fill in if focusedElement has none.
+                    for (auto& namedTextEntry : widgetDCData->namedTexts) {
+                        snapshot->focusedElement.namedTexts.push_back(std::move(namedTextEntry));
+                    }
+                    if (snapshot->focusedElement.dcScalarProps.empty()) {
+                        snapshot->focusedElement.dcScalarProps = std::move(widgetDCData->dcScalarProps);
+                        snapshot->focusedElement.dcType = widgetDCData->dcType;
+                    }
+                }
+            }
+
+            // Carousel text-change detection: re-extract tab name using
+            // a fresh selected element from this tick's Strategy 3 results.
+            // Only possible when selected is a fresh pointer (not stale address).
+            if (selected && selectedIsFresh && !selectionChanged && !focusChanged) {
+                auto freshText = ExtractTabName(
+                    static_cast<Noesis::FrameworkElement*>(selected));
+                if (!freshText.empty() && freshText != lastSelectedElemText_) {
+                    lastSelectedElemText_ = freshText;
+                    WARN("[BG3Access]   -> Carousel text changed: %s", freshText.c_str());
+                }
+            }
+        } else {
+            widgetDCDirty_ = false;
+        }
+
+        // ----- Inline carousel detection -----
+        // Appearance rows have child ListBoxes (face, skin colour, etc.).
+        // When left/right changes the SelectedItem, no focus event fires.
+        // Each tick, if focus hasn't changed, find the child ListBox under
+        // the focused element, read SelectedItem.Name or SelectedItem.ColorName,
+        // and fire a focus callback if the text changed.
+        // Only runs when focus is stable (no focus/selection change this tick).
+        // Uses the THIS-FRAME focused pointer (not the stored address).
+        if (focused && !focusChanged) {
+            auto focusedElement = static_cast<Noesis::FrameworkElement*>(focused);
+            // BFS for a child TextBlock named "selectionName" (the
+            // AppearanceCarousel template's value display).  Also look
+            // for ListBox to try SelectedItem.Name as fallback.
+            // Max 6 levels deep, 64 nodes to reach through template internals.
+            std::vector<Noesis::Visual*> searchQueue(64);
+            int searchHead = 0, searchTail = 0;
+            searchQueue[searchTail++] = focusedElement;
+            Noesis::FrameworkElement* foundSelectionName = nullptr;
+            Noesis::FrameworkElement* foundListBox = nullptr;
+
+            while (searchHead < searchTail && searchHead < 64) {
+                auto currentNode = searchQueue[searchHead++];
+                if (!currentNode) continue;
+
+                auto nodeTypeName = currentNode->GetClassType()->GetName();
+
+                // Check for TextBlock named "selectionName"
+                if (nodeTypeName && strstr(nodeTypeName, "TextBlock")) {
+                    auto nodeName = ReadPropertyAsString(
+                        static_cast<Noesis::FrameworkElement*>(currentNode), "Name");
+                    if (nodeName == "selectionName") {
+                        foundSelectionName = static_cast<Noesis::FrameworkElement*>(currentNode);
+                        break;
+                    }
+                }
+
+                // Also track ListBox as fallback
+                if (!foundListBox && nodeTypeName
+                    && strstr(nodeTypeName, "ListBox")
+                    && !strstr(nodeTypeName, "ListBoxItem")) {
+                    foundListBox = static_cast<Noesis::FrameworkElement*>(currentNode);
+                }
+
+                // Add children to queue
+                auto childCount = currentNode->GetVisualChildrenCount();
+                for (uint32_t childIdx = 0; childIdx < childCount && searchTail < 64; childIdx++) {
+                    searchQueue[searchTail++] = currentNode->GetVisualChild(childIdx);
+                }
+            }
+
+            // Try reading text from the selectionName TextBlock first
+            std::string carouselText;
+            if (foundSelectionName) {
+                carouselText = ReadTextBlockText(foundSelectionName);
+            }
+            // Fallback: read SelectedItem.Name from ListBox
+            if (carouselText.empty() && foundListBox) {
+                carouselText = TryReadInlineCarouselText(foundListBox);
+            }
+
+            if (!carouselText.empty()) {
+
+                if (!carouselText.empty() && carouselText != lastInlineCarouselText_) {
+                    lastInlineCarouselText_ = carouselText;
+                    WARN("[BG3Access]   -> Inline carousel changed: %s", carouselText.c_str());
+                    // No legacy dispatch -- snapshot builder reads
+                    // lastInlineCarouselText_ at end of Tick().
+                }
+            } else {
+                if (!lastInlineCarouselText_.empty()) {
+                    lastInlineCarouselText_.clear();
+                }
+            }
+        }
+
+        // Clear inline carousel state on focus change so the next
+        // carousel row starts fresh and INPC suppression ends.
+        if (focusChanged) {
+            lastInlineCarouselText_.clear();
+
+        }
+
+        // ===== SNAPSHOT FINALIZATION =====
+        // The snapshot has been populated throughout Tick().
+        // Finalize change flags, run delta comparison, and dispatch.
+        {
+            // Change flags from detection above
+            snapshot->focusChanged = focusChanged;
+            snapshot->selectionChanged = selectionChanged || snapshot->selectionChanged;
+
+            // Focused element data: ONLY use elements obtained THIS frame.
+            // lastFocusedAddr_ is an opaque address -- never dereference.
+            Noesis::UIElement* snapshotElement = focused;
+            if (!snapshotElement && selected && selectedIsFresh) {
+                snapshotElement = selected;
+            }
+            if (snapshotElement) {
+                ExtractElementData(snapshot->focusedElement,
+                    static_cast<Noesis::FrameworkElement*>(snapshotElement));
+            }
+
+            // Inline carousel value (already detected above)
+            snapshot->inlineCarouselValue = lastInlineCarouselText_;
+            snapshot->inlineCarouselChanged =
+                !lastInlineCarouselText_.empty() &&
+                lastInlineCarouselText_ != previousSnapshotCarousel_;
+
+            // INPC value change: compare DC props against previous
+            if (!snapshot->focusedElement.dcScalarProps.empty() &&
+                snapshot->focusedElement.dcScalarProps != previousSnapshotDCProps_) {
+                snapshot->valueChanged = true;
+            }
+
+            // Widget, widgetDC, and namedTexts data were written directly
+            // into snapshot by ExtractWidgetData() and the widgetDCDirty
+            // handler above.  No accumulator reads needed.
+
+            // Settling logic: after tab selection change, wait a few frames
+            if (selectionChanged && snapshot->focusedElement.isTab) {
+                settleFramesRemaining_ = 3;
+            }
+            if (settleFramesRemaining_ > 0) {
+                settleFramesRemaining_--;
+                if (settleFramesRemaining_ == 0 && pendingINPCSubscription_) {
+                    // UI has settled -- use THIS frame's fresh element.
+                    CommitINPCSubscription(focused ? focused : selected);
+                }
+            } else if (pendingINPCSubscription_) {
+                // No settling needed (non-tab focus change).
+                CommitINPCSubscription(focused ? focused : selected);
+            }
+
+            // Delta comparison: has anything meaningful changed?
+            bool shouldDispatch = false;
+            if (snapshot->focusChanged &&
+                snapshot->focusedElement.elemId != previousSnapshotElemId_) {
+                shouldDispatch = true;
+            }
+            if (snapshot->inlineCarouselChanged) {
+                shouldDispatch = true;
+            }
+            if (snapshot->valueChanged && !snapshot->focusChanged) {
+                shouldDispatch = true;
+            }
+            if (snapshot->selectionChanged) {
+                shouldDispatch = true;
+            }
+            if (snapshot->widgetAdded) {
+                shouldDispatch = true;
+            }
+            if (!snapshot->focusedElement.namedTexts.empty()) {
+                shouldDispatch = true;
+            }
+
+            // Suppress during settling (except the initial tab change,
+            // widget adds, and carousels)
+            if (settleFramesRemaining_ > 0
+                && !snapshot->selectionChanged
+                && !snapshot->widgetAdded
+                && !snapshot->inlineCarouselChanged) {
+                shouldDispatch = false;
+            }
+
+            // If a SelectionChanged event fired DURING this tick (carousel
+            // recycling, binding updates), the tree isn't truly stable yet.
+            // Suppress this dispatch and re-arm settle so the next post-settle
+            // tick gets complete data (e.g. resolved ListTitle bindings).
+            if (shouldDispatch && sSelectionDirtyFlag) {
+                WARN("[BG3Access] SelectionChanged during tick -- re-arming settle, suppressing dispatch");
+                sSelectionDirtyFlag = false;
+                sSelectionChangedItemAddr = 0;
+                treeSettleFrames_ = 6;
+                return;
+            }
+
+            // Dispatch snapshot to Lua
+            if (shouldDispatch && callback_) {
+                // Count namedTexts in both focusedElement and widgetData.
+                int focusNamedCount = static_cast<int>(
+                    snapshot->focusedElement.namedTexts.size());
+                int widgetNamedCount = 0;
+                if (snapshot->widgetAdded)
+                    widgetNamedCount = static_cast<int>(
+                        snapshot->widgetData.namedTexts.size());
+
+                WARN("[BG3Access] SNAPSHOT: focus=%d sel=%d val=%d carousel=%d "
+                     "widget=%d postSettle=%d elemId=%s "
+                     "focusNT=%d widgetNT=%d carVal=%s",
+                     snapshot->focusChanged, snapshot->selectionChanged,
+                     snapshot->valueChanged, snapshot->inlineCarouselChanged,
+                     snapshot->widgetAdded, wasPostSettle ? 1 : 0,
+                     snapshot->focusedElement.elemId.c_str(),
+                     focusNamedCount, widgetNamedCount,
+                     snapshot->inlineCarouselValue.c_str());
+
+                // Log namedTexts keys+values so we can see what data arrived.
+                for (auto const& pair : snapshot->focusedElement.namedTexts) {
+                    WARN("[BG3Access]   focusNT: %s = %s",
+                         pair.first.c_str(), pair.second.c_str());
+                }
+                if (snapshot->widgetAdded) {
+                    for (auto const& pair : snapshot->widgetData.namedTexts) {
+                        WARN("[BG3Access]   widgetNT: %s = %s",
+                             pair.first.c_str(), pair.second.c_str());
+                    }
+                }
+
+                // Update delta cache
+                previousSnapshotElemId_ = snapshot->focusedElement.elemId;
+                previousSnapshotCarousel_ = snapshot->inlineCarouselValue;
+                previousSnapshotDCProps_ = snapshot->focusedElement.dcScalarProps;
+
+                ContextGuardAnyThread ctx(ContextType::Client);
+                if (gExtender->GetClient().HasExtensionState()) {
+                    LuaClientPin pin(gExtender->GetClient().GetExtensionState());
+                    if (pin) {
+                        pin->GetDeferredUIEvents().OnTickSnapshot(
+                            callback_, std::move(*snapshotPtr));
+                    }
+                }
+            }
+
+        }
     }
 
     void Reset()
     {
-        UnsubscribeINPC();
-        UnsubscribeWidgetINPC();
         UnsubscribeAllSelectionChanged();
-        lastFocused_ = nullptr;
-        lastSelected_ = nullptr;
-        lastSelectedDC_ = nullptr;
-        cachedRoot_ = nullptr;
+        lastFocusedAddr_ = 0;
+        lastSelectedAddr_ = 0;
+        lastSelectedDCAddr_ = 0;
+        pendingINPCSubscription_ = false;
+        lastSelectedElemText_.clear();
+        lastInlineCarouselText_.clear();
+        cachedRootAddr_ = 0;
         widgetContainer_ = nullptr;
         prevWidgetCount_ = 0;
         hadFocusBefore_ = false;
-        pendingWidgetFire_ = false;
-        widgetSettleCount_ = 0;
         initialSelectionDone_ = false;
         sSelectionDirtyFlag = false;
         pendingNamedTexts_ = false;
         namedTextsSettleCount_ = 0;
-        pendingNamedTextsWidget_ = nullptr;
+        pendingNamedTextsWidgetAddr_ = 0;
+        inpcDirty_ = false;
+        widgetDCDirty_ = false;
+        widgetInpcDCAddr_ = 0;
+        widgetInpcWidgetAddr_ = 0;
+        treeSettleFrames_ = 0;
         for (uint32_t i = 0; i < kMaxWidgets; i++) {
-            prevWidgets_[i] = nullptr;
-            preAddWidgets_[i] = nullptr;
+            prevWidgetAddrs_[i] = 0;
         }
-        preAddWidgetCount_ = 0;
     }
 
 private:
-    // Fire a FOCUS event: extract all data from the element NOW (it is
-    // alive during Tick), store as FocusEventData, queue the struct.
-    // Lua receives a table of strings/bools -- no Noesis objects.
-    //
-    // Also auto-subscribes INPC on the element's DataContext (Phase 2).
-    // When a ViewModel property changes, re-reads DC properties and fires
-    // a "PropertyChanged" event through the same callback.
-    void FireFocusCallback(Noesis::UIElement* elem)
+    // Subscribe INPC on the focused element's DataContext and the
+    // widget's DataContext.  Snapshot handles all data extraction and
+    // dispatch -- this function only manages subscriptions.
+    void SubscribeElementINPC(Noesis::UIElement* elem)
     {
         if (!elem) return;
-        WARN("[BG3Access]   FireFocusCallback: elem=%p", elem);
-        auto frameworkElem = static_cast<Noesis::FrameworkElement*>(elem);
-        FocusEventData data;
-        ExtractElementData(data, frameworkElem);
+        // Don't dereference the element here -- during tab switches it
+        // may be in a half-destroyed state.  Just set a flag so Tick()
+        // re-discovers the focused element and subscribes INPC on a
+        // fresh pointer after the UI has settled.
+        pendingINPCSubscription_ = true;
+        WARN("[BG3Access]   SubscribeElementINPC: deferred (pending re-discovery)");
+    }
 
-        // NOTE: namedTexts re-collection on tab switch is deferred, not
-        // done here.  IsElementVisible cannot reliably filter cross-tab
-        // TextBlocks during the same frame as the selection change (Noesis
-        // hasn't updated Visibility states yet).  The deferred collection
-        // fires after kWidgetSettleTicks via pendingNamedTexts_ in Tick().
+    // Re-discover the focused element and subscribe INPC on it.
+    // Called from Tick() after settling, using fresh pointers from
+    // the current frame's focus strategies.
+    void CommitINPCSubscription(Noesis::UIElement* freshElement)
+    {
+        pendingINPCSubscription_ = false;
+        if (!freshElement) return;
 
-        // Auto-subscribe INPC on the DataContext.
-        UnsubscribeINPC();
+        WARN("[BG3Access]   CommitINPCSubscription: elem=%p", freshElement);
+        auto frameworkElem = static_cast<Noesis::FrameworkElement*>(freshElement);
+
+        // No UnsubscribeINPC needed -- fire-and-forget pattern.
+        // Previous subscription's delegate just sets inpcDirty_ (harmless).
         if (sDataContextProp) {
             auto depObj = static_cast<Noesis::DependencyObject const*>(frameworkElem);
             auto dcVal = sDataContextProp->GetValue(depObj);
@@ -845,24 +1228,16 @@ private:
                 }
             }
         }
-
-        ContextGuardAnyThread ctx(ContextType::Client);
-        if (gExtender->GetClient().HasExtensionState()) {
-            LuaClientPin pin(gExtender->GetClient().GetExtensionState());
-            if (pin) {
-                pin->GetDeferredUIEvents().OnFocusChanged(
-                    callback_, std::move(data));
-            }
-        }
     }
 
     // Fire a WIDGET event: extract data from the widget and push as a
     // data table (no Noesis elements cross to Lua).  Phase 3 replacement
     // for the old OnPropertyChanged path.
-    void FireWidgetCallback(Noesis::UIElement* elem)
+    void ExtractWidgetData(Noesis::UIElement* elem, ecl::lua::TickSnapshot& snapshot)
     {
         if (!elem) return;
-        FocusEventData data;
+        snapshot.widgetAdded = true;
+        auto& data = snapshot.widgetData;
         data.eventType = "WidgetAdded";
 
         auto frameworkElem = static_cast<Noesis::FrameworkElement*>(elem);
@@ -909,193 +1284,128 @@ private:
         // element crashes ReadTextBlockText, we lose NameScope texts for
         // this widget but don't crash the game.
         TryCollectNamedTexts(frameworkElem, data.namedTexts);
-
-        ContextGuardAnyThread ctx(ContextType::Client);
-        if (gExtender->GetClient().HasExtensionState()) {
-            LuaClientPin pin(gExtender->GetClient().GetExtensionState());
-            if (pin) {
-                pin->GetDeferredUIEvents().OnFocusChanged(
-                    callback_, std::move(data));
-            }
-        }
     }
 
     // ----- Auto-INPC subscription (Phase 2) -----
     // Subscribes to INotifyPropertyChanged on a DataContext ViewModel.
-    // When a property changes, re-reads ALL DC properties and fires a
-    // "PropertyChanged" event to Lua through the global focus callback.
+    // Fire-and-forget: subscribe the delegate, then forget the pointer.
+    // NEVER call Remove() -- the old object may already be dead.  If the
+    // VM is destroyed, Noesis cleans up its delegate list automatically.
+    // Our delegate callback (OnINPCChanged) just sets a dirty flag --
+    // harmless if it fires during destruction.
     void SubscribeINPC(Noesis::BaseComponent* dataContext)
     {
         auto notifies = Noesis::DynamicCast<
             Noesis::INotifyPropertyChanged*, Noesis::BaseComponent*>(dataContext);
         if (!notifies) return;
 
-        // Unsubscribe from previous target if still alive.
-        // No Ptr<> ref -- if the old VM was destroyed, Noesis already
-        // cleared its delegate list, so we just reset our pointer.
-        if (inpcTarget_ && inpcTarget_ != notifies) {
-            inpcTarget_->PropertyChanged().Remove(
-                Noesis::MakeDelegate(this, &GlobalFocusMonitor::OnINPCChanged));
-        }
-
-        inpcTarget_ = notifies;
-
+        // Fire-and-forget: subscribe and let Noesis manage the lifetime.
+        // The delegate may fire redundantly if we subscribe twice on the
+        // same object, but that just sets inpcDirty_ = true again (idempotent).
         notifies->PropertyChanged().Add(
             Noesis::MakeDelegate(this, &GlobalFocusMonitor::OnINPCChanged));
     }
 
-    void UnsubscribeINPC()
-    {
-        // Don't call Remove on a potentially dead object.
-        // Just clear the pointer.  If the VM is still alive, the
-        // delegate fires harmlessly (OnINPCChanged checks callback_).
-        // If dead, Noesis already cleaned up its delegate list.
-        inpcTarget_ = nullptr;
-    }
+    // UnsubscribeINPC removed -- fire-and-forget pattern means there is
+    // nothing to unsubscribe.  The delegate fires harmlessly (sets a flag).
+    // Noesis cleans up delegate lists when objects are destroyed.
 
     void OnINPCChanged(Noesis::BaseComponent* sender,
                        const Noesis::PropertyChangedEventArgs& args)
     {
-        if (!callback_) return;
-
-        // Re-read all DC properties from the sender (ViewModel is alive).
-        FocusEventData data;
-        data.eventType = "PropertyChanged";
-        if (sender) {
-            data.dcType = sender->GetClassType()->GetName();
-            CollectDCProperties(data, sender);
-        }
-
-        ContextGuardAnyThread ctx(ContextType::Client);
-        if (gExtender->GetClient().HasExtensionState()) {
-            LuaClientPin pin(gExtender->GetClient().GetExtensionState());
-            if (pin) {
-                pin->GetDeferredUIEvents().OnFocusChanged(
-                    callback_, std::move(data));
-            }
-        }
+        // Batch per frame: just set dirty flag.  The tick fires ONE
+        // PropertyChanged event instead of one per property change.
+        inpcDirty_ = true;
     }
 
     // ----- Widget DC INPC subscription (Phase 3) -----
-    // Monitors the WIDGET's DataContext for property changes.  Fires a
-    // "WidgetDCChanged" event when the widget ViewModel updates (e.g.,
-    // after tab content loads and bindings resolve).  Replaces the fragile
-    // Lua WaitFrames timer with event-driven detection.
+    // Monitors the WIDGET's DataContext for property changes.  Fire-and-forget:
+    // subscribe the delegate, store address for duplicate avoidance and
+    // re-discovery, then never call Remove().  Noesis manages cleanup.
     void SubscribeWidgetINPC(Noesis::BaseComponent* dataContext,
                              Noesis::FrameworkElement* widgetElem = nullptr)
     {
-        // Skip if same DC object already subscribed
-        if (widgetInpcTarget_ && widgetInpcTarget_ ==
-            Noesis::DynamicCast<Noesis::INotifyPropertyChanged*, Noesis::BaseComponent*>(dataContext))
-            return;
+        auto dcAddr = reinterpret_cast<uintptr_t>(dataContext);
 
-        // Unsubscribe from previous target if still alive.
-        if (widgetInpcTarget_) {
-            widgetInpcTarget_->PropertyChanged().Remove(
-                Noesis::MakeDelegate(this, &GlobalFocusMonitor::OnWidgetINPCChanged));
-        }
+        // Skip if same DC object already subscribed (address comparison).
+        if (dcAddr == widgetInpcDCAddr_ && dcAddr != 0)
+            return;
 
         auto notifies = Noesis::DynamicCast<
             Noesis::INotifyPropertyChanged*, Noesis::BaseComponent*>(dataContext);
         if (!notifies) return;
 
-        widgetInpcTarget_ = notifies;
-        widgetInpcWidgetAddr_ = widgetElem;
+        // Fire-and-forget: subscribe and store addresses for re-discovery.
+        // Previous subscription's delegate may still fire -- that just sets
+        // widgetDCDirty_ = true (idempotent).
+        widgetInpcDCAddr_ = dcAddr;
+        widgetInpcWidgetAddr_ = reinterpret_cast<uintptr_t>(widgetElem);
 
         notifies->PropertyChanged().Add(
             Noesis::MakeDelegate(this, &GlobalFocusMonitor::OnWidgetINPCChanged));
     }
 
-    void UnsubscribeWidgetINPC()
-    {
-        // Don't call Remove on a potentially dead object.
-        widgetInpcTarget_ = nullptr;
-        widgetInpcWidgetAddr_ = nullptr;
-    }
+    // UnsubscribeWidgetINPC removed -- fire-and-forget pattern.
+    // Noesis cleans up delegate lists when objects are destroyed.
 
     void OnWidgetINPCChanged(Noesis::BaseComponent* sender,
                               const Noesis::PropertyChangedEventArgs& args)
     {
-        if (!callback_) return;
-
-        // Re-read ALL DC properties from the widget's ViewModel.
-        FocusEventData data;
-        data.eventType = "WidgetDCChanged";
-        if (sender) {
-            data.dcType = sender->GetClassType()->GetName();
-            CollectDCProperties(data, sender);
-        }
-
-        // Cancel the fallback timer -- WidgetDCChanged is the primary path.
+        // Batch per frame: just set dirty flag.  The tick fires ONE
+        // WidgetDCChanged event instead of one per property change.
+        // Also cancel the fallback timer since we know the DC changed.
+        widgetDCDirty_ = true;
         pendingNamedTexts_ = false;
-
-        // Collect namedTexts from the widget if we have a valid address.
-        // Verify against the live widget list before dereferencing.
-        if (widgetInpcWidgetAddr_ && widgetContainer_) {
-            auto count = widgetContainer_->GetVisualChildrenCount();
-            bool found = false;
-            for (uint32_t i = 0; i < count; i++) {
-                auto child = widgetContainer_->GetVisualChild(i);
-                if (child == static_cast<Noesis::Visual*>(widgetInpcWidgetAddr_)) {
-                    WARN("[BG3Access]   INPC: collecting namedTexts from widget %p", widgetInpcWidgetAddr_);
-                    TryCollectNamedTexts(widgetInpcWidgetAddr_, data.namedTexts);
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                WARN("[BG3Access]   INPC: widget %p not found in %u children, skipping namedTexts",
-                    widgetInpcWidgetAddr_, count);
-            }
-        } else {
-            WARN("[BG3Access]   INPC: no widget addr (%p) or container (%p), skipping namedTexts",
-                widgetInpcWidgetAddr_, widgetContainer_);
-        }
-
-        ContextGuardAnyThread ctx(ContextType::Client);
-        if (gExtender->GetClient().HasExtensionState()) {
-            LuaClientPin pin(gExtender->GetClient().GetExtensionState());
-            if (pin) {
-                pin->GetDeferredUIEvents().OnFocusChanged(
-                    callback_, std::move(data));
-            }
-        }
     }
 
     // Focus/selection tracking.
-    // Raw pointers only -- NO Ptr<> refs.  These are compared by value
-    // to detect changes, then dereferenced ONLY within the same tick
-    // they were obtained (via GetFocusedElement / FindSelectedTabInTree).
-    // Deferred paths must re-find elements from the live widget list.
-    Noesis::UIElement* lastFocused_ = nullptr;
-    Noesis::UIElement* lastSelected_ = nullptr;
-    const void* lastSelectedDC_ = nullptr;
+    // All cross-frame element references stored as uintptr_t ADDRESS VALUES.
+    // NEVER cast back to a pointer for dereference.  Used ONLY for
+    // equality comparison to detect state changes between ticks.
+    // All actual element access uses fresh pointers obtained THIS frame.
+    uintptr_t lastFocusedAddr_ = 0;
+    uintptr_t lastSelectedAddr_ = 0;
+    bool pendingINPCSubscription_ = false;  // deferred INPC subscription
+    DWORD mainThreadId_ = 0;  // thread that initialized the monitor
+    uintptr_t lastSelectedDCAddr_ = 0;  // DataContext address for carousel recycling detection
+    std::string lastSelectedElemText_;  // tab name text for carousel text-change detection
+    std::string lastInlineCarouselText_;  // Name/ColorName from inline carousel SelectedItem
 
-    // INPC auto-subscription tracking (focused element DC)
-    // Raw pointers only -- no Ptr<> refs.  If the VM is destroyed,
-    // Noesis clears its delegate list.  Our stale pointer is harmless.
-    Noesis::INotifyPropertyChanged* inpcTarget_ = nullptr;
+    // INPC auto-subscription tracking (focused element DC).
+    // Fire-and-forget: subscribe, then CLEAR the pointer.  Never call
+    // Remove() on a potentially dead object.  If the VM is destroyed,
+    // Noesis already cleaned up its delegate list.  Our delegate
+    // callback (OnINPCChanged) just sets a dirty flag -- harmless if
+    // fired on a dead object's cleanup path.
+    // No stored pointers -- subscription is one-way.
 
-    // Widget DC INPC subscription tracking (Phase 3)
-    Noesis::INotifyPropertyChanged* widgetInpcTarget_ = nullptr;
-    Noesis::FrameworkElement* widgetInpcWidgetAddr_ = nullptr;  // raw address, verified before use
+    // Widget DC INPC subscription tracking (Phase 3).
+    // Fire-and-forget like element INPC above.  The widget DC address
+    // is stored as uintptr_t for duplicate-subscription avoidance only.
+    // The widget address is stored for re-discovery from the live widget
+    // list when the dirty flag fires.
+    uintptr_t widgetInpcDCAddr_ = 0;       // DC address, comparison only (never dereferenced)
+    uintptr_t widgetInpcWidgetAddr_ = 0;   // widget address, re-discovered from live widgets before use
 
-    // Widget container tracking (Strategy 4)
-    Noesis::Visual* cachedRoot_ = nullptr;
-    Noesis::Visual* widgetContainer_ = nullptr;
+    // Per-frame batching: INPC handlers set dirty flags instead of
+    // firing immediately.  The tick fires at most ONE callback per type
+    // per frame, eliminating the multi-property-change event storm.
+    bool inpcDirty_ = false;
+    bool widgetDCDirty_ = false;
+
+    // Widget container tracking (Strategy 4).
+    // All stored as uintptr_t -- comparison only, never dereferenced.
+    // widgetContainer_ is the exception: it's re-discovered each tick
+    // via FindWidgetContainer() when cachedRootAddr_ changes.
+    uintptr_t cachedRootAddr_ = 0;
+    Noesis::Visual* widgetContainer_ = nullptr;  // re-discovered from root each tick when root changes
     uint32_t prevWidgetCount_ = 0;
-    Noesis::Visual* prevWidgets_[kMaxWidgets] = {};
-
-    // Pre-addition widget set: saved when a widget addition is first
-    // detected, used at fire time to identify which widget is new.
-    uint32_t preAddWidgetCount_ = 0;
-    Noesis::Visual* preAddWidgets_[kMaxWidgets] = {};
+    uintptr_t prevWidgetAddrs_[kMaxWidgets] = {};
 
     lua::PersistentRegistryEntry callback_;
     bool forceNext_ = false;
+    bool postSettle_ = false;           // true on the ONE tick after settle expires
     bool hadFocusBefore_ = false;       // true once any focus/selection was found
-    bool pendingWidgetFire_ = false;    // deferred Strategy 4 fire pending
-    int widgetSettleCount_ = 0;         // ticks remaining before deferred fire
     int overlayPollCount_ = 0;
 
     // Strategy 3: event-driven selection detection.
@@ -1108,16 +1418,33 @@ private:
     // so IsElementVisible can reliably filter cross-tab TextBlocks.
     bool pendingNamedTexts_ = false;
     int namedTextsSettleCount_ = 0;
-    Noesis::Visual* pendingNamedTextsWidget_ = nullptr;  // raw address, verified against live widgets before use
+    uintptr_t pendingNamedTextsWidgetAddr_ = 0;  // widget address, verified against live widgets before use
 
     // Widgets that already have a SelectionChanged handler.
-    // Subscribe-only pattern (never Remove) -- track pointers to avoid
-    // adding duplicate handlers.  Raw pointers: if a widget is destroyed,
-    // its HashMap is torn down (handler gone).  A recycled address just
-    // means we skip subscribing (harmless -- the new widget at that
-    // address gets subscribed on its next widget set change).
-    Noesis::UIElement* subscribedWidgets_[kMaxWidgets] = {};
+    // Subscribe-only pattern (never Remove) -- track addresses to avoid
+    // adding duplicate handlers.  If a widget is destroyed, its HashMap
+    // is torn down (handler gone).  A recycled address just means we
+    // skip subscribing (harmless -- the new widget at that address gets
+    // subscribed on its next widget set change).
+    uintptr_t subscribedWidgetAddrs_[kMaxWidgets] = {};
     uint32_t subscribedWidgetCount_ = 0;
+
+    // ----- Tick Snapshot (one-per-frame state package) -----
+    // Populated throughout Tick(), dispatched once at the end.
+    ecl::lua::TickSnapshot tickSnapshot_;
+    std::string previousSnapshotElemId_;    // Delta: last sent elemId
+    std::string previousSnapshotCarousel_;  // Delta: last sent inline carousel value
+    std::vector<std::pair<std::string, std::string>> previousSnapshotDCProps_; // Delta: last sent DC props
+    int settleFramesRemaining_ = 0;        // Settling: frames left before sending
+
+    // Tree settle: number of frames to skip ALL tree walks after a
+    // selection change or widget set change.  Noesis tears down and
+    // rebuilds parts of the visual tree during tab switches; walking
+    // it mid-rebuild crashes on destroyed nodes.  This gives the layout
+    // engine time to finish before we re-enter the tree.
+    int treeSettleFrames_ = 0;
+
+    // (Accumulators removed -- snapshot is a local in Tick(), populated directly.)
 
     // Subscribe SelectionChanged on visible widgets.  Skip already-subscribed.
     // Prunes dead entries first: any tracked widget NOT in the current set
@@ -1126,35 +1453,36 @@ private:
     {
         if (!sSelectionChangedEvent) return;
 
-        // Prune dead entries: remove tracked widgets not in current set.
+        // Prune dead entries: remove tracked addresses not in current set.
         for (uint32_t i = 0; i < subscribedWidgetCount_; ) {
             bool alive = false;
             for (uint32_t j = 0; j < count; j++) {
-                if (widgets[j] == static_cast<Noesis::Visual*>(subscribedWidgets_[i])) {
+                if (reinterpret_cast<uintptr_t>(widgets[j]) == subscribedWidgetAddrs_[i]) {
                     alive = true;
                     break;
                 }
             }
             if (!alive) {
                 // Swap with last and shrink.
-                subscribedWidgets_[i] = subscribedWidgets_[subscribedWidgetCount_ - 1];
-                subscribedWidgets_[subscribedWidgetCount_ - 1] = nullptr;
+                subscribedWidgetAddrs_[i] = subscribedWidgetAddrs_[subscribedWidgetCount_ - 1];
+                subscribedWidgetAddrs_[subscribedWidgetCount_ - 1] = 0;
                 subscribedWidgetCount_--;
             } else {
                 i++;
             }
         }
 
-        // Subscribe on new widgets.
+        // Subscribe on new widgets (using fresh pointers from THIS tick).
         for (uint32_t i = 0; i < count; i++) {
             if (!widgets[i] || !IsVisibleDP(widgets[i])) continue;
 
             auto uiElement = static_cast<Noesis::UIElement*>(
                 const_cast<Noesis::Visual*>(widgets[i]));
+            auto elementAddr = reinterpret_cast<uintptr_t>(uiElement);
 
             bool alreadySubscribed = false;
             for (uint32_t j = 0; j < subscribedWidgetCount_; j++) {
-                if (subscribedWidgets_[j] == uiElement) {
+                if (subscribedWidgetAddrs_[j] == elementAddr) {
                     alreadySubscribed = true;
                     break;
                 }
@@ -1176,7 +1504,7 @@ private:
                         &SelectionDirtyDelegate::Handler});
             }
 
-            subscribedWidgets_[subscribedWidgetCount_] = uiElement;
+            subscribedWidgetAddrs_[subscribedWidgetCount_] = elementAddr;
             subscribedWidgetCount_++;
             WARN("[BG3Access] Subscribed SelectionChanged on widget %p", uiElement);
         }
@@ -1187,7 +1515,7 @@ private:
     void UnsubscribeAllSelectionChanged()
     {
         for (uint32_t i = 0; i < subscribedWidgetCount_; i++)
-            subscribedWidgets_[i] = nullptr;
+            subscribedWidgetAddrs_[i] = 0;
         subscribedWidgetCount_ = 0;
     }
 
@@ -1409,14 +1737,33 @@ static bool IsUIWidgetType(Noesis::Visual const* elem)
 static Noesis::Visual* FindWidgetContainer(Noesis::Visual* root)
 {
     if (!sUIWidgetType) return nullptr;
-    Noesis::Visual* cur = root;
-    for (int depth = 0; depth < 10 && cur; depth++) {
-        auto count = cur->GetVisualChildrenCount();
-        if (count == 0) return nullptr;
-        auto firstChild = cur->GetVisualChild(0);
-        if (firstChild && IsUIWidgetType(firstChild))
-            return cur;
-        cur = firstChild;
+    // BFS search for the visual node whose children are UIWidget instances.
+    // The original linear-descent (first-child-only) approach missed menus
+    // where the UIWidget wasn't at child index 0 (e.g. character creation
+    // after a state transition reorders children).
+    //
+    // We use a simple iterative approach: check each level's children.
+    // If ANY child at a level is a UIWidget, that level's parent is the
+    // container.  If none are, descend into children breadth-first.
+    std::vector<Noesis::Visual*> queue(64);
+    int queueHead = 0;
+    int queueTail = 0;
+    queue[queueTail++] = root;
+
+    while (queueHead < queueTail) {
+        auto node = queue[queueHead++];
+        auto childCount = node->GetVisualChildrenCount();
+        for (uint32_t i = 0; i < childCount; i++) {
+            auto child = node->GetVisualChild(i);
+            if (child && IsUIWidgetType(child))
+                return node;  // This node is the container
+        }
+        // No UIWidget children at this level -- enqueue children for
+        // next level.  Limit total nodes to prevent runaway searches.
+        for (uint32_t i = 0; i < childCount && queueTail < 60; i++) {
+            auto child = node->GetVisualChild(i);
+            if (child) queue[queueTail++] = child;
+        }
     }
     return nullptr;
 }
@@ -1460,6 +1807,7 @@ Noesis::UIElement* TryFocusManager(Noesis::Visual* elem, int depth,
     auto count = elem->GetVisualChildrenCount();
     for (int i = (int)count - 1; i >= 0; i--) {
         auto child = elem->GetVisualChild(i);
+        if (!child) continue;
         auto result = TryFocusManager(child, depth - 1, outScopeRoot);
         if (result) return result;
     }
@@ -1668,7 +2016,7 @@ Noesis::FrameworkElement* FindNameInWidgetScoped(char const* name,
 
     // BFS through visual children, max 5 levels deep, max 256 nodes.
     // NameScope owners are typically 2-5 levels below the UIWidget root.
-    Noesis::Visual* queue[256];
+    std::vector<Noesis::Visual*> queue(256);
     int front = 0, back = 0;
 
     // Seed with widget's direct children (level 1).
@@ -1739,9 +2087,10 @@ Noesis::UIElement* GetFocusedElement()
 
 bg3se::ui::UIStateMachine* GetStateMachine()
 {
-    Noesis::gStaticSymbols.Initialize();
-    return nullptr; // FIXME - not handled yet!
-    // return (*GetStaticSymbols().ls__gGlobalResourceManager)->UIManager->field_3B8.StateMachine;
+    // Stubbed out.  The ls.StateMachine instance is not a direct field
+    // in UIManager or EoCClient -- it's a XAML-instantiated Noesis
+    // component.  Searching for it via the Noesis tree from Lua instead.
+    return nullptr;
 }
 
 using FireStateEventProc = void(bg3se::ui::UIStateMachine*, bg3se::ui::UIStateMachine::EventResult&, bg3se::ui::UIStateMachine::EntityContext const&, bg3se::ui::UIStateMachine::EventArgs const&);
@@ -1846,25 +2195,8 @@ ecl::PlayerDragData* GetDragDrop(uint16_t playerId)
 // Accessibility Lua API functions
 // ---------------------------------------------------------------------------
 
-bool SubscribePropertyChanged(lua_State* L, Noesis::BaseComponent* target, lua::RegistryEntry callback)
-{
-    return INPCMonitor::Instance().Subscribe(L, target, std::move(callback));
-}
-
-void UnsubscribePropertyChanged()
-{
-    INPCMonitor::Instance().Unsubscribe();
-}
-
-bool SubscribeDPChanged(lua_State* L, Noesis::DependencyObject* target, lua::RegistryEntry callback)
-{
-    return DPMonitor::Instance().Subscribe(L, target, std::move(callback));
-}
-
-void UnsubscribeDPChanged()
-{
-    DPMonitor::Instance().Unsubscribe();
-}
+// Legacy SubscribePropertyChanged, UnsubscribePropertyChanged,
+// SubscribeDPChanged, UnsubscribeDPChanged deleted -- snapshot handles everything.
 
 bool SubscribeGlobalFocusChanged(lua_State* L, lua::RegistryEntry callback)
 {
@@ -2154,8 +2486,24 @@ static std::string ReadTypePropertyAsString(Noesis::BaseObject const* obj,
         char buf[32];
         snprintf(buf, sizeof(buf), "%.0f", value);
         return buf;
+    } else if (Noesis::TypeHelpers::IsDescendantOf(
+                   type->GetClassType(),
+                   Noesis::gStaticSymbols.TypeClasses.TypeEnum.Type)) {
+        // Enum properties (e.g. Ability=Strength, Skill=Deception).
+        // Read the underlying integer and look up the symbolic name.
+        int64_t enumValue = 0;
+        prop->GetCopy(obj, &enumValue);
+        auto enumType = static_cast<Noesis::TypeEnum const*>(type);
+        for (auto const& entry : enumType->mValues) {
+            if (entry.second == enumValue) {
+                return std::string(entry.first.Str());
+            }
+        }
+        // Enum value not found in the mapping -- return the numeric value
+        // so callers at least get something.
+        return std::to_string(enumValue);
     }
-    // Pointer / Ptr / object / enum types -- not convertible to string here.
+    // Pointer / Ptr / object types -- not convertible to string here.
     return {};
 }
 
@@ -2506,6 +2854,55 @@ static void TryCollectNamedTexts(
     }
 }
 
+// ---------------------------------------------------------------------------
+// ShallowChildTextScan: bounded BFS through visual children to find
+// TextBlock text.  Used by ExtractElementData for ContentControl/Control
+// elements whose displayed text is in template-generated children.
+// ---------------------------------------------------------------------------
+static std::string ShallowChildTextScan(Noesis::FrameworkElement* elem)
+{
+    if (!elem) return {};
+    std::vector<Noesis::Visual*> childQueue(64);
+    int childFront = 0, childBack = 0;
+    auto seedCount = elem->GetVisualChildrenCount();
+    for (uint32_t i = 0; i < seedCount && childBack < 64; i++) {
+        auto child = elem->GetVisualChild(i);
+        if (child) childQueue[childBack++] = child;
+    }
+    for (int level = 0; level < 5 && childFront < childBack; level++) {
+        int levelEnd = childBack;
+        while (childFront < levelEnd) {
+            auto cur = childQueue[childFront++];
+            auto curTypeName = cur->GetClassType()->GetName();
+            if (strstr(curTypeName, "TextBlock")) {
+                auto tbText = ReadTextBlockText(
+                    static_cast<Noesis::FrameworkElement*>(cur));
+                if (!tbText.empty()
+                    && tbText.find("[ForceUpdate]") == std::string::npos
+                    && tbText.find("s_HandleUnknown") == std::string::npos) {
+                    return tbText;
+                }
+            }
+            auto childChildCount = cur->GetVisualChildrenCount();
+            for (uint32_t i = 0; i < childChildCount && childBack < 64; i++) {
+                auto child = cur->GetVisualChild(i);
+                if (child) childQueue[childBack++] = child;
+            }
+        }
+    }
+    return {};
+}
+
+// Guarded wrapper: probes the element before scanning.  The BFS
+// operates on the currently focused element (alive this tick), so it
+// is lower risk than NameScope walks.  Probe catches the most obvious
+// corruption (vtable, child count) before entering the scan.
+static std::string TryShallowChildTextScan(Noesis::FrameworkElement* elem)
+{
+    if (!ProbeTextBlockElement(elem)) return {};
+    return ShallowChildTextScan(elem);
+}
+
 // DataContext type exclusion list for overlay widgets whose TextBlocks
 // have unresolved bindings.  These widgets are NOT content pages -- they
 // are download progress overlays, notification popups, etc.  Skipping
@@ -2520,6 +2917,11 @@ static bool IsOverlayDCType(const char* dcTypeName)
     if (strstr(dcTypeName, "DCModBrowserDownload")) return true;
     // DCModDownloadProgress: download progress bars
     if (strstr(dcTypeName, "DCModDownloadProgress")) return true;
+    // DCCharacterCreation: god-object DC with 43+ NameScope entries.
+    // Walking NameScope during race/class switches crashes because
+    // TextBlocks are destroyed mid-rebuild.  Character creation uses
+    // DC properties and BFS child scan instead of NameScope texts.
+    if (strstr(dcTypeName, "DCCharacterCreation")) return true;
     return false;
 }
 
@@ -2816,7 +3218,7 @@ static std::string ExtractTabName(Noesis::FrameworkElement* elem)
     // Walk up to 50 levels deep, return first TextBlock text found.
     {
         // BFS through visual children looking for TextBlocks.
-        Noesis::Visual* queue[256];
+        std::vector<Noesis::Visual*> queue(256);
         int front = 0, back = 0;
         auto seedCount = elem->GetVisualChildrenCount();
         for (uint32_t i = 0; i < seedCount && back < 256; i++) {
@@ -3071,7 +3473,9 @@ static void CollectDCProperties(FocusEventData& out, Noesis::BaseObject* dc)
 
         auto typeOfType = type->GetClassType();
 
-        // Scalar types: read as string
+        // Scalar types (including enums): read as string
+        bool isEnum = Noesis::TypeHelpers::IsDescendantOf(
+            typeOfType, Noesis::gStaticSymbols.TypeClasses.TypeEnum.Type);
         if (type == types.String.Type
             || type == types.CStringPtr.Type
             || type == types.LocaString.Type
@@ -3080,7 +3484,8 @@ static void CollectDCProperties(FocusEventData& out, Noesis::BaseObject* dc)
             || type == types.UInt32.Type
             || type == types.Int64.Type
             || type == types.Single.Type
-            || type == types.Double.Type) {
+            || type == types.Double.Type
+            || isEnum) {
 
             auto val = ReadTypePropertyAsString(dc, propInfo->Property);
             if (!val.empty()
@@ -3247,9 +3652,7 @@ static void ExtractElementData(FocusEventData& out, Noesis::FrameworkElement* el
         CollectDCProperties(out, dataContext);
     }
 
-    // elemText: direct property reads only.  No tree walking.
-    // For bound Content (buttons), elemText stays empty -- Lua falls back
-    // to cleaning up elemName ("NewGameButton" -> "New Game").
+    // elemText: primary extraction -- direct property reads.
     if (strstr(out.elemType.c_str(), "TextBlock")) {
         out.elemText = ReadTextBlockText(elem);
     }
@@ -3264,6 +3667,18 @@ static void ExtractElementData(FocusEventData& out, Noesis::FrameworkElement* el
             && str.find("[ForceUpdate]") == std::string::npos) {
             out.elemText = std::string(str.data(), str.size());
         }
+    }
+
+    // elemText: fallback -- bounded BFS through visual children.
+    // For ContentControl/Control elements (carousel selectors, template-
+    // driven controls), the displayed text lives in template-generated
+    // TextBlock children, not in any direct property.  Walk up to 5 levels
+    // deep with a 64-node queue to find the first meaningful TextBlock.
+    // Same pattern as ExtractTabName Try 4 but with tighter bounds.
+    // SEH-guarded because visual children may be partially destroyed
+    // during UI rebuilds (race/class tab switches in character creation).
+    if (out.elemText.empty()) {
+        out.elemText = TryShallowChildTextScan(elem);
     }
 
     // tabName
@@ -3394,10 +3809,6 @@ void RegisterUILib()
     MODULE_FUNCTION(GetDragDrop)
     MODULE_FUNCTION(EnableErrorReporting)
     // Accessibility
-    MODULE_FUNCTION(SubscribePropertyChanged)
-    MODULE_FUNCTION(UnsubscribePropertyChanged)
-    MODULE_FUNCTION(SubscribeDPChanged)
-    MODULE_FUNCTION(UnsubscribeDPChanged)
     MODULE_FUNCTION(SubscribeGlobalFocusChanged)
     MODULE_FUNCTION(UnsubscribeGlobalFocusChanged)
     MODULE_FUNCTION(ForceGlobalFocusUpdate)

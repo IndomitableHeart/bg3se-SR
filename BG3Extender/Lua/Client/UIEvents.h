@@ -18,7 +18,7 @@ using namespace bg3se::lua;
 // ---------------------------------------------------------------------------
 struct FocusEventData
 {
-    // Event type: "FocusChanged" (default) or "PropertyChanged" (INPC)
+    // Event type: "FocusChanged" (default), "WidgetAdded", "WidgetDCChanged"
     std::string eventType;
 
     // Element identity
@@ -109,6 +109,33 @@ private:
     SaltedPool<EventHandler> subscriptions_;
 };
 
+// ---------------------------------------------------------------------------
+// TickSnapshot: one-per-frame data package sent from C++ to Lua.
+// Contains the COMPLETE picture of what the user is looking at, plus
+// change flags telling Lua HOW to speak (full announcement vs value update).
+// No Noesis pointers -- all C++ primitives.
+// ---------------------------------------------------------------------------
+struct TickSnapshot
+{
+    // Change flags -- Lua uses these to decide speech behavior.
+    bool focusChanged = false;          // User moved to a different element
+    bool selectionChanged = false;      // Tab carousel selection changed
+    bool valueChanged = false;          // INPC property changed on focused element DC
+    bool inlineCarouselChanged = false; // Inline appearance carousel value changed
+    bool widgetAdded = false;           // New dialog/overlay widget appeared
+
+    // Current focused element state (full picture, not just changes).
+    FocusEventData focusedElement;
+
+    // Inline carousel value (from child ListBox selectionName TextBlock).
+    // Non-empty only when an inline carousel exists under the focused element.
+    std::string inlineCarouselValue;
+
+    // Widget added data (dialog/overlay detection).
+    // Only populated when widgetAdded == true.
+    FocusEventData widgetData;
+};
+
 class DeferredUIEvents
 {
 public:
@@ -117,10 +144,14 @@ public:
     void PostUpdate();
 
     void OnCommand(lua::PersistentRegistryEntry const& handler, Noesis::BaseCommand* command, Noesis::BaseComponent* parameter);
-    void OnPropertyChanged(lua::PersistentRegistryEntry const& handler, Noesis::BaseComponent* object, Noesis::Symbol property);
 
-    // Queue a focus event with pre-extracted data (no Noesis pointers).
+    // Legacy event queues -- kept for backwards compatibility during transition.
+    // TODO: remove once snapshot system is fully validated.
+    void OnPropertyChanged(lua::PersistentRegistryEntry const& handler, Noesis::BaseComponent* object, Noesis::Symbol property);
     void OnFocusChanged(lua::PersistentRegistryEntry const& handler, FocusEventData&& data);
+
+    // New snapshot dispatch: one call per tick with complete state.
+    void OnTickSnapshot(lua::PersistentRegistryEntry const& handler, TickSnapshot&& snapshot);
 
 private:
     struct DeferredCommand
@@ -143,10 +174,17 @@ private:
         FocusEventData Data;
     };
 
+    struct DeferredTickSnapshot
+    {
+        lua::PersistentRegistryEntry Handler;
+        TickSnapshot Snapshot;
+    };
+
     ClientState& state_;
     Array<DeferredCommand> commands_;
     Array<DeferredPropertyChange> propertyChanges_;
     Array<DeferredFocusChange> focusChanges_;
+    Array<DeferredTickSnapshot> tickSnapshots_;
 };
 
 END_SE()

@@ -423,6 +423,13 @@ static void PushTickSnapshotTable(lua_State* L, TickSnapshot const& snapshot)
     PushFocusEventTable(L, snapshot.focusedElement);
     lua_settable(L, -3);
 
+    // Selected element data (only when different from focused)
+    if (!snapshot.selectedElementData.elemType.empty()) {
+        lua_pushstring(L, "selectedElement");
+        PushFocusEventTable(L, snapshot.selectedElementData);
+        lua_settable(L, -3);
+    }
+
     // Widget data (nested table, only if widgetAdded)
     if (snapshot.widgetAdded) {
         lua_pushstring(L, "widgetData");

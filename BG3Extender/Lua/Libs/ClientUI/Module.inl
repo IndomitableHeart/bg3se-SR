@@ -69,6 +69,11 @@ static void CollectNamedTextsFromWidget(
 static void TryCollectNamedTexts(
     Noesis::FrameworkElement* widgetElem,
     std::vector<std::pair<std::string, std::string>>& namedTexts);
+static void GatherVisibleTextBlocks(
+    Noesis::FrameworkElement* root,
+    std::vector<std::string>& outTexts,
+    int maxDepth = 12,
+    int maxNodes = 256);
 
 Noesis::FrameworkElement* GetRoot()
 {
@@ -306,7 +311,11 @@ public:
         sSelectionDirtyFlag = false;
         for (uint32_t i = 0; i < kMaxWidgets; i++) {
             prevWidgetAddrs_[i] = 0;
+            prevWidgetVisible_[i] = false;
+            settleBaselineWidgetAddrs_[i] = 0;
+            settleBaselineWidgetVisible_[i] = false;
         }
+        settleBaselineWidgetCount_ = 0;
         return true;
     }
 
@@ -356,20 +365,29 @@ public:
         // ----- Gather current widget set -----
         uint32_t widgetCount = 0;
         Noesis::Visual* widgets[kMaxWidgets] = {};
+        bool widgetVisible[kMaxWidgets] = {};
         if (widgetContainer_) {
             auto count = widgetContainer_->GetVisualChildrenCount();
             widgetCount = (count < kMaxWidgets) ? count : kMaxWidgets;
-            for (uint32_t i = 0; i < widgetCount; i++)
+            for (uint32_t i = 0; i < widgetCount; i++) {
                 widgets[i] = widgetContainer_->GetVisualChild(i);
+                widgetVisible[i] = widgets[i] ? IsVisibleDP(widgets[i]) : false;
+            }
         }
 
         // ----- Quick widget set change check -----
+        // Detects pointer changes AND visibility changes (dialogs are
+        // pre-created hidden children that become visible on trigger).
         bool widgetSetJustChanged = false;
         if (widgetCount != prevWidgetCount_) {
             widgetSetJustChanged = true;
         } else if (widgetCount > 0) {
             for (uint32_t i = 0; i < widgetCount; i++) {
                 if (reinterpret_cast<uintptr_t>(widgets[i]) != prevWidgetAddrs_[i]) {
+                    widgetSetJustChanged = true;
+                    break;
+                }
+                if (widgetVisible[i] != prevWidgetVisible_[i]) {
                     widgetSetJustChanged = true;
                     break;
                 }
@@ -382,6 +400,19 @@ public:
         // widget set change.  This adapts to however long Noesis takes
         // to finish building -- no guessing, no double-settle chaining.
         // Hard cap at 30 frames (~500ms) to prevent infinite settling.
+        //
+        // IMPORTANT: Capture the pre-update widget state BEFORE the
+        // widgetSetJustChanged block updates prevWidgetAddrs_.  When
+        // SelectionChanged and a widget swap happen on the same tick,
+        // the baseline must reflect the state BEFORE the swap, not after.
+        uint32_t preUpdateWidgetCount = prevWidgetCount_;
+        uintptr_t preUpdateWidgetAddrs[kMaxWidgets];
+        bool preUpdateWidgetVisible[kMaxWidgets];
+        for (uint32_t i = 0; i < kMaxWidgets; i++) {
+            preUpdateWidgetAddrs[i] = prevWidgetAddrs_[i];
+            preUpdateWidgetVisible[i] = prevWidgetVisible_[i];
+        }
+
         bool somethingChanged = false;
         if (sSelectionDirtyFlag) {
             sSelectionDirtyFlag = false;
@@ -391,9 +422,11 @@ public:
         if (widgetSetJustChanged && hadFocusBefore_) {
             // Update widget baseline so next tick can detect further changes.
             prevWidgetCount_ = widgetCount;
-            for (uint32_t i = 0; i < kMaxWidgets; i++)
+            for (uint32_t i = 0; i < kMaxWidgets; i++) {
                 prevWidgetAddrs_[i] = (i < widgetCount)
                     ? reinterpret_cast<uintptr_t>(widgets[i]) : 0;
+                prevWidgetVisible_[i] = (i < widgetCount) ? widgetVisible[i] : false;
+            }
             somethingChanged = true;
         }
 
@@ -403,6 +436,14 @@ public:
                 settling_ = true;
                 settleStableCount_ = 0;
                 settleTotalCount_ = 0;
+                // Save the pre-update widget state as baseline.  This is
+                // from BEFORE widgetSetJustChanged updated prevWidgetAddrs_,
+                // so it reflects the state before any widget swaps on this tick.
+                settleBaselineWidgetCount_ = preUpdateWidgetCount;
+                for (uint32_t i = 0; i < kMaxWidgets; i++) {
+                    settleBaselineWidgetAddrs_[i] = preUpdateWidgetAddrs[i];
+                    settleBaselineWidgetVisible_[i] = preUpdateWidgetVisible[i];
+                }
             } else {
                 // Something changed during settle -- reset stability counter.
                 settleStableCount_ = 0;
@@ -621,10 +662,27 @@ public:
 
         // ----- Strategy 4: Widget set change detection -----
         // Compare current widget addresses against stored addresses.
-        uint32_t oldWidgetCount = prevWidgetCount_;
+        // On post-settle ticks, compare against the PRE-SETTLE baseline
+        // (saved when settle started).  During settle, prevWidgetAddrs_
+        // is updated each frame for stability detection, which destroys
+        // the original baseline.  Without this, widgets added during
+        // settle (dialogs, overlays) would never be detected as "new."
+        uint32_t oldWidgetCount;
         uintptr_t oldWidgetAddrs[kMaxWidgets] = {};
-        for (uint32_t i = 0; i < oldWidgetCount && i < kMaxWidgets; i++)
-            oldWidgetAddrs[i] = prevWidgetAddrs_[i];
+        bool oldWidgetVisible[kMaxWidgets] = {};
+        if (postSettle_) {
+            oldWidgetCount = settleBaselineWidgetCount_;
+            for (uint32_t i = 0; i < oldWidgetCount && i < kMaxWidgets; i++) {
+                oldWidgetAddrs[i] = settleBaselineWidgetAddrs_[i];
+                oldWidgetVisible[i] = settleBaselineWidgetVisible_[i];
+            }
+        } else {
+            oldWidgetCount = prevWidgetCount_;
+            for (uint32_t i = 0; i < oldWidgetCount && i < kMaxWidgets; i++) {
+                oldWidgetAddrs[i] = prevWidgetAddrs_[i];
+                oldWidgetVisible[i] = prevWidgetVisible_[i];
+            }
+        }
 
         bool widgetSetChanged = false;
         if (widgetCount != oldWidgetCount) {
@@ -632,6 +690,10 @@ public:
         } else {
             for (uint32_t i = 0; i < widgetCount; i++) {
                 if (reinterpret_cast<uintptr_t>(widgets[i]) != oldWidgetAddrs[i]) {
+                    widgetSetChanged = true;
+                    break;
+                }
+                if (widgetVisible[i] != oldWidgetVisible[i]) {
                     widgetSetChanged = true;
                     break;
                 }
@@ -643,12 +705,13 @@ public:
             initialSelectionDone_ = false;
         }
 
-        // Update cached widget addresses.  Stored as uintptr_t -- NEVER
-        // cast back to pointers.  Used only for equality comparison to
-        // detect widget set changes between ticks.
+        // Update cached widget addresses and visibility.  Stored as
+        // uintptr_t -- NEVER cast back to pointers.  Used only for
+        // equality comparison to detect widget set changes between ticks.
         prevWidgetCount_ = widgetCount;
         for (uint32_t i = 0; i < kMaxWidgets; i++) {
             prevWidgetAddrs_[i] = (i < widgetCount) ? reinterpret_cast<uintptr_t>(widgets[i]) : 0;
+            prevWidgetVisible_[i] = (i < widgetCount) ? widgetVisible[i] : false;
         }
 
         // ----- Diagnostic logging -----
@@ -741,29 +804,48 @@ public:
             if (widgetCount > oldWidgetCount) {
                 widgetAdded = true;
             } else {
-                // Same count but different addresses -- check if any are new
+                // Same count -- check for new addresses OR newly visible
                 for (uint32_t i = 0; i < widgetCount; i++) {
-                    bool found = false;
                     auto currentAddr = reinterpret_cast<uintptr_t>(widgets[i]);
+                    bool foundAddr = false;
+                    bool wasVisible = false;
                     for (uint32_t j = 0; j < oldWidgetCount; j++) {
-                        if (currentAddr == oldWidgetAddrs[j]) { found = true; break; }
+                        if (currentAddr == oldWidgetAddrs[j]) {
+                            foundAddr = true;
+                            wasVisible = oldWidgetVisible[j];
+                            break;
+                        }
                     }
-                    if (!found) { widgetAdded = true; break; }
+                    // New pointer, or was hidden and is now visible
+                    if (!foundAddr || (widgetVisible[i] && !wasVisible)) {
+                        widgetAdded = true;
+                        break;
+                    }
                 }
             }
 
             if (widgetAdded) {
                 // Widget changes now always go through the settle window
                 // at the top of Tick().  By the time we reach here, the tree
-                // is stable (post-settle).  Fire for EACH new visible widget.
-                // widgets[] array contains fresh pointers from THIS tick.
+                // is stable (post-settle).  Fire for EACH new/newly-visible
+                // widget.  widgets[] array contains fresh pointers from THIS tick.
                 bool fired = false;
                 for (int i = (int)widgetCount - 1; i >= 0; i--) {
-                    if (!widgets[i] || !IsVisibleDP(widgets[i])) continue;
-                    bool isNew = true;
+                    if (!widgets[i] || !widgetVisible[i]) continue;
                     auto currentAddr = reinterpret_cast<uintptr_t>(widgets[i]);
+                    bool isNew = false;
+                    bool foundAddr = false;
+                    bool wasVisible = false;
                     for (uint32_t j = 0; j < oldWidgetCount; j++) {
-                        if (currentAddr == oldWidgetAddrs[j]) { isNew = false; break; }
+                        if (currentAddr == oldWidgetAddrs[j]) {
+                            foundAddr = true;
+                            wasVisible = oldWidgetVisible[j];
+                            break;
+                        }
+                    }
+                    // Fire for new pointers or widgets that just became visible
+                    if (!foundAddr || !wasVisible) {
+                        isNew = true;
                     }
                     if (isNew) {
                         WARN("[BG3Access]   -> FIRE widgetAdded (widget[%d])", i);
@@ -777,7 +859,7 @@ public:
                 if (!fired) {
                     // All addresses swapped -- fire topmost visible as fallback.
                     for (int i = (int)widgetCount - 1; i >= 0; i--) {
-                        if (!widgets[i] || !IsVisibleDP(widgets[i])) continue;
+                        if (!widgets[i] || !widgetVisible[i]) continue;
                         WARN("[BG3Access]   -> FIRE widgetAdded fallback (widget[%d])", i);
                         ExtractWidgetData(
                             static_cast<Noesis::UIElement*>(
@@ -838,6 +920,69 @@ public:
         // After a tab switch, wait for Noesis to update Visibility states
         // Track whether we've ever had focus (for Strategy 4 guard).
         if (focused || selected) hadFocusBefore_ = true;
+
+        // ----- Initial widget scan (splash screen, loading text) -----
+        // When widgets exist but nothing has focus yet (hadFocusBefore_
+        // is false), the normal detection paths are blocked.  Scan
+        // visible widgets to extract text from screens that have no
+        // focusable elements (e.g., "Press any key to continue").
+        //
+        // Runs once per STABLE widget set.  When the widget set changes
+        // (loading screen -> splash screen), the stability counter resets
+        // and we scan the new set after it stabilizes.  Uses a simple
+        // fingerprint (widget count + first widget address) to detect
+        // whether the set has changed since the last scan.
+        // Also scan when focus is lost (in-game loading screens after
+        // menus had focus).  The fingerprint prevents re-scanning the
+        // same widget set, so this only fires on genuine changes.
+        if (!focused && !selected && widgetCount > 0) {
+            // Fingerprint: count + first widget address.
+            uintptr_t firstWidgetAddr = reinterpret_cast<uintptr_t>(widgets[0]);
+            bool setChanged = (widgetCount != lastScanWidgetCount_
+                            || firstWidgetAddr != lastScanFirstAddr_);
+            if (setChanged) {
+                initialWidgetScanDelay_ = 0;
+                lastScanWidgetCount_ = widgetCount;
+                lastScanFirstAddr_ = firstWidgetAddr;
+            }
+            initialWidgetScanDelay_++;
+            if (initialWidgetScanDelay_ == 10) {
+                WARN("[BG3Access] Initial widget scan (%u widgets)", widgetCount);
+                for (int i = (int)widgetCount - 1; i >= 0; i--) {
+                    if (!widgets[i] || !IsVisibleDP(widgets[i])) continue;
+                    auto widgetElem = static_cast<Noesis::FrameworkElement*>(
+                        const_cast<Noesis::Visual*>(widgets[i]));
+
+                    // Skip overlay widgets (notifications, etc.) -- they
+                    // contain stale text like "Your Turn" that shouldn't speak.
+                    if (sDataContextProp) {
+                        auto depObj = static_cast<Noesis::DependencyObject const*>(widgetElem);
+                        auto dcVal = sDataContextProp->GetValue(depObj);
+                        if (dcVal) {
+                            auto dc = *reinterpret_cast<Noesis::BaseComponent* const*>(dcVal);
+                            if (dc && IsOverlayDCType(dc->GetClassType()->GetName())) continue;
+                        }
+                    }
+
+                    WARN("[BG3Access]   Initial scan: widget[%d]", i);
+                    ExtractWidgetData(widgetElem, *snapshot);
+                    TryCollectNamedTexts(widgetElem, snapshot->focusedElement.namedTexts);
+
+                    // Fallback: if NameScope found no text, BFS the visual
+                    // tree for TextBlocks inside ControlTemplates (e.g.,
+                    // splash screen "Press any key to continue").
+                    if (snapshot->focusedElement.namedTexts.empty()) {
+                        std::vector<std::string> visualTexts;
+                        GatherVisibleTextBlocks(widgetElem, visualTexts);
+                        for (auto& visualText : visualTexts) {
+                            WARN("[BG3Access]     Visual text: %s", visualText.c_str());
+                            snapshot->focusedElement.namedTexts.push_back(
+                                {"_visualText", std::move(visualText)});
+                        }
+                    }
+                }
+            }
+        }
 
         // Keep polling when nothing is focused (give new widgets time
         // to settle and acquire focus).  Cap at 30 ticks to avoid
@@ -1190,6 +1335,10 @@ public:
         widgetContainer_ = nullptr;
         prevWidgetCount_ = 0;
         hadFocusBefore_ = false;
+        // NOTE: scan tracking fields (initialWidgetScanDelay_,
+        // lastScanWidgetCount_, lastScanFirstAddr_) intentionally NOT
+        // reset here.  GameStateChanged fires multiple times during load
+        // and resetting causes the same tip to repeat on each transition.
         initialSelectionDone_ = false;
         sSelectionDirtyFlag = false;
         inpcDirty_ = false;
@@ -1199,8 +1348,12 @@ public:
         settling_ = false;
         settleStableCount_ = 0;
         settleTotalCount_ = 0;
+        settleBaselineWidgetCount_ = 0;
         for (uint32_t i = 0; i < kMaxWidgets; i++) {
             prevWidgetAddrs_[i] = 0;
+            prevWidgetVisible_[i] = false;
+            settleBaselineWidgetAddrs_[i] = 0;
+            settleBaselineWidgetVisible_[i] = false;
         }
     }
 
@@ -1280,6 +1433,10 @@ private:
                 if (dataContext) {
                     data.dcType = dataContext->GetClassType()->GetName();
                     CollectDCProperties(data, dataContext);
+
+                    // NOTE: Actions collection enumeration via DynamicCast<IList*>
+                    // crashes the Noesis Indie SDK type registry.  Dialog button
+                    // hints are handled in Lua based on dcType instead.
 
                     // Subscribe widget DC INPC for property change tracking.
                     // Pass widget element for namedTexts collection on DC change.
@@ -1413,11 +1570,25 @@ private:
     Noesis::Visual* widgetContainer_ = nullptr;  // re-discovered from root each tick when root changes
     uint32_t prevWidgetCount_ = 0;
     uintptr_t prevWidgetAddrs_[kMaxWidgets] = {};
+    bool prevWidgetVisible_[kMaxWidgets] = {};
+
+    // Pre-settle baseline: saved when settle STARTS so that post-settle
+    // Strategy 4 can compare against the state BEFORE the settle window.
+    // Without this, prevWidgetAddrs_/prevWidgetVisible_ are updated
+    // during settle (for stability detection), destroying the baseline.
+    // Dialogs/overlays that appear or become visible during settle
+    // would never be detected as "new."
+    uint32_t settleBaselineWidgetCount_ = 0;
+    uintptr_t settleBaselineWidgetAddrs_[kMaxWidgets] = {};
+    bool settleBaselineWidgetVisible_[kMaxWidgets] = {};
 
     lua::PersistentRegistryEntry callback_;
     bool forceNext_ = false;
     bool postSettle_ = false;           // true on the ONE tick after settle expires
     bool hadFocusBefore_ = false;       // true once any focus/selection was found
+    int initialWidgetScanDelay_ = 0;      // stability counter for pre-focus scan
+    uint32_t lastScanWidgetCount_ = 0;   // fingerprint: widget count at last scan
+    uintptr_t lastScanFirstAddr_ = 0;    // fingerprint: first widget addr at last scan
     int overlayPollCount_ = 0;
 
     // Strategy 3: event-driven selection detection.
@@ -2861,6 +3032,69 @@ static void TryCollectNamedTexts(
         CollectNamedTextsFromWidget(widgetElem, namedTexts);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         WARN("[BG3Access]   NameScope: CRASH in CollectNamedTextsFromWidget, skipping");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GatherVisibleTextBlocks: BFS walk of the visual tree to find TextBlocks
+// with readable text.  Used as a fallback when NameScope iteration finds
+// nothing (e.g., splash screen text inside ControlTemplates).
+//
+// Safety:
+// - Only called on fresh pointers from the current tick
+// - IsVisibleDP pruning skips collapsed branches
+// - Depth and node count caps prevent runaway walks
+// - Does not recurse into child UIWidgets (separate scope)
+// - ReadTextBlockText is proven safe (used throughout the codebase)
+// - SEH guard at the call site catches unexpected crashes
+// ---------------------------------------------------------------------------
+static void GatherVisibleTextBlocks(
+    Noesis::FrameworkElement* root,
+    std::vector<std::string>& outTexts,
+    int maxDepth,
+    int maxNodes)
+{
+    if (!root) return;
+
+    struct QueueEntry {
+        Noesis::Visual* node;
+        int depth;
+    };
+    // Stack-allocated queue with fixed capacity.
+    std::vector<QueueEntry> queue;
+    queue.reserve(maxNodes);
+    queue.push_back({root, 0});
+    int processed = 0;
+
+    while (processed < (int)queue.size() && processed < maxNodes) {
+        auto entry = queue[processed++];
+        if (!entry.node || entry.depth > maxDepth) continue;
+        if (!IsVisibleDP(entry.node)) continue;
+
+        // Do not recurse into child UIWidgets -- they have their own scope.
+        if (entry.node != root && IsUIWidgetType(entry.node)) continue;
+
+        auto typeName = entry.node->GetClassType()->GetName();
+
+        // Found a TextBlock: read its text and stop recursing into it
+        // (children are Inline objects handled by ReadTextBlockText).
+        if (strstr(typeName, "TextBlock")) {
+            auto text = ReadTextBlockText(
+                static_cast<Noesis::FrameworkElement*>(entry.node));
+            if (!text.empty()
+                && text.find("[ForceUpdate]") == std::string::npos
+                && text.find("s_HandleUnknown") == std::string::npos) {
+                outTexts.push_back(std::move(text));
+            }
+            continue;
+        }
+
+        // Enqueue visible children for BFS.
+        auto childCount = entry.node->GetVisualChildrenCount();
+        for (uint32_t i = 0; i < childCount
+             && (int)queue.size() < maxNodes; i++) {
+            queue.push_back({entry.node->GetVisualChild(i), entry.depth + 1});
+        }
     }
 }
 

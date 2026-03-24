@@ -141,6 +141,7 @@ static void ExtractElementData(FocusEventData& out, Noesis::FrameworkElement* el
 static void CollectDCProperties(FocusEventData& out, Noesis::BaseObject* dc);
 static std::string ReadPropertyAsString(Noesis::BaseObject const* obj, const char* propName);
 static void ExtractBindingInfo(FocusEventData& out, Noesis::FrameworkElement* elem);
+static bool IsOverlayDCType(const char* dcTypeName);
 
 // GlobalFocusMonitor: per-frame focus/selection change detector.
 //
@@ -416,7 +417,7 @@ public:
                 settleStableCount_++;
             }
 
-            if (settleStableCount_ >= 3 || settleTotalCount_ >= 30) {
+            if (settleStableCount_ >= 5 || settleTotalCount_ >= 30) {
                 // Stable for 3 frames or hard cap reached.
                 WARN("[BG3Access] Settle: complete after %u frames (%u stable)",
                      settleTotalCount_, settleStableCount_);
@@ -808,6 +809,27 @@ public:
                 WARN("[BG3Access]   -> Post-settle NameScope (widget[%d])", i);
                 TryCollectNamedTexts(widgetElem, snapshot->focusedElement.namedTexts);
             }
+
+            // Subscribe widget DC INPC on the first non-overlay content
+            // widget.  Does NOT set widgetAdded -- the INPC handler
+            // fires widgetAdded when the DC actually changes, avoiding
+            // stale DC reads from widgets the game hasn't swapped yet.
+            for (uint32_t i = 0; i < widgetCount; i++) {
+                if (!widgets[i] || !IsVisibleDP(widgets[i])) continue;
+                auto widgetElem = static_cast<Noesis::FrameworkElement*>(
+                    const_cast<Noesis::Visual*>(widgets[i]));
+                if (!sDataContextProp) continue;
+                auto depObj = static_cast<Noesis::DependencyObject const*>(widgetElem);
+                auto dcVal = sDataContextProp->GetValue(depObj);
+                if (!dcVal) continue;
+                auto dataContext = *reinterpret_cast<Noesis::BaseComponent* const*>(dcVal);
+                if (!dataContext) continue;
+                auto dcTypeName = dataContext->GetClassType()->GetName();
+                if (IsOverlayDCType(dcTypeName)) continue;
+                WARN("[BG3Access]   -> Post-settle INPC subscribe (widget[%u] DC=%s)", i, dcTypeName);
+                SubscribeWidgetINPC(dataContext, widgetElem);
+                break;
+            }
         }
         bool wasPostSettle = postSettle_;
         postSettle_ = false;
@@ -896,6 +918,17 @@ public:
                     if (snapshot->focusedElement.dcScalarProps.empty()) {
                         snapshot->focusedElement.dcScalarProps = std::move(widgetDCData->dcScalarProps);
                         snapshot->focusedElement.dcType = widgetDCData->dcType;
+                    }
+
+                    // Set widgetAdded so Lua can detect DC changes (e.g.,
+                    // DCControllerOptions for interactive controller mode).
+                    // This only fires when the DC actually changes (INPC),
+                    // not on stale reads.
+                    if (!snapshot->widgetAdded) {
+                        snapshot->widgetAdded = true;
+                        snapshot->widgetData.eventType = "WidgetDCChanged";
+                        snapshot->widgetData.dcType = freshDC->GetClassType()->GetName();
+                        CollectDCProperties(snapshot->widgetData, freshDC);
                     }
                 }
             }
@@ -1009,7 +1042,6 @@ public:
             snapshot->selectionChanged = selectionChanged || snapshot->selectionChanged;
 
             // Focused element data: ONLY use elements obtained THIS frame.
-            // lastFocusedAddr_ is an opaque address -- never dereference.
             Noesis::UIElement* snapshotElement = focused;
             if (!snapshotElement && selected && selectedIsFresh) {
                 snapshotElement = selected;
@@ -1017,6 +1049,15 @@ public:
             if (snapshotElement) {
                 ExtractElementData(snapshot->focusedElement,
                     static_cast<Noesis::FrameworkElement*>(snapshotElement));
+            }
+
+            // Selected element: when Strategy 3 found a ListBoxItem that
+            // differs from the focused element, send its data too.
+            // Lua needs both: focused for item text, selected for section
+            // label DC (VMSelectableRace, VMSelectableClass, etc.).
+            if (selected && selectedIsFresh && selected != snapshotElement) {
+                ExtractElementData(snapshot->selectedElementData,
+                    static_cast<Noesis::FrameworkElement*>(selected));
             }
 
             // Inline carousel value (already detected above)

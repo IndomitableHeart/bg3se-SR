@@ -131,6 +131,11 @@ struct TickSnapshot
     // Non-empty only when an inline carousel exists under the focused element.
     std::string inlineCarouselValue;
 
+    // Selected element data (from Strategy 3 ListBoxItem when it differs
+    // from the focused element).  Carries the VM DC type needed for CC
+    // section labels (VMSelectableRace -> "Race", etc.).
+    FocusEventData selectedElementData;
+
     // Widget added data (dialog/overlay detection).
     // Only populated when widgetAdded == true.
     FocusEventData widgetData;

@@ -282,6 +282,7 @@ static void PushFocusEventTable(lua_State* L, FocusEventData const& data)
         }
         lua_settable(L, -3);
     }
+
 }
 
 // Forward declaration (defined after PostUpdate).

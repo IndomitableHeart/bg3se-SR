@@ -452,6 +452,7 @@ public:
 
         if (settling_) {
             settleTotalCount_++;
+
             if (somethingChanged) {
                 settleStableCount_ = 0;
             } else {
@@ -459,7 +460,7 @@ public:
             }
 
             if (settleStableCount_ >= 5 || settleTotalCount_ >= 30) {
-                // Stable for 3 frames or hard cap reached.
+                // Stable for 5 frames or hard cap reached.
                 WARN("[BG3Access] Settle: complete after %u frames (%u stable)",
                      settleTotalCount_, settleStableCount_);
                 settling_ = false;
@@ -911,6 +912,33 @@ public:
                 WARN("[BG3Access]   -> Post-settle INPC subscribe (widget[%u] DC=%s)", i, dcTypeName);
                 SubscribeWidgetINPC(dataContext, widgetElem);
                 break;
+            }
+
+            // Targeted CC step read: when the CC god-object widget is
+            // present, read CharacterCreationStep and store it as a
+            // special namedText so Lua can detect page transitions.
+            // This is safe (one property read) and avoids subscribing
+            // INPC on the 100+ property god-object.
+            for (uint32_t i = 0; i < widgetCount; i++) {
+                if (!widgets[i] || !IsVisibleDP(widgets[i])) continue;
+                auto widgetElem = static_cast<Noesis::FrameworkElement*>(
+                    const_cast<Noesis::Visual*>(widgets[i]));
+                if (!sDataContextProp) continue;
+                auto depObj = static_cast<Noesis::DependencyObject const*>(widgetElem);
+                auto dcVal = sDataContextProp->GetValue(depObj);
+                if (!dcVal) continue;
+                auto dc = *reinterpret_cast<Noesis::BaseComponent* const*>(dcVal);
+                if (!dc) continue;
+                auto dcTypeName = dc->GetClassType()->GetName();
+                if (strstr(dcTypeName, "DCCharacterCreation")) {
+                    auto stepVal = ReadPropertyAsString(dc, "CharacterCreationStep");
+                    if (!stepVal.empty()) {
+                        snapshot->focusedElement.namedTexts.push_back(
+                            {"_ccStep", stepVal});
+                        WARN("[BG3Access]   -> CC step: %s", stepVal.c_str());
+                    }
+                    break;
+                }
             }
         }
         bool wasPostSettle = postSettle_;

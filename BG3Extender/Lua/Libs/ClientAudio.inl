@@ -1,5 +1,7 @@
 #include <GameDefinitions/Symbols.h>
 #include <GameDefinitions/Sound.h>
+#include <mmsystem.h>
+#pragma comment(lib, "winmm.lib")
 
 /// <lua_module>Audio</lua_module>
 BEGIN_NS(ecl::lua::audio)
@@ -173,6 +175,70 @@ bool PlayExternalSound(LuaSoundObjectId soundObject, char const* eventName, char
     return GetSoundManager()->PlayExternalSound((SoundObjectId)soundObject, eventId, lsPath, (uint8_t)codec, positionSec.value_or(0.0f), false, nullptr);
 }
 
+// ---------------------------------------------------------------------------
+// MCI-based file playback -- plays a WAV file through the Windows audio
+// pipeline alongside the game audio.  Supports play, pause, resume, stop.
+// Path is relative to the game Data directory.
+// ---------------------------------------------------------------------------
+
+static bool gFileIsPlaying = false;
+static std::wstring gPlayingFilePath;
+
+bool PlayFile(char const* path)
+{
+    // Stop any previous playback.
+    if (gFileIsPlaying) {
+        PlaySoundW(nullptr, nullptr, 0);
+        gFileIsPlaying = false;
+        gPlayingFilePath.clear();
+    }
+
+    STDString lsPath = GetStaticSymbols().ToPath(path, PathRootType::Data);
+    std::wstring widePath(lsPath.begin(), lsPath.end());
+
+    BOOL result = PlaySoundW(widePath.c_str(), nullptr,
+        SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
+    if (!result) {
+        ERR("PlayFile failed for: %ls", widePath.c_str());
+        return false;
+    }
+
+    gFileIsPlaying = true;
+    gPlayingFilePath = widePath;
+    return true;
+}
+
+void PauseFile()
+{
+    // PlaySoundW does not support pause.  Stop instead.
+    if (gFileIsPlaying) {
+        PlaySoundW(nullptr, nullptr, 0);
+    }
+}
+
+void ResumeFile()
+{
+    // PlaySoundW does not support resume.  Restart from beginning.
+    if (gFileIsPlaying && !gPlayingFilePath.empty()) {
+        PlaySoundW(gPlayingFilePath.c_str(), nullptr,
+            SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
+    }
+}
+
+void StopFile()
+{
+    if (gFileIsPlaying) {
+        PlaySoundW(nullptr, nullptr, 0);
+        gFileIsPlaying = false;
+        gPlayingFilePath.clear();
+    }
+}
+
+bool IsFilePlaying()
+{
+    return gFileIsPlaying;
+}
+
 bool LoadBank(const char* bankName)
 {
     SoundNameId bankId{ -1 };
@@ -215,6 +281,11 @@ void RegisterAudioLib()
     MODULE_FUNCTION(LoadEvent)
     MODULE_FUNCTION(UnloadEvent)
     MODULE_FUNCTION(PlayExternalSound)
+    MODULE_FUNCTION(PlayFile)
+    MODULE_FUNCTION(PauseFile)
+    MODULE_FUNCTION(ResumeFile)
+    MODULE_FUNCTION(StopFile)
+    MODULE_FUNCTION(IsFilePlaying)
     MODULE_FUNCTION(LoadBank)
     MODULE_FUNCTION(UnloadBank)
     MODULE_FUNCTION(PrepareBank)

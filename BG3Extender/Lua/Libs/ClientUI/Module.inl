@@ -185,6 +185,21 @@ static bool ProbeUIElement(Noesis::UIElement* elem)
     }
 }
 
+// Targeted probe for GetVisualChildrenCount vtable slot, which can be
+// independently corrupted on freed elements even when GetClassType passes.
+// Use before GetVisualChildrenCount/GetVisualChild on elements obtained
+// from tree walks (not on the element itself at function entry -- use
+// ProbeUIElement for that).
+static bool ProbeVisualChildren(Noesis::Visual* elem)
+{
+    __try {
+        (void)elem->GetVisualChildrenCount();
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 // Handler for Selector.SelectionChanged routed events.  Uses the
 // DummyDelegate pattern (same as UIEventHooks): 'this' is a fake pointer
 // that is never dereferenced.  Extracts the selected element directly
@@ -305,6 +320,7 @@ public:
         lastSelectedDCAddr_ = 0;
         cachedRootAddr_ = 0;
         widgetContainer_ = nullptr;
+        forcedNullCount_ = 0;
         prevWidgetCount_ = 0;
         hadFocusBefore_ = false;
         initialSelectionDone_ = false;
@@ -371,7 +387,11 @@ public:
             widgetCount = (count < kMaxWidgets) ? count : kMaxWidgets;
             for (uint32_t i = 0; i < widgetCount; i++) {
                 widgets[i] = widgetContainer_->GetVisualChild(i);
-                widgetVisible[i] = widgets[i] ? IsVisibleDP(widgets[i]) : false;
+                if (!widgets[i]) { widgetVisible[i] = false; continue; }
+                if (!ProbeUIElement(static_cast<Noesis::UIElement*>(widgets[i]))) {
+                    widgets[i] = nullptr; widgetVisible[i] = false; continue;
+                }
+                widgetVisible[i] = IsVisibleDP(widgets[i]);
             }
         }
 
@@ -469,6 +489,7 @@ public:
                 forceNext_ = true;
                 postSettle_ = true;
                 lastFocusedAddr_ = 0;
+                lastFocusedDCAddr_ = 0;
                 lastSelectedAddr_ = 0;
                 lastSelectedDCAddr_ = 0;
             } else {
@@ -625,11 +646,33 @@ public:
             }
         }
 
+        // ----- Focused element DataContext for DC-swap detection -----
+        // Same pattern as selDC: address-only, never dereferenced.
+        // Catches content-area items (e.g. Skills) whose container is
+        // reused with a new ViewModel a few ticks after focus arrives.
+        uintptr_t focusedDCAddr = 0;
+        if (focused && sDataContextProp) {
+            auto depObj = static_cast<Noesis::DependencyObject const*>(focused);
+            auto dcVal = sDataContextProp->GetValue(depObj);
+            if (dcVal) {
+                auto dataContext = *reinterpret_cast<const void* const*>(dcVal);
+                focusedDCAddr = reinterpret_cast<uintptr_t>(dataContext);
+            }
+        }
+
         bool forced = forceNext_;
         forceNext_ = false;
 
         // Track focus and selection independently.
+        // Focus fires when element changes OR when the same element gets
+        // a new DataContext (DC swap -- container recycling in content areas).
         bool focusChanged = (reinterpret_cast<uintptr_t>(focused) != lastFocusedAddr_);
+        if (!focusChanged && focused
+            && focusedDCAddr != lastFocusedDCAddr_
+            && focusedDCAddr != 0 && lastFocusedDCAddr_ != 0) {
+            // Same element, DC swapped to a different non-null value
+            focusChanged = true;
+        }
         // Selection change fires when:
         // - DataContext address changed (carousel recycling: same element,
         //   new DC -- fires once).
@@ -723,14 +766,17 @@ public:
                         && !widgetSetChanged && !focused && !selected;
         if ((focusChanged || selectionChanged || forced || widgetSetChanged)
             && !forcedNoOp) {
-            WARN("[BG3Access] Tick: focused=%p scopeRoot=%p selected=%p selDC=0x%llx prevSelDC=0x%llx focChg=%d selChg=%d forced=%d wChg=%d widgets=%u",
-                focused, scopeRoot, selected, (unsigned long long)selectedDCAddr, (unsigned long long)lastSelectedDCAddr_,
+            WARN("[BG3Access] Tick: focused=%p scopeRoot=%p selected=%p selDC=0x%llx prevSelDC=0x%llx focDC=0x%llx prevFocDC=0x%llx focChg=%d selChg=%d forced=%d wChg=%d widgets=%u",
+                focused, scopeRoot, selected,
+                (unsigned long long)selectedDCAddr, (unsigned long long)lastSelectedDCAddr_,
+                (unsigned long long)focusedDCAddr, (unsigned long long)lastFocusedDCAddr_,
                 focusChanged, selectionChanged, forced, widgetSetChanged, widgetCount);
         }
 
         // ----- Update last known state (addresses only) -----
         if (focusChanged) {
             lastFocusedAddr_ = reinterpret_cast<uintptr_t>(focused);
+            lastFocusedDCAddr_ = focusedDCAddr;
         }
 
         if (selectionChanged) {
@@ -785,10 +831,16 @@ public:
                 WARN("[BG3Access]   -> FIRE forced");
 
                 SubscribeElementINPC(best);
+                forcedNullCount_ = 0;
             } else {
-                // Both null -- UI is rebuilding (e.g. Cross-Play tab
-                // destroys and recreates the ListBoxItem tree).
-                forceNext_ = true;
+                // Both null -- UI may be rebuilding (Cross-Play tab)
+                // or focus moved to a different layer (pause menu).
+                // Retry a few times for rebuilds, then stop to avoid
+                // spamming when focus is genuinely elsewhere.
+                forcedNullCount_++;
+                if (forcedNullCount_ < 5) {
+                    forceNext_ = true;
+                }
             }
         }
 
@@ -914,32 +966,6 @@ public:
                 break;
             }
 
-            // Targeted CC step read: when the CC god-object widget is
-            // present, read CharacterCreationStep and store it as a
-            // special namedText so Lua can detect page transitions.
-            // This is safe (one property read) and avoids subscribing
-            // INPC on the 100+ property god-object.
-            for (uint32_t i = 0; i < widgetCount; i++) {
-                if (!widgets[i] || !IsVisibleDP(widgets[i])) continue;
-                auto widgetElem = static_cast<Noesis::FrameworkElement*>(
-                    const_cast<Noesis::Visual*>(widgets[i]));
-                if (!sDataContextProp) continue;
-                auto depObj = static_cast<Noesis::DependencyObject const*>(widgetElem);
-                auto dcVal = sDataContextProp->GetValue(depObj);
-                if (!dcVal) continue;
-                auto dc = *reinterpret_cast<Noesis::BaseComponent* const*>(dcVal);
-                if (!dc) continue;
-                auto dcTypeName = dc->GetClassType()->GetName();
-                if (strstr(dcTypeName, "DCCharacterCreation")) {
-                    auto stepVal = ReadPropertyAsString(dc, "CharacterCreationStep");
-                    if (!stepVal.empty()) {
-                        snapshot->focusedElement.namedTexts.push_back(
-                            {"_ccStep", stepVal});
-                        WARN("[BG3Access]   -> CC step: %s", stepVal.c_str());
-                    }
-                    break;
-                }
-            }
         }
         bool wasPostSettle = postSettle_;
         postSettle_ = false;
@@ -1060,6 +1086,10 @@ public:
                 }
             }
 
+            // Validate before virtual calls -- element may be stale.
+            if (freshWidget && !ProbeUIElement(static_cast<Noesis::UIElement*>(freshWidget))) {
+                freshWidget = nullptr;
+            }
             if (freshWidget) {
                 // Re-read DC from the fresh widget pointer (obtained this frame).
                 Noesis::BaseComponent* freshDC = nullptr;
@@ -1151,6 +1181,8 @@ public:
             while (searchHead < searchTail && searchHead < 64) {
                 auto currentNode = searchQueue[searchHead++];
                 if (!currentNode) continue;
+                // Validate before virtual calls -- element may be stale.
+                if (!ProbeUIElement(static_cast<Noesis::UIElement*>(currentNode))) continue;
 
                 auto nodeTypeName = currentNode->GetClassType()->GetName();
 
@@ -1311,12 +1343,14 @@ public:
                         snapshot->widgetData.namedTexts.size());
 
                 WARN("[BG3Access] SNAPSHOT: focus=%d sel=%d val=%d carousel=%d "
-                     "widget=%d postSettle=%d elemId=%s "
+                     "widget=%d postSettle=%d elemId=%s dcType=%s "
                      "focusNT=%d widgetNT=%d carVal=%s",
                      snapshot->focusChanged, snapshot->selectionChanged,
                      snapshot->valueChanged, snapshot->inlineCarouselChanged,
                      snapshot->widgetAdded, wasPostSettle ? 1 : 0,
                      snapshot->focusedElement.elemId.c_str(),
+                     snapshot->focusedElement.dcType.empty()
+                         ? "(none)" : snapshot->focusedElement.dcType.c_str(),
                      focusNamedCount, widgetNamedCount,
                      snapshot->inlineCarouselValue.c_str());
 
@@ -1361,6 +1395,7 @@ public:
         lastInlineCarouselText_.clear();
         cachedRootAddr_ = 0;
         widgetContainer_ = nullptr;
+        forcedNullCount_ = 0;
         prevWidgetCount_ = 0;
         hadFocusBefore_ = false;
         // NOTE: scan tracking fields (initialWidgetScanDelay_,
@@ -1565,6 +1600,7 @@ private:
     bool pendingINPCSubscription_ = false;  // deferred INPC subscription
     DWORD mainThreadId_ = 0;  // thread that initialized the monitor
     uintptr_t lastSelectedDCAddr_ = 0;  // DataContext address for carousel recycling detection
+    uintptr_t lastFocusedDCAddr_ = 0;   // DataContext address for focused-element DC-swap detection
     std::string lastSelectedElemText_;  // tab name text for carousel text-change detection
     std::string lastInlineCarouselText_;  // Name/ColorName from inline carousel SelectedItem
 
@@ -1596,6 +1632,7 @@ private:
     // via FindWidgetContainer() when cachedRootAddr_ changes.
     uintptr_t cachedRootAddr_ = 0;
     Noesis::Visual* widgetContainer_ = nullptr;  // re-discovered from root each tick when root changes
+    uint32_t forcedNullCount_ = 0;  // limits forced re-arms when focus is null
     uint32_t prevWidgetCount_ = 0;
     uintptr_t prevWidgetAddrs_[kMaxWidgets] = {};
     bool prevWidgetVisible_[kMaxWidgets] = {};
@@ -1961,17 +1998,25 @@ static Noesis::Visual* FindWidgetContainer(Noesis::Visual* root)
 
     while (queueHead < queueTail) {
         auto node = queue[queueHead++];
+        // Validate before virtual calls -- element may be stale.
+        if (!ProbeUIElement(static_cast<Noesis::UIElement*>(node))) continue;
         auto childCount = node->GetVisualChildrenCount();
         for (uint32_t i = 0; i < childCount; i++) {
             auto child = node->GetVisualChild(i);
-            if (child && IsUIWidgetType(child))
+            if (!child) continue;
+            if (!ProbeUIElement(static_cast<Noesis::UIElement*>(child)))
+                continue;
+            if (IsUIWidgetType(child))
                 return node;  // This node is the container
         }
         // No UIWidget children at this level -- enqueue children for
         // next level.  Limit total nodes to prevent runaway searches.
         for (uint32_t i = 0; i < childCount && queueTail < 60; i++) {
             auto child = node->GetVisualChild(i);
-            if (child) queue[queueTail++] = child;
+            if (!child) continue;
+            if (!ProbeUIElement(static_cast<Noesis::UIElement*>(child)))
+                continue;
+            queue[queueTail++] = child;
         }
     }
     return nullptr;
@@ -1990,6 +2035,14 @@ Noesis::UIElement* TryFocusManager(Noesis::Visual* elem, int depth,
                                     Noesis::DependencyObject** outScopeRoot)
 {
     if (!elem || depth <= 0) return nullptr;
+
+    // Validate the element pointer before any virtual calls.  A child
+    // obtained from GetVisualChild may have been freed by Noesis between
+    // frames, leaving a dangling pointer with a corrupt vtable.
+    if (!ProbeUIElement(static_cast<Noesis::UIElement*>(elem))) {
+        WARN("[BG3Access] TryFocusManager: stale element pointer %p -- skipping subtree", elem);
+        return nullptr;
+    }
 
     auto depObj = static_cast<Noesis::DependencyObject const*>(elem);
 
@@ -2013,6 +2066,7 @@ Noesis::UIElement* TryFocusManager(Noesis::Visual* elem, int depth,
         }
     }
 
+    if (!ProbeVisualChildren(elem)) return nullptr;
     auto count = elem->GetVisualChildrenCount();
     for (int i = (int)count - 1; i >= 0; i--) {
         auto child = elem->GetVisualChild(i);
@@ -2032,6 +2086,9 @@ Noesis::UIElement* TryFocusManager(Noesis::Visual* elem, int depth,
 Noesis::UIElement* FindFocusedInTree(Noesis::Visual* elem, int depth)
 {
     if (!elem || depth <= 0) return nullptr;
+
+    // Validate before virtual calls -- child from GetVisualChild may be stale.
+    if (!ProbeUIElement(static_cast<Noesis::UIElement*>(elem))) return nullptr;
 
     // Prune invisible branches -- collapsed/hidden subtrees cannot have focus.
     if (!IsVisibleDP(elem)) return nullptr;
@@ -2054,6 +2111,7 @@ Noesis::UIElement* FindFocusedInTree(Noesis::Visual* elem, int depth)
         }
     }
 
+    if (!ProbeVisualChildren(elem)) return nullptr;
     auto count = elem->GetVisualChildrenCount();
     for (int i = (int)count - 1; i >= 0; i--) {
         auto child = elem->GetVisualChild(i);
@@ -2092,6 +2150,9 @@ Noesis::UIElement* FindSelectedTabInTree(Noesis::Visual* elem, int depth)
 {
     if (!elem || depth <= 0) return nullptr;
 
+    // Validate before virtual calls -- child from GetVisualChild may be stale.
+    if (!ProbeUIElement(static_cast<Noesis::UIElement*>(elem))) return nullptr;
+
     // Prune invisible branches.
     if (!IsVisibleDP(elem)) return nullptr;
 
@@ -2103,6 +2164,7 @@ Noesis::UIElement* FindSelectedTabInTree(Noesis::Visual* elem, int depth)
         }
     }
 
+    if (!ProbeVisualChildren(elem)) return nullptr;
     auto count = elem->GetVisualChildrenCount();
     for (uint32_t i = 0; i < count; i++) {
         auto child = elem->GetVisualChild(i);
@@ -2130,6 +2192,8 @@ Noesis::UIElement* GetTopmostWidget()
     for (int i = (int)count - 1; i >= 0; i--) {
         auto child = container->GetVisualChild(i);
         if (!child) continue;
+        // Validate before virtual calls -- element may be stale.
+        if (!ProbeUIElement(static_cast<Noesis::UIElement*>(child))) continue;
         if (IsUIWidgetType(child) && IsVisibleDP(child)) {
             return static_cast<Noesis::UIElement*>(child);
         }
@@ -2167,7 +2231,10 @@ Noesis::FrameworkElement* FindNameInWidget(char const* name)
     // Try each visible widget in reverse Z-order (topmost first).
     for (int wi = (int)widgetCount - 1; wi >= 0; wi--) {
         auto widget = container->GetVisualChild(wi);
-        if (!widget || !IsUIWidgetType(widget) || !IsVisibleDP(widget))
+        if (!widget) continue;
+        // Validate before virtual calls -- element may be stale.
+        if (!ProbeUIElement(static_cast<Noesis::UIElement*>(widget))) continue;
+        if (!IsUIWidgetType(widget) || !IsVisibleDP(widget))
             continue;
 
         // Walk down the first-child chain to enter the NameScope.
@@ -2180,6 +2247,8 @@ Noesis::FrameworkElement* FindNameInWidget(char const* name)
 
             auto child = cur->GetVisualChild(0);
             if (!child) break;
+            // Validate before virtual calls -- element may be stale.
+            if (!ProbeUIElement(static_cast<Noesis::UIElement*>(child))) break;
 
             // All visual tree nodes in Noesis UI are FrameworkElements
             // (Grid, Border, ContentPresenter, etc.).  static_cast is
@@ -2240,6 +2309,8 @@ Noesis::FrameworkElement* FindNameInWidgetScoped(char const* name,
         int levelEnd = back;
         while (front < levelEnd) {
             auto cur = queue[front++];
+            // Validate before virtual calls -- element may be stale.
+            if (!ProbeUIElement(static_cast<Noesis::UIElement*>(cur))) continue;
             auto curFE = static_cast<Noesis::FrameworkElement*>(cur);
             found = Noesis::FrameworkElementHelpers::FindNodeName(curFE, name);
             if (found) return static_cast<Noesis::FrameworkElement*>(found);
@@ -3097,6 +3168,8 @@ static void GatherVisibleTextBlocks(
     while (processed < (int)queue.size() && processed < maxNodes) {
         auto entry = queue[processed++];
         if (!entry.node || entry.depth > maxDepth) continue;
+        // Validate before virtual calls -- element may be stale.
+        if (!ProbeUIElement(static_cast<Noesis::UIElement*>(entry.node))) continue;
         if (!IsVisibleDP(entry.node)) continue;
 
         // Do not recurse into child UIWidgets -- they have their own scope.
@@ -3145,6 +3218,8 @@ static std::string ShallowChildTextScan(Noesis::FrameworkElement* elem)
         int levelEnd = childBack;
         while (childFront < levelEnd) {
             auto cur = childQueue[childFront++];
+            // Validate before virtual calls -- element may be stale.
+            if (!ProbeUIElement(static_cast<Noesis::UIElement*>(cur))) continue;
             auto curTypeName = cur->GetClassType()->GetName();
             if (strstr(curTypeName, "TextBlock")) {
                 auto tbText = ReadTextBlockText(
@@ -3250,6 +3325,8 @@ static void CollectNamedTextsFromWidget(
         if (childCount == 0) break;
         auto child = current->GetVisualChild(0);
         if (!child) break;
+        // Validate before virtual calls -- element may be stale.
+        if (!ProbeUIElement(static_cast<Noesis::UIElement*>(child))) break;
         current = child;
     }
 
@@ -3315,6 +3392,146 @@ static void CollectNamedTextsFromWidget(
 //
 // Skips [ForceUpdate] binding placeholders.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// TryReadSelectedBonusAbility: reads BonusAbilities[SelectedIndex].Ability
+// from a DC that has both properties (the CC god-object).
+//
+// BonusAbilities doesn't go through the sub-object extraction path in
+// PushDCProperties (its TypeProperty type isn't recognized as a pointer).
+// This targeted function finds the collection via TypeProperty::Get(),
+// casts to BaseCollection, and reads the selected item's Ability property.
+//
+// Called as post-processing after PushDCProperties.  Pushes
+// "SelectedBonusAbility" = "Strength" (etc.) into the dcProps table.
+// ---------------------------------------------------------------------------
+
+// SEH helper: BaseCollection::Count() on a bad pointer.
+static int SafeCollectionCount(Noesis::BaseCollection* collection)
+{
+    __try {
+        return collection->Count();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+// Struct-based version: stores SelectedBonusAbility into dcScalarProps.
+// Called from ExtractElementData path (INPC snapshots).
+static void TryCollectSelectedBonusAbility(
+    FocusEventData& out, Noesis::BaseObject* dc)
+{
+    auto const& cls = Noesis::gClassCache.GetClass(dc->GetClassType());
+
+    Noesis::TypeProperty const* bonusProp = nullptr;
+    Noesis::TypeProperty const* indexProp = nullptr;
+
+    for (auto& entry : cls.Names) {
+        if (!entry.Value().Property) continue;
+        auto name = entry.Key().GetString();
+        if (strcmp(name, "BonusAbilities") == 0)
+            bonusProp = entry.Value().Property;
+        else if (strcmp(name, "SelectedIndex") == 0)
+            indexProp = entry.Value().Property;
+    }
+    if (!bonusProp || !indexProp) return;
+
+    auto indexVal = ReadTypePropertyAsString(dc, indexProp);
+    if (indexVal.empty()) return;
+    int32_t selectedIndex = atoi(indexVal.c_str());
+    if (selectedIndex < 0) return;
+
+    auto collectionComponent = bonusProp->GetComponent(dc);
+    auto collectionRaw = collectionComponent.GetPtr();
+    if (!collectionRaw) return;
+
+    auto collection = static_cast<Noesis::BaseCollection*>(collectionRaw);
+    int count = SafeCollectionCount(collection);
+    if (selectedIndex >= count) return;
+
+    auto itemPtr = collection->GetComponent((uint32_t)selectedIndex);
+    auto item = itemPtr.GetPtr();
+    if (!item) return;
+
+    auto const& itemCls = Noesis::gClassCache.GetClass(item->GetClassType());
+    for (auto& entry : itemCls.Names) {
+        if (!entry.Value().Property) continue;
+        if (strcmp(entry.Key().GetString(), "Ability") != 0) continue;
+
+        auto abilityVal = ReadTypePropertyAsString(
+            static_cast<Noesis::BaseObject*>(item),
+            entry.Value().Property);
+        if (!abilityVal.empty()) {
+            out.dcScalarProps.emplace_back("SelectedBonusAbility",
+                std::move(abilityVal));
+            return;
+        }
+    }
+}
+
+// Lua-table version: pushes SelectedBonusAbility into dcProps table.
+// Called from ExtractElementInfo path (Lua API calls).
+// Read the selected ability name from BonusAbilities[SelectedIndex].
+// Uses TypeProperty::GetComponent to properly unwrap Ptr<> wrappers.
+// No SEH needed -- GetComponent and Count are safe when called on
+// valid TypeProperties from the class cache.
+static void TryReadSelectedBonusAbility(
+    Noesis::BaseObject* dc, lua_State* L, int dcPropsIdx)
+{
+    auto const& cls = Noesis::gClassCache.GetClass(dc->GetClassType());
+
+    Noesis::TypeProperty const* bonusProp = nullptr;
+    Noesis::TypeProperty const* indexProp = nullptr;
+
+    for (auto& entry : cls.Names) {
+        if (!entry.Value().Property) continue;
+        auto name = entry.Key().GetString();
+        if (strcmp(name, "BonusAbilities") == 0)
+            bonusProp = entry.Value().Property;
+        else if (strcmp(name, "SelectedIndex") == 0)
+            indexProp = entry.Value().Property;
+    }
+    if (!bonusProp || !indexProp) return;
+
+    // Read SelectedIndex.
+    auto indexVal = ReadTypePropertyAsString(dc, indexProp);
+    if (indexVal.empty()) return;
+    int32_t selectedIndex = atoi(indexVal.c_str());
+    if (selectedIndex < 0) return;
+
+    // Get the collection via GetComponent (handles Ptr<> unwrapping).
+    auto collectionComponent = bonusProp->GetComponent(dc);
+    auto collectionRaw = collectionComponent.GetPtr();
+    if (!collectionRaw) return;
+
+    auto collection = static_cast<Noesis::BaseCollection*>(collectionRaw);
+    int count = SafeCollectionCount(collection);
+    if (selectedIndex >= count) return;
+
+    // Get the selected item.
+    auto itemPtr = collection->GetComponent((uint32_t)selectedIndex);
+    auto item = itemPtr.GetPtr();
+    if (!item) return;
+
+    // Read Ability TypeProperty from the item.
+    auto const& itemCls = Noesis::gClassCache.GetClass(item->GetClassType());
+    for (auto& entry : itemCls.Names) {
+        if (!entry.Value().Property) continue;
+        if (strcmp(entry.Key().GetString(), "Ability") != 0) continue;
+
+        auto abilityVal = ReadTypePropertyAsString(
+            static_cast<Noesis::BaseObject*>(item),
+            entry.Value().Property);
+        if (!abilityVal.empty()) {
+            lua_pushstring(L, "SelectedBonusAbility");
+            lua_pushstring(L, abilityVal.c_str());
+            lua_settable(L, dcPropsIdx);
+            return;
+        }
+    }
+}
+
+
 static void PushDCProperties(lua_State* L, Noesis::BaseObject* dc)
 {
     if (!dc) {
@@ -3410,6 +3627,8 @@ static void PushDCProperties(lua_State* L, Noesis::BaseObject* dc)
                     }
                 }
 
+
+
                 if (hasAny) {
                     lua_pushstring(L, entry.Key().GetString());
                     lua_insert(L, -2);  // swap key and table
@@ -3501,6 +3720,8 @@ static std::string ExtractTabName(Noesis::FrameworkElement* elem)
             int levelEnd = back;
             while (front < levelEnd) {
                 auto cur = queue[front++];
+                // Validate before virtual calls -- element may be stale.
+                if (!ProbeUIElement(static_cast<Noesis::UIElement*>(cur))) continue;
                 auto typeName = cur->GetClassType()->GetName();
                 if (strstr(typeName, "TextBlock")) {
                     auto tbText = ReadTextBlockText(
@@ -3639,6 +3860,10 @@ static void ExtractElementInfo(lua_State* L, Noesis::FrameworkElement* elem)
     lua_pushstring(L, "dcProps");
     if (dataContext) {
         PushDCProperties(L, dataContext);
+        // Post-process: read selected ability name for Ability Bonus selector.
+        // BonusAbilities collection isn't handled by the generic sub-object
+        // path (its TypeProperty type isn't recognized as a pointer).
+        TryReadSelectedBonusAbility(dataContext, L, lua_gettop(L));
     } else {
         lua_pushnil(L);
     }
@@ -3832,6 +4057,44 @@ static void CollectDCProperties(FocusEventData& out, Noesis::BaseObject* dc)
 // that require exported symbols -- all data accessed via direct member
 // reads (same pattern as mValues, mVisualParent throughout this codebase).
 // ---------------------------------------------------------------------------
+// SEH wrapper: reads a single binding entry's path string and resolved value.
+// Isolated from C++ objects so __try is legal.  Returns false on access violation.
+static bool TryReadBindingEntry(
+    Noesis::DependencyObject* depObj,
+    Noesis::DependencyProperty const* depProp,
+    Noesis::StoredValue* storedVal,
+    const char** outDepPropName,
+    const char** outBindingPath,
+    uint32_t* outPathLen,
+    std::string* outResolvedValue)
+{
+    __try {
+        auto expression = storedVal->value.complex->expression.GetPtr();
+        if (!expression) return false;
+
+        auto bindingExpr = static_cast<Noesis::BaseBindingExpression*>(expression);
+        auto baseBinding = bindingExpr->mBinding.GetPtr();
+        if (!baseBinding) return false;
+
+        auto binding = static_cast<Noesis::Binding*>(baseBinding);
+        auto propertyPath = binding->mPath.GetPtr();
+        if (!propertyPath) return false;
+
+        auto& bindingPathStr = propertyPath->mPath;
+        *outPathLen = bindingPathStr.Size();
+        if (*outPathLen == 0) return false;
+
+        *outBindingPath = bindingPathStr.Str();
+        *outDepPropName = depProp->GetName().Str();
+        if (!*outDepPropName) return false;
+
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Stale binding pointer -- harmless, skip silently.
+        return false;
+    }
+}
+
 static void ExtractBindingInfo(FocusEventData& out, Noesis::FrameworkElement* elem)
 {
     if (!elem) return;
@@ -3846,36 +4109,23 @@ static void ExtractBindingInfo(FocusEventData& out, Noesis::FrameworkElement* el
         if (!storedVal || !storedVal->flags.isInitialized) continue;
         if (!storedVal->flags.isExpression || !storedVal->flags.isComplex) continue;
 
-        // Get the expression from StoredValue::ComplexValue::expression.
-        // No API calls needed -- direct member access.
-        auto expression = storedVal->value.complex->expression.GetPtr();
-        if (!expression) continue;
+        const char* depPropName = nullptr;
+        const char* bindingPath = nullptr;
+        uint32_t pathLen = 0;
+        std::string resolvedValue;
 
-        // static_cast to BaseBindingExpression to access mBinding.
-        // Safe: isExpression flag guarantees this is a binding expression.
-        auto bindingExpr = static_cast<Noesis::BaseBindingExpression*>(expression);
-        auto baseBinding = bindingExpr->mBinding.GetPtr();
-        if (!baseBinding) continue;
+        if (!TryReadBindingEntry(depObj, depProp, storedVal,
+                &depPropName, &bindingPath, &pathLen, &resolvedValue)) {
+            continue;
+        }
 
-        // static_cast to Binding (concrete type with mPath).
-        // BG3 XAML uses standard {Binding}, not MultiBinding.
-        auto binding = static_cast<Noesis::Binding*>(baseBinding);
-        auto propertyPath = binding->mPath.GetPtr();
-        if (!propertyPath) continue;
-
-        auto& bindingPathStr = propertyPath->mPath;
-        if (bindingPathStr.Size() == 0) continue;
-
-        // Read the resolved value from the cached binding result.
-        auto resolvedValue = ReadDepPropertyAsString(depObj, depProp);
+        // Read the resolved value (outside SEH -- uses std::string).
+        resolvedValue = ReadDepPropertyAsString(depObj, depProp);
         if (resolvedValue.find("[ForceUpdate]") != std::string::npos) continue;
-
-        auto depPropName = depProp->GetName().Str();
-        if (!depPropName) continue;
 
         FocusEventData::BindingInfo info;
         info.propertyName = depPropName;
-        info.bindingPath = std::string(bindingPathStr.Str());
+        info.bindingPath = std::string(bindingPath);
         info.resolvedValue = std::move(resolvedValue);
         out.bindings.push_back(std::move(info));
     }
@@ -3922,6 +4172,9 @@ static void ExtractElementData(FocusEventData& out, Noesis::FrameworkElement* el
     // DC properties
     if (dataContext) {
         CollectDCProperties(out, dataContext);
+        // Post-process: read selected ability name from BonusAbilities
+        // collection if present.  Adds SelectedBonusAbility to dcScalarProps.
+        TryCollectSelectedBonusAbility(out, dataContext);
     }
 
     // elemText: primary extraction -- direct property reads.

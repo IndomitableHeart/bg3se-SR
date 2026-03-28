@@ -167,7 +167,13 @@ void InitializeTolkGlobally() {
     }
     g_tolkState.store(finalState);
     if (finalState == TolkState::Loaded && g_Tolk_Output) {
-        g_Tolk_Output(L"Tolk loaded successfully.", false);
+        // Only announce on the very first successful load, not on Lua VM
+        // re-initializations (game state changes trigger shutdown + reinit).
+        static bool firstLoadAnnounced = false;
+        if (!firstLoadAnnounced) {
+            firstLoadAnnounced = true;
+            g_Tolk_Output(L"Tolk loaded successfully.", false);
+        }
     }
 }
 

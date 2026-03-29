@@ -300,7 +300,7 @@ static std::string TryReadInlineCarouselText(Noesis::FrameworkElement* listBox)
 class GlobalFocusMonitor
 {
 public:
-    static constexpr uint32_t kMaxWidgets = 16;
+    static constexpr uint32_t kMaxWidgets = 32;
     // Max recursion depth for tree walks.  IsVisible pruning eliminates
     // collapsed branches, so only visible nodes are visited.  100 is safe
     // (~6KB stack) and prevents silent truncation in deeply templated menus
@@ -353,6 +353,9 @@ public:
     void Tick()
     {
         if (!callback_) return;
+
+        // Decrement INPC cooldown each tick.
+        if (inpcCooldown_ > 0) inpcCooldown_--;
 
         // Guard: Noesis visual trees are single-threaded.  Larian's job
         // system may dispatch OnUpdate on a worker thread during async
@@ -1065,8 +1068,15 @@ public:
         // The delta comparison on dcScalarProps misses sub-object changes
         // (e.g. SelectedItem in comboboxes), so INPC is the reliable trigger.
         if (inpcDirty_) {
-            inpcDirty_ = false;
-            snapshot->valueChanged = true;
+            // Don't clear yet -- post-settle processing below may
+            // re-trigger INPC.  Clear after dispatch instead.
+            // Suppress stray INPC echoes that fire on the same tick as
+            // (or 1-2 ticks after) a focus/selection dispatch.  These
+            // cause VALUE events that interrupt descriptions the screen
+            // reader is still speaking.
+            if (!focusChanged && !selectionChanged && inpcCooldown_ <= 0) {
+                snapshot->valueChanged = true;
+            }
         }
 
         if (widgetDCDirty_ && callback_ && widgetInpcWidgetAddr_ != 0) {
@@ -1271,11 +1281,10 @@ public:
                 !lastInlineCarouselText_.empty() &&
                 lastInlineCarouselText_ != previousSnapshotCarousel_;
 
-            // INPC value change: compare DC props against previous
-            if (!snapshot->focusedElement.dcScalarProps.empty() &&
-                snapshot->focusedElement.dcScalarProps != previousSnapshotDCProps_) {
-                snapshot->valueChanged = true;
-            }
+            // Value changes are detected solely through INPC (inpcDirty_).
+            // A redundant dcScalarProps diff was here previously but it
+            // caused duplicate VALUE dispatches that interrupted speech.
+            // INPC is the single source of truth for value changes.
 
             // Widget, widgetDC, and namedTexts data were written directly
             // into snapshot by ExtractWidgetData() and the widgetDCDirty
@@ -1371,6 +1380,18 @@ public:
                 previousSnapshotCarousel_ = snapshot->inlineCarouselValue;
                 previousSnapshotDCProps_ = snapshot->focusedElement.dcScalarProps;
 
+                // Set INPC cooldown to suppress stray echoes for 2 ticks
+                // after any focus/selection dispatch.
+                if (snapshot->focusChanged || snapshot->selectionChanged) {
+                    inpcCooldown_ = 2;
+                }
+
+                // Clear INPC dirty flags AFTER dispatch so any
+                // re-triggering during post-settle NameScope walks
+                // is consumed rather than causing a second dispatch.
+                inpcDirty_ = false;
+                widgetDCDirty_ = false;
+
                 ContextGuardAnyThread ctx(ContextType::Client);
                 if (gExtender->GetClient().HasExtensionState()) {
                     LuaClientPin pin(gExtender->GetClient().GetExtensionState());
@@ -1379,6 +1400,11 @@ public:
                             callback_, std::move(*snapshotPtr));
                     }
                 }
+            } else {
+                // Even when not dispatching, clear INPC flags to prevent
+                // stale dirty state from firing on the next tick.
+                inpcDirty_ = false;
+                widgetDCDirty_ = false;
             }
 
         }
@@ -1651,6 +1677,7 @@ private:
     bool forceNext_ = false;
     bool postSettle_ = false;           // true on the ONE tick after settle expires
     bool hadFocusBefore_ = false;       // true once any focus/selection was found
+    int inpcCooldown_ = 0;              // ticks since last focus/selection dispatch; suppresses stray INPC echoes
     int initialWidgetScanDelay_ = 0;      // stability counter for pre-focus scan
     uint32_t lastScanWidgetCount_ = 0;   // fingerprint: widget count at last scan
     uintptr_t lastScanFirstAddr_ = 0;    // fingerprint: first widget addr at last scan

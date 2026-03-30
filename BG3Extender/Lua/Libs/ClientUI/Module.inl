@@ -1006,22 +1006,31 @@ public:
             if (initialWidgetScanDelay_ == 10) {
                 WARN("[BG3Access] Initial widget scan (%u widgets)", widgetCount);
                 for (int i = (int)widgetCount - 1; i >= 0; i--) {
-                    if (!widgets[i] || !IsVisibleDP(widgets[i])) continue;
+                    if (!widgets[i]) continue;
+
+                    // Log every widget: index, visibility, DC type.
+                    bool isVisible = IsVisibleDP(widgets[i]);
+                    const char* scanDCType = "(none)";
+                    bool isOverlay = false;
                     auto widgetElem = static_cast<Noesis::FrameworkElement*>(
                         const_cast<Noesis::Visual*>(widgets[i]));
-
-                    // Skip overlay widgets (notifications, etc.) -- they
-                    // contain stale text like "Your Turn" that shouldn't speak.
                     if (sDataContextProp) {
                         auto depObj = static_cast<Noesis::DependencyObject const*>(widgetElem);
                         auto dcVal = sDataContextProp->GetValue(depObj);
                         if (dcVal) {
                             auto dc = *reinterpret_cast<Noesis::BaseComponent* const*>(dcVal);
-                            if (dc && IsOverlayDCType(dc->GetClassType()->GetName())) continue;
+                            if (dc) {
+                                scanDCType = dc->GetClassType()->GetName();
+                                isOverlay = IsOverlayDCType(scanDCType);
+                            }
                         }
                     }
+                    WARN("[BG3Access]   widget[%d] vis=%d DC=%s%s", i,
+                        isVisible ? 1 : 0, scanDCType,
+                        isOverlay ? " (overlay)" : "");
 
-                    WARN("[BG3Access]   Initial scan: widget[%d]", i);
+                    if (!isVisible || isOverlay) continue;
+
                     ExtractWidgetData(widgetElem, *snapshot);
                     TryCollectNamedTexts(widgetElem, snapshot->focusedElement.namedTexts);
 

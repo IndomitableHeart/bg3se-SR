@@ -437,6 +437,45 @@ static void PushTickSnapshotTable(lua_State* L, TickSnapshot const& snapshot)
         PushFocusEventTable(L, snapshot.widgetData);
         lua_settable(L, -3);
     }
+
+    // Radial slot data (only if radialSlotChanged)
+    lua_pushstring(L, "radialSlotChanged");
+    lua_pushboolean(L, snapshot.radialSlotChanged);
+    lua_settable(L, -3);
+
+    if (snapshot.radialSlotChanged) {
+        lua_pushstring(L, "radialTitleText");
+        if (!snapshot.radialTitleText.empty()) {
+            lua_pushstring(L, snapshot.radialTitleText.c_str());
+        } else {
+            lua_pushnil(L);
+        }
+        lua_settable(L, -3);
+
+        lua_pushstring(L, "radialDescriptionText");
+        if (!snapshot.radialDescriptionText.empty()) {
+            lua_pushstring(L, snapshot.radialDescriptionText.c_str());
+        } else {
+            lua_pushnil(L);
+        }
+        lua_settable(L, -3);
+
+        lua_pushstring(L, "radialSlotTag");
+        if (!snapshot.radialSlotTag.empty()) {
+            lua_pushstring(L, snapshot.radialSlotTag.c_str());
+        } else {
+            lua_pushnil(L);
+        }
+        lua_settable(L, -3);
+
+        lua_pushstring(L, "radialSlotType");
+        if (!snapshot.radialSlotType.empty()) {
+            lua_pushstring(L, snapshot.radialSlotType.c_str());
+        } else {
+            lua_pushnil(L);
+        }
+        lua_settable(L, -3);
+    }
 }
 
 END_NS()

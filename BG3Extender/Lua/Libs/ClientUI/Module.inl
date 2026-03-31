@@ -114,6 +114,11 @@ static const Noesis::DependencyProperty* sLSMoveFocusFocusableProp = nullptr;
 // NameScope attached DP -- looked up at runtime since the Indie SDK
 // doesn't export NameScope::NameScopeProperty.
 static const Noesis::DependencyProperty* sNameScopeProp = nullptr;
+// FrameworkElement.Tag -- used by ActionRadials XAML to propagate the
+// focused radial slot's DataContext (VMHotBarSlot) via a Blend behavior.
+// Polling this property detects radial slot focus changes without needing
+// a custom strategy for ls:Radial.LocalFocus.
+static const Noesis::DependencyProperty* sTagProp = nullptr;
 static const Noesis::TypeClass* sListBoxItemType = nullptr;
 static const Noesis::TypeClass* sUIWidgetType = nullptr;
 static const Noesis::TypeClass* sDCWidgetType = nullptr;
@@ -140,6 +145,25 @@ static Noesis::Visual* FindWidgetContainer(Noesis::Visual* root);
 // Forward declarations -- defined below, after InitFocusProperties.
 Noesis::UIElement* GetFocusedElement();
 static void TryDiscoverFocusedElementProp(Noesis::Visual* const* widgets, uint32_t count);
+Noesis::FrameworkElement* FindNameInWidgetScoped(char const* name, Noesis::Visual* widget);
+static void PollRadialLocalFocus(
+    Noesis::Visual* const* widgets, bool const* widgetVisible,
+    uint32_t widgetCount, ecl::lua::TickSnapshot* snapshot);
+
+// SEH-guarded Noesis read helpers.  Each function does ONLY raw pointer
+// reads (no C++ objects with destructors) inside __try/__except.
+// Text extraction (std::string) happens in the caller, outside SEH.
+static uint32_t GatherWidgets_SEH(Noesis::Visual* container,
+    Noesis::Visual** outWidgets, bool* outVisible, uint32_t maxWidgets);
+static uintptr_t ReadDCAddress_SEH(Noesis::UIElement* elem);
+static Noesis::UIElement* FindFocusedElement_SEH(
+    Noesis::Visual** widgets, bool* widgetVisible, uint32_t widgetCount,
+    Noesis::FrameworkElement* root, int maxDepth,
+    Noesis::DependencyObject** outScopeRoot);
+static Noesis::UIElement* FindSelectedTab_SEH(
+    Noesis::Visual** widgets, bool* widgetVisible, uint32_t widgetCount,
+    Noesis::FrameworkElement* root,
+    Noesis::DependencyObject* scopeRoot, int maxDepth);
 
 // Forward declarations for data extraction (defined after ExtractElementInfo).
 static void ExtractElementData(FocusEventData& out, Noesis::FrameworkElement* elem);
@@ -208,37 +232,31 @@ struct SelectionDirtyDelegate
 {
     void Handler(Noesis::BaseComponent* source, const Noesis::RoutedEventArgs& args)
     {
-        // Only fire for tab carousel selections, not inline carousels.
-        // Tab carousels select ListBoxItems; inline carousels (Face,
-        // Skin Colour) select content items that are NOT ListBoxItems.
-        // Without this filter, pressing left/right on an inline carousel
-        // triggers a 6-frame settle and suppresses speech.
-        auto& selArgs = static_cast<const Noesis::SelectionChangedEventArgs&>(args);
-        if (selArgs.addedItems.Size() > 0) {
-            auto addedItem = selArgs.addedItems[0].GetPtr();
-            if (addedItem && sListBoxItemType) {
-                // Walk the type hierarchy to check for ListBoxItem.
-                bool isListBoxItem = false;
-                auto itemClass = addedItem->GetClassType();
-                while (itemClass) {
-                    if (itemClass == sListBoxItemType) {
-                        isListBoxItem = true;
-                        break;
+        __try {
+            // Only fire for tab carousel selections, not inline carousels.
+            auto& selArgs = static_cast<const Noesis::SelectionChangedEventArgs&>(args);
+            if (selArgs.addedItems.Size() > 0) {
+                auto addedItem = selArgs.addedItems[0].GetPtr();
+                if (addedItem && sListBoxItemType) {
+                    bool isListBoxItem = false;
+                    auto itemClass = addedItem->GetClassType();
+                    while (itemClass) {
+                        if (itemClass == sListBoxItemType) {
+                            isListBoxItem = true;
+                            break;
+                        }
+                        itemClass = itemClass->GetBase();
                     }
-                    itemClass = itemClass->GetBase();
+                    if (!isListBoxItem) return;
                 }
-                if (!isListBoxItem) {
-                    // Inline carousel selection -- ignore.
-                    return;
-                }
+                sSelectionChangedItemAddr = reinterpret_cast<uintptr_t>(addedItem);
+            } else {
+                return;
             }
-            sSelectionChangedItemAddr = reinterpret_cast<uintptr_t>(addedItem);
-        } else {
-            // No items added (deselection or focus-follows-selection in
-            // ItemsControl).  Not a tab switch -- ignore.
-            return;
+            sSelectionDirtyFlag = true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            WARN("[BG3Access] SelectionChanged handler: SEH fault (stale widget during destruction?)");
         }
-        sSelectionDirtyFlag = true;
     }
 };
 
@@ -324,7 +342,10 @@ public:
         prevWidgetCount_ = 0;
         hadFocusBefore_ = false;
         initialSelectionDone_ = false;
+        selectionFiredDuringSettle_ = false;
         sSelectionDirtyFlag = false;
+        lastRadialTagAddr_ = 0;
+        radialWasVisible_ = false;
         for (uint32_t i = 0; i < kMaxWidgets; i++) {
             prevWidgetAddrs_[i] = 0;
             prevWidgetVisible_[i] = false;
@@ -381,22 +402,11 @@ public:
             widgetContainer_ = FindWidgetContainer(root);
         }
 
-        // ----- Gather current widget set -----
-        uint32_t widgetCount = 0;
+        // ----- Gather current widget set (SEH-guarded) -----
         Noesis::Visual* widgets[kMaxWidgets] = {};
         bool widgetVisible[kMaxWidgets] = {};
-        if (widgetContainer_) {
-            auto count = widgetContainer_->GetVisualChildrenCount();
-            widgetCount = (count < kMaxWidgets) ? count : kMaxWidgets;
-            for (uint32_t i = 0; i < widgetCount; i++) {
-                widgets[i] = widgetContainer_->GetVisualChild(i);
-                if (!widgets[i]) { widgetVisible[i] = false; continue; }
-                if (!ProbeUIElement(static_cast<Noesis::UIElement*>(widgets[i]))) {
-                    widgets[i] = nullptr; widgetVisible[i] = false; continue;
-                }
-                widgetVisible[i] = IsVisibleDP(widgets[i]);
-            }
-        }
+        uint32_t widgetCount = GatherWidgets_SEH(
+            widgetContainer_, widgets, widgetVisible, kMaxWidgets);
 
         // ----- Quick widget set change check -----
         // Detects pointer changes AND visibility changes (dialogs are
@@ -441,6 +451,7 @@ public:
             sSelectionDirtyFlag = false;
             sSelectionChangedItemAddr = 0;
             somethingChanged = true;
+            selectionFiredDuringSettle_ = true;
         }
         if (widgetSetJustChanged && hadFocusBefore_) {
             // Update widget baseline so next tick can detect further changes.
@@ -491,6 +502,8 @@ public:
                 settleTotalCount_ = 0;
                 forceNext_ = true;
                 postSettle_ = true;
+                // Preserve selectionFiredDuringSettle_ -- consumed
+                // by shouldRunStrategy3 below, then cleared.
                 lastFocusedAddr_ = 0;
                 lastFocusedDCAddr_ = 0;
                 lastSelectedAddr_ = 0;
@@ -512,49 +525,14 @@ public:
             TryDiscoverFocusedElementProp(widgets, widgetCount);
         }
 
-        // ----- Strategy 1: FocusManager.FocusedElement (FAST PATH) -----
-        // Checks FocusManager.FocusedElement directly on each widget.
-        // O(1) per widget -- no tree walk.
-        // TryFocusManager recurses into children only if the property
-        // is not set at the widget level (handles nested focus scopes).
-        Noesis::UIElement* focused = nullptr;
+        // ----- Strategy 1+2: Focus detection (SEH-guarded) -----
+        // Strategy 1: FocusManager.FocusedElement (fast path).
+        // Strategy 2: IsFocused + ls:MoveFocus.IsFocused tree walk (fallback).
+        // Both wrapped in FindFocusedElement_SEH -- returns nullptr on fault.
         Noesis::DependencyObject* scopeRoot = nullptr;
-        if (widgetCount > 0) {
-            for (int i = (int)widgetCount - 1; i >= 0; i--) {
-                if (!widgets[i] || !IsVisibleDP(widgets[i])) continue;
-                focused = TryFocusManager(widgets[i], kMaxTreeDepth, &scopeRoot);
-                if (focused) break;
-            }
-        } else if (root) {
-            // FALLBACK: Some menus (e.g. Character Creation) attach
-            // elements directly under the root Canvas without ls.UIWidget
-            // wrappers.  widgetCount is 0 but focus still exists.
-            focused = TryFocusManager(root, kMaxTreeDepth, &scopeRoot);
-        }
-
-        // ----- Strategy 2: IsFocused + ls:MoveFocus.IsFocused tree walk -----
-        // FALLBACK for when no FocusedElement property is set (safety net).
-        // Walks the visual tree checking ls:MoveFocus.IsFocused first
-        // (controller focus), then UIElement.IsFocused (keyboard focus).
-        // IsVisible pruning skips collapsed branches for speed.
-        if (!focused && (sIsFocusedProp || sLSMoveFocusIsFocusedProp)) {
-            if (widgetCount > 0) {
-                for (int i = (int)widgetCount - 1; i >= 0; i--) {
-                    if (!widgets[i] || !IsVisibleDP(widgets[i])) continue;
-                    focused = FindFocusedInTree(widgets[i], kMaxTreeDepth);
-                    if (focused) {
-                        scopeRoot = static_cast<Noesis::DependencyObject*>(widgets[i]);
-                        break;
-                    }
-                }
-            } else if (root) {
-                // FALLBACK: Scan the root directly when no widgets exist.
-                focused = FindFocusedInTree(root, kMaxTreeDepth);
-                if (focused) {
-                    scopeRoot = static_cast<Noesis::DependencyObject*>(root);
-                }
-            }
-        }
+        Noesis::UIElement* focused = FindFocusedElement_SEH(
+            widgets, widgetVisible, widgetCount,
+            root, kMaxTreeDepth, &scopeRoot);
 
         // Subscribe SelectionChanged on each widget (subscribe-only, never
         // Remove).  Per-widget because the event may be handled (stopped)
@@ -580,12 +558,17 @@ public:
             initialSelectionDone_ = false;
         }
 
-        // When event subscription is active, only run tree walk when needed.
-        // Without subscription, falls back to polling every frame.
+        // Post-settle tick ALWAYS runs Strategy 3 because SelectionChanged
+        // subscriptions may not exist during settle (they're created after).
+        // selectionFiredDuringSettle_ handles the common case (RB/LB tab
+        // switch mid-menu).  postSettle_ handles initial menu entry where
+        // subscriptions weren't active during the settle window.
         bool shouldRunStrategy3 = !sSelectionChangedEvent
                                || subscribedWidgetCount_ == 0
                                || !initialSelectionDone_
-                               || forceNext_;
+                               || selectionFiredDuringSettle_
+                               || postSettle_;
+        selectionFiredDuringSettle_ = false;
 
         Noesis::UIElement* selected = nullptr;
         if (sIsSelectedProp && sListBoxItemType && shouldRunStrategy3) {
@@ -593,33 +576,14 @@ public:
             initialSelectionDone_ = true;
             sSelectionChangedItemAddr = 0;
 
-            // Tree walk: find the currently selected ListBoxItem fresh.
-            // The SelectionChanged event's dirty flag told us SOMETHING
-            // changed; the walk finds exactly WHAT is selected now.
-            {
-                if (scopeRoot) {
-                    selected = FindSelectedTabInTree(
-                        static_cast<Noesis::Visual*>(scopeRoot), kMaxTreeDepth);
-                } else if (widgetCount > 0) {
-                    for (int i = (int)widgetCount - 1; i >= 0; i--) {
-                        if (!widgets[i] || !IsVisibleDP(widgets[i])) continue;
-                        selected = FindSelectedTabInTree(widgets[i], kMaxTreeDepth);
-                        if (selected) break;
-                    }
-                }
-                if (!selected) {
-                    selected = FindSelectedTabInTree(root, kMaxTreeDepth);
-                }
-            }
+            // Tree walk (SEH-guarded): find the currently selected
+            // ListBoxItem fresh.  The SelectionChanged event told us
+            // SOMETHING changed; the walk finds exactly WHAT is now.
+            selected = FindSelectedTab_SEH(
+                widgets, widgetVisible, widgetCount,
+                root, scopeRoot, kMaxTreeDepth);
 
             if (reinterpret_cast<uintptr_t>(selected) != lastSelectedAddr_) strategy3Changes_++;
-            if (strategy3Runs_ % 300 == 0) {
-                WARN("[BG3Access] Strategy3 stats: %u runs, %u changes (%.1f%% wasted)",
-                    strategy3Runs_, strategy3Changes_,
-                    strategy3Runs_ > 0
-                        ? 100.0 * (1.0 - (double)strategy3Changes_ / strategy3Runs_)
-                        : 0.0);
-            }
         } else if (sIsSelectedProp && sListBoxItemType) {
             // Strategy 3 skipped -- preserve last known address for
             // comparison only.  selected stays null (not safe to dereference).
@@ -638,15 +602,10 @@ public:
         // comparison only (selected pointer is null, cannot dereference).
         uintptr_t effectiveSelectedAddr = selectedIsFresh ? selectedAddr : lastSelectedAddr_;
 
-        // ----- DataContext for recycling detection -----
+        // ----- DataContext for recycling detection (SEH-guarded) -----
         uintptr_t selectedDCAddr = 0;
-        if (selected && selectedIsFresh && sDataContextProp) {
-            auto depObj = static_cast<Noesis::DependencyObject const*>(selected);
-            auto dcVal = sDataContextProp->GetValue(depObj);
-            if (dcVal) {
-                auto dataContext = *reinterpret_cast<const void* const*>(dcVal);
-                selectedDCAddr = reinterpret_cast<uintptr_t>(dataContext);
-            }
+        if (selected && selectedIsFresh) {
+            selectedDCAddr = ReadDCAddress_SEH(selected);
         }
 
         // ----- Focused element DataContext for DC-swap detection -----
@@ -654,13 +613,8 @@ public:
         // Catches content-area items (e.g. Skills) whose container is
         // reused with a new ViewModel a few ticks after focus arrives.
         uintptr_t focusedDCAddr = 0;
-        if (focused && sDataContextProp) {
-            auto depObj = static_cast<Noesis::DependencyObject const*>(focused);
-            auto dcVal = sDataContextProp->GetValue(depObj);
-            if (dcVal) {
-                auto dataContext = *reinterpret_cast<const void* const*>(dcVal);
-                focusedDCAddr = reinterpret_cast<uintptr_t>(dataContext);
-            }
+        if (focused) {
+            focusedDCAddr = ReadDCAddress_SEH(focused);
         }
 
         bool forced = forceNext_;
@@ -774,6 +728,9 @@ public:
                 (unsigned long long)selectedDCAddr, (unsigned long long)lastSelectedDCAddr_,
                 (unsigned long long)focusedDCAddr, (unsigned long long)lastFocusedDCAddr_,
                 focusChanged, selectionChanged, forced, widgetSetChanged, widgetCount);
+
+            // (Per-widget diagnostic dump removed -- no longer needed for
+            // radial/overlay detection; DCHotBar filter handles it.)
         }
 
         // ----- Update last known state (addresses only) -----
@@ -944,7 +901,7 @@ public:
                 if (!widgets[i] || !IsVisibleDP(widgets[i])) continue;
                 auto widgetElem = static_cast<Noesis::FrameworkElement*>(
                     const_cast<Noesis::Visual*>(widgets[i]));
-                WARN("[BG3Access]   -> Post-settle NameScope (widget[%d])", i);
+                // (Post-settle NameScope diagnostic removed)
                 TryCollectNamedTexts(widgetElem, snapshot->focusedElement.namedTexts);
             }
 
@@ -1128,7 +1085,7 @@ public:
                     CollectDCProperties(*widgetDCData, freshDC);
 
                     // Collect namedTexts from the fresh widget.
-                    WARN("[BG3Access]   INPC: collecting namedTexts from widget %p", freshWidget);
+                    // (INPC namedTexts diagnostic removed)
                     TryCollectNamedTexts(freshWidget, widgetDCData->namedTexts);
 
                     // Merge into snapshot: namedTexts are appended (not replaced)
@@ -1257,6 +1214,114 @@ public:
         // (Focus-change clear moved above carousel scan so the value
         // is detected as a change on the same tick as the focus change.)
 
+        // ----- Radial LocalFocus polling (RT shortcuts menu) -----
+        // Delegated to PollRadialLocalFocus (SEH-guarded, no C++ destructors).
+        // Populates snapshot->radialSlotChanged and related fields.
+        if (!focused && !selected && widgetCount > 0 && sDataContextProp && sTagProp) {
+            PollRadialLocalFocus(widgets, widgetVisible, widgetCount, snapshot);
+        }
+
+        // ----- HotBar action radial: Tag polling on visible widgets -----
+        // The XAML sets ActionRadials.Tag = LocalFocus.DataContext whenever
+        // the radial pointer moves to a different slot.  Poll each visible
+        // widget for a non-null Tag DP.  When the tag changes and is a
+        // VMHotBarSlot, populate snapshot with Content.Name (action title).
+        // Skip if PollRadialLocalFocus already set radialSlotChanged (RT menu).
+        if (sTagProp && sDataContextProp && widgetCount > 0 && !snapshot->radialSlotChanged) {
+            bool foundHotBarWidget = false;
+            bool hotBarHasTag = false;
+            for (uint32_t widgetIdx = 0; widgetIdx < widgetCount; widgetIdx++) {
+                if (!widgets[widgetIdx] || !widgetVisible[widgetIdx]) continue;
+                auto widgetElement = static_cast<Noesis::FrameworkElement*>(
+                    const_cast<Noesis::Visual*>(widgets[widgetIdx]));
+                auto widgetDepObj = static_cast<Noesis::DependencyObject const*>(widgetElement);
+
+                // Only process the DCHotBar widget (ActionRadials).
+                // Other widgets may have Tags for unrelated purposes.
+                auto dcVal = sDataContextProp->GetValue(widgetDepObj);
+                if (!dcVal) continue;
+                auto widgetDC = *reinterpret_cast<Noesis::BaseComponent* const*>(dcVal);
+                if (!widgetDC) continue;
+                auto widgetDCTypeName = widgetDC->GetClassType()->GetName();
+                if (!widgetDCTypeName || !strstr(widgetDCTypeName, "DCHotBar")) continue;
+                foundHotBarWidget = true;
+
+                // Read Tag property from the HotBar widget.
+                auto tagVal = sTagProp->GetValue(widgetDepObj);
+                if (!tagVal) { break; }
+                auto tagObject = *reinterpret_cast<Noesis::BaseObject* const*>(tagVal);
+                if (!tagObject) { break; }
+                hotBarHasTag = true;
+                auto tagAddr = reinterpret_cast<uintptr_t>(tagObject);
+
+                if (tagAddr != lastRadialTagAddr_) {
+                    lastRadialTagAddr_ = tagAddr;
+
+                    if (!ProbeUIElement(reinterpret_cast<Noesis::UIElement*>(tagObject)))
+                        continue;
+
+                    auto tagTypeName = tagObject->GetClassType()->GetName();
+
+                    // HotBar action radial: Tag is VMHotBarSlot.
+                    // C++ extracts the slot's identifying properties (Name,
+                    // StatsId, SpellId, etc.) and passes them to Lua.
+                    // Lua uses Ext.Stats APIs for descriptions (API-first).
+                    if (tagTypeName && strstr(tagTypeName, "HotBarSlot")) {
+                        FocusEventData tagData;
+                        CollectDCProperties(tagData, tagObject);
+
+                        // Extract Content sub-object properties: Name for
+                        // the display title, plus any identifier (StatsId,
+                        // SpellId, OriginatorId) that Lua needs for API lookup.
+                        std::string actionName;
+                        std::string actionTag;
+                        for (auto const& subObj : tagData.dcObjectProps) {
+                            if (subObj.propName == "Content") {
+                                for (auto const& prop : subObj.props) {
+                                    if (prop.first == "Name" && actionName.empty()) {
+                                        actionName = prop.second;
+                                    }
+                                }
+                                // Build a tag string with ALL Content props
+                                // so Lua can pick the right API identifier.
+                                // Format: "key1=val1;key2=val2;..."
+                                for (auto const& prop : subObj.props) {
+                                    if (!prop.second.empty()) {
+                                        if (!actionTag.empty()) actionTag += ";";
+                                        actionTag += prop.first;
+                                        actionTag += "=";
+                                        actionTag += prop.second;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+
+                        if (!actionName.empty()) {
+                            snapshot->radialSlotChanged = true;
+                            snapshot->radialSlotType = "HotBar";
+                            snapshot->radialTitleText = std::move(actionName);
+                            // Description left empty -- Lua resolves via API.
+                            snapshot->radialDescriptionText.clear();
+                            snapshot->radialSlotTag = std::move(actionTag);
+
+                            WARN("[BG3Access] HOTBAR RADIAL: title=%s tag=%s",
+                                 snapshot->radialTitleText.c_str(),
+                                 snapshot->radialSlotTag.c_str());
+                        }
+                    }
+                }
+            }
+            // When the HotBar widget exists but its Tag is null (stick at
+            // center rest), reset the tracker so returning to the same
+            // slot is detected as a new change.  XAML sets Tag = null
+            // when LocalFocus goes null (LocalFocusChanged event fires
+            // with LocalFocus.DataContext = null on center rest).
+            if (foundHotBarWidget && !hotBarHasTag && lastRadialTagAddr_ != 0) {
+                lastRadialTagAddr_ = 0;
+            }
+        }
+
         // ===== SNAPSHOT FINALIZATION =====
         // The snapshot has been populated throughout Tick().
         // Finalize change flags, run delta comparison, and dispatch.
@@ -1323,6 +1388,9 @@ public:
                 shouldDispatch = true;
             }
             if (snapshot->widgetAdded) {
+                shouldDispatch = true;
+            }
+            if (snapshot->radialSlotChanged) {
                 shouldDispatch = true;
             }
             if (!snapshot->focusedElement.namedTexts.empty()) {
@@ -1438,6 +1506,7 @@ public:
         // reset here.  GameStateChanged fires multiple times during load
         // and resetting causes the same tip to repeat on each transition.
         initialSelectionDone_ = false;
+        selectionFiredDuringSettle_ = false;
         sSelectionDirtyFlag = false;
         inpcDirty_ = false;
         widgetDCDirty_ = false;
@@ -1639,6 +1708,12 @@ private:
     std::string lastSelectedElemText_;  // tab name text for carousel text-change detection
     std::string lastInlineCarouselText_;  // Name/ColorName from inline carousel SelectedItem
 
+    // Radial wheel tracking (DCHotBar widget Tag polling).
+    // The XAML sets ActionRadials.Tag = LocalFocus.DataContext on every
+    // radial slot focus change.  Polling Tag detects slot navigation.
+    uintptr_t lastRadialTagAddr_ = 0;      // Tag object address, comparison only
+    bool radialWasVisible_ = false;         // tracks radial open/close transitions
+
     // INPC auto-subscription tracking (focused element DC).
     // Fire-and-forget: subscribe, then CLEAR the pointer.  Never call
     // Remove() on a potentially dead object.  If the VM is destroyed,
@@ -1725,6 +1800,7 @@ private:
     bool settling_ = false;
     uint32_t settleStableCount_ = 0;
     uint32_t settleTotalCount_ = 0;
+    bool selectionFiredDuringSettle_ = false;
 
     // (Accumulators removed -- snapshot is a local in Tick(), populated directly.)
 
@@ -1932,6 +2008,10 @@ void InitFocusProperties(Noesis::FrameworkElement* root)
             nameScopeClass, bg3se::FixedString("NameScope"));
     }
 
+    // FrameworkElement.Tag -- standard WPF property, always resolvable.
+    sTagProp = Noesis::TypeHelpers::GetDependencyProperty(
+        root->GetClassType(), bg3se::FixedString("Tag"));
+
     // Discover Selector.SelectionChanged routed event at runtime.
     // Used for event-driven tab detection.  Subscribe-only pattern:
     // we Insert/Add to mRoutedEventHandlers but NEVER Remove().
@@ -1955,8 +2035,8 @@ void InitFocusProperties(Noesis::FrameworkElement* root)
         selectorReflType, sSelectionChangedEvent);
 
     // Diagnostic: show what resolved.
-    WARN("[BG3Access] InitFocusProperties: IsFocused=%p FocusedElement=%p IsSelected=%p DataContext=%p IsVisible=%p Visibility=%p ListBoxItemType=%p UIWidgetType=%p DCWidgetType=%p LSMoveFocusIsFocused=%p LSMoveFocusFocusable=%p NameScope=%p",
-        sIsFocusedProp, sFocusedElementProp, sIsSelectedProp, sDataContextProp, sIsVisibleProp, sVisibilityProp, sListBoxItemType, sUIWidgetType, sDCWidgetType, sLSMoveFocusIsFocusedProp, sLSMoveFocusFocusableProp, sNameScopeProp);
+    WARN("[BG3Access] InitFocusProperties: IsFocused=%p FocusedElement=%p IsSelected=%p DataContext=%p IsVisible=%p Visibility=%p ListBoxItemType=%p UIWidgetType=%p DCWidgetType=%p LSMoveFocusIsFocused=%p LSMoveFocusFocusable=%p NameScope=%p Tag=%p",
+        sIsFocusedProp, sFocusedElementProp, sIsSelectedProp, sDataContextProp, sIsVisibleProp, sVisibilityProp, sListBoxItemType, sUIWidgetType, sDCWidgetType, sLSMoveFocusIsFocusedProp, sLSMoveFocusFocusableProp, sNameScopeProp, sTagProp);
 }
 
 // ---------------------------------------------------------------------------
@@ -2012,6 +2092,143 @@ static bool IsUIWidgetType(Noesis::Visual const* elem)
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// PollRadialLocalFocus: SEH-guarded radial focus detection.
+// Scans visible widgets for a DCGameMenu widget (RT shortcuts radial),
+// finds its MenuRadial element, reads LocalFocus to detect which slot
+// the LS is pointing at, and populates the snapshot with title/description.
+// Extracted to a standalone function for SEH compatibility (no C++ objects
+// with destructors).
+// ---------------------------------------------------------------------------
+// LookupLocalFocusDP: separated so the FixedString temporary
+// (which has a destructor) does not live in the __try function.
+static const Noesis::DependencyProperty* LookupLocalFocusDP(
+    Noesis::TypeClass const* classType)
+{
+    return Noesis::TypeHelpers::GetDependencyProperty(
+        classType, bg3se::FixedString("LocalFocus"));
+}
+
+// PollRadialLocalFocus_Unsafe: SEH-guarded inner function.
+// Only does raw pointer reads -- no C++ objects with destructors.
+// Returns the focused item element and the widget visual via out params.
+// Returns true if a new radial slot was detected.
+static bool PollRadialLocalFocus_Unsafe(
+    Noesis::Visual* const* widgets, bool const* widgetVisible,
+    uint32_t widgetCount,
+    Noesis::FrameworkElement** outFocusedItem,
+    Noesis::Visual** outWidgetVisual)
+{
+    static const Noesis::DependencyProperty* sLocalFocusProp = nullptr;
+    static bool sLocalFocusLookupDone = false;
+    static uintptr_t sLastLocalFocusAddr = 0;
+
+    *outFocusedItem = nullptr;
+    *outWidgetVisual = nullptr;
+
+    __try {
+        for (uint32_t widgetIdx = 0; widgetIdx < widgetCount; widgetIdx++) {
+            if (!widgets[widgetIdx] || !widgetVisible[widgetIdx]) continue;
+            auto widgetElement = static_cast<Noesis::FrameworkElement*>(
+                const_cast<Noesis::Visual*>(widgets[widgetIdx]));
+            auto widgetDepObj = static_cast<Noesis::DependencyObject const*>(widgetElement);
+
+            if (!ProbeUIElement(static_cast<Noesis::UIElement*>(widgetElement))) continue;
+            auto widgetDCVal = sDataContextProp->GetValue(widgetDepObj);
+            if (!widgetDCVal) continue;
+            auto widgetDC = *reinterpret_cast<Noesis::BaseComponent* const*>(widgetDCVal);
+            if (!widgetDC) continue;
+            auto widgetDCType = widgetDC->GetClassType();
+            if (!widgetDCType) continue;
+            auto widgetDCTypeName = widgetDCType->GetName();
+            if (!widgetDCTypeName || !strstr(widgetDCTypeName, "DCGameMenu")) continue;
+
+            auto menuRadial = FindNameInWidgetScoped(
+                "MenuRadial", widgets[widgetIdx]);
+            if (!menuRadial) continue;
+
+            if (!sLocalFocusLookupDone) {
+                sLocalFocusLookupDone = true;
+                sLocalFocusProp = LookupLocalFocusDP(menuRadial->GetClassType());
+                if (sLocalFocusProp) {
+                    WARN("[BG3Access] LocalFocus DP found on %s",
+                         menuRadial->GetClassType()->GetName());
+                }
+            }
+            if (!sLocalFocusProp) continue;
+
+            auto localFocusDepObj = static_cast<Noesis::DependencyObject const*>(
+                static_cast<Noesis::FrameworkElement*>(menuRadial));
+            auto localFocusVal = sLocalFocusProp->GetValue(localFocusDepObj);
+            if (!localFocusVal) {
+                sLastLocalFocusAddr = 0;
+                continue;
+            }
+            auto localFocusObj = *reinterpret_cast<Noesis::BaseObject* const*>(localFocusVal);
+            if (!localFocusObj) {
+                sLastLocalFocusAddr = 0;
+                continue;
+            }
+
+            auto localFocusAddr = reinterpret_cast<uintptr_t>(localFocusObj);
+            if (localFocusAddr != sLastLocalFocusAddr) {
+                sLastLocalFocusAddr = localFocusAddr;
+                if (ProbeUIElement(reinterpret_cast<Noesis::UIElement*>(localFocusObj))) {
+                    *outFocusedItem = static_cast<Noesis::FrameworkElement*>(
+                        reinterpret_cast<Noesis::UIElement*>(localFocusObj));
+                    *outWidgetVisual = widgets[widgetIdx];
+                    return true;
+                }
+            }
+            break;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        WARN("[BG3Access] PollRadialLocalFocus: access fault (SEH caught)");
+    }
+    return false;
+}
+
+// PollRadialLocalFocus: outer wrapper that does text extraction
+// (std::string operations) outside the SEH block.
+static void PollRadialLocalFocus(
+    Noesis::Visual* const* widgets, bool const* widgetVisible,
+    uint32_t widgetCount, ecl::lua::TickSnapshot* snapshot)
+{
+    Noesis::FrameworkElement* focusedItem = nullptr;
+    Noesis::Visual* widgetVisual = nullptr;
+
+    if (!PollRadialLocalFocus_Unsafe(widgets, widgetVisible, widgetCount,
+                                     &focusedItem, &widgetVisual)) {
+        return;
+    }
+
+    // Text extraction (uses std::string -- safe outside __try).
+    auto tagString = ReadPropertyAsString(focusedItem, "Tag");
+
+    std::string titleText;
+    std::string descriptionText;
+    auto actionTitleElem = FindNameInWidgetScoped("ActionTitle", widgetVisual);
+    if (actionTitleElem) {
+        titleText = ReadTextBlockText(actionTitleElem);
+    }
+    auto descriptionElem = FindNameInWidgetScoped("Description", widgetVisual);
+    if (descriptionElem) {
+        descriptionText = ReadTextBlockText(descriptionElem);
+    }
+
+    snapshot->radialSlotChanged = true;
+    snapshot->radialSlotTag = std::move(tagString);
+    snapshot->radialTitleText = std::move(titleText);
+    snapshot->radialDescriptionText = std::move(descriptionText);
+    snapshot->radialSlotType = "ShortcutsMenu";
+
+    WARN("[BG3Access] RADIAL FOCUS: tag=%s title=%s",
+         snapshot->radialSlotTag.c_str(),
+         snapshot->radialTitleText.empty()
+             ? "(none)" : snapshot->radialTitleText.c_str());
+}
+
 // Find the widget container: drill down from root following first children
 // until we find an element whose children are UIWidgets.
 // The BG3 tree structure is: UICanvas -> Viewbox -> Decorator -> Grid -> UIWidget(s)
@@ -2058,6 +2275,20 @@ static Noesis::Visual* FindWidgetContainer(Noesis::Visual* root)
     return nullptr;
 }
 
+// ---------------------------------------------------------------------------
+// GatherStateMachineWidgets: SEH-guarded access to UIStateMachine.
+// Walks the active state tree and collects UIWidget pointers that are NOT
+// already in the Canvas-based widget array.  These are widgets on other
+// Noesis layers (Pause, MessageBox) like the RT ShortcutsMenu.
+//
+// Extracted to a standalone function because __try/__except cannot coexist
+// with C++ objects that have destructors in the same function.
+//
+// outWidgets: array to fill with discovered widgets (caller-owned).
+// outCount:   set to number of widgets found.
+// maxOut:     capacity of outWidgets.
+// existingWidgets/existingCount: the Canvas widgets to exclude (already tracked).
+// ---------------------------------------------------------------------------
 // Strategy 1: Check FocusManager.FocusedElement on focus scopes.
 //
 // O(1) property read per node -- no tree walk needed when set on widgets.
@@ -2217,24 +2448,164 @@ Noesis::UIElement* FindSelectedTabInTree(Noesis::Visual* elem, int depth)
 // when GetFocusedElement() might return an element in a background widget.
 Noesis::UIElement* GetTopmostWidget()
 {
-    auto root = GetRoot();
-    if (!root) return nullptr;
+    __try {
+        auto root = GetRoot();
+        if (!root) return nullptr;
 
-    InitFocusProperties(root);
-    auto container = FindWidgetContainer(root);
-    if (!container) return nullptr;
+        InitFocusProperties(root);
+        auto container = FindWidgetContainer(root);
+        if (!container) return nullptr;
 
-    auto count = container->GetVisualChildrenCount();
-    for (int i = (int)count - 1; i >= 0; i--) {
-        auto child = container->GetVisualChild(i);
-        if (!child) continue;
-        // Validate before virtual calls -- element may be stale.
-        if (!ProbeUIElement(static_cast<Noesis::UIElement*>(child))) continue;
-        if (IsUIWidgetType(child) && IsVisibleDP(child)) {
-            return static_cast<Noesis::UIElement*>(child);
+        auto count = container->GetVisualChildrenCount();
+        for (int i = (int)count - 1; i >= 0; i--) {
+            auto child = container->GetVisualChild(i);
+            if (!child) continue;
+            if (!ProbeUIElement(static_cast<Noesis::UIElement*>(child))) continue;
+            if (IsUIWidgetType(child) && IsVisibleDP(child)) {
+                return static_cast<Noesis::UIElement*>(child);
+            }
         }
+        return nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        WARN("[BG3Access] GetTopmostWidget: SEH fault");
+        return nullptr;
     }
-    return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// SEH-guarded Noesis read helpers.
+// Each function does ONLY raw pointer reads (no C++ objects with destructors)
+// inside __try/__except.  Text extraction (std::string) happens in the
+// caller, outside the SEH block.
+// ---------------------------------------------------------------------------
+
+// GatherWidgets_SEH: reads widget children from the widget container.
+// Returns widget count (0 on failure).  outWidgets and outVisible are
+// zeroed on failure.
+static uint32_t GatherWidgets_SEH(
+    Noesis::Visual* container,
+    Noesis::Visual** outWidgets,
+    bool* outVisible,
+    uint32_t maxWidgets)
+{
+    __try {
+        if (!container) return 0;
+        auto count = container->GetVisualChildrenCount();
+        uint32_t widgetCount = (count < maxWidgets) ? count : maxWidgets;
+        for (uint32_t i = 0; i < widgetCount; i++) {
+            outWidgets[i] = container->GetVisualChild(i);
+            if (!outWidgets[i]) { outVisible[i] = false; continue; }
+            if (!ProbeUIElement(static_cast<Noesis::UIElement*>(outWidgets[i]))) {
+                outWidgets[i] = nullptr; outVisible[i] = false; continue;
+            }
+            outVisible[i] = IsVisibleDP(outWidgets[i]);
+        }
+        return widgetCount;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        WARN("[BG3Access] GatherWidgets_SEH: fault on container %p", container);
+        for (uint32_t i = 0; i < maxWidgets; i++) {
+            outWidgets[i] = nullptr;
+            outVisible[i] = false;
+        }
+        return 0;
+    }
+}
+
+// ReadDCAddress_SEH: reads DataContext pointer address from an element.
+// Returns the raw address (never dereferences the DC), or 0 on failure.
+// Reusable for all DC-based change detection (recycling, DC swaps).
+static uintptr_t ReadDCAddress_SEH(Noesis::UIElement* elem)
+{
+    __try {
+        if (!elem || !sDataContextProp) return 0;
+        auto depObj = static_cast<Noesis::DependencyObject const*>(elem);
+        auto dcVal = sDataContextProp->GetValue(depObj);
+        if (!dcVal) return 0;
+        auto dataContext = *reinterpret_cast<const void* const*>(dcVal);
+        return reinterpret_cast<uintptr_t>(dataContext);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+// FindFocusedElement_SEH: runs Strategy 1 (FocusManager.FocusedElement)
+// and Strategy 2 (IsFocused + ls:MoveFocus.IsFocused tree walk) with
+// SEH protection.  Returns the focused element, or nullptr on failure/fault.
+static Noesis::UIElement* FindFocusedElement_SEH(
+    Noesis::Visual** widgets, bool* widgetVisible, uint32_t widgetCount,
+    Noesis::FrameworkElement* root, int maxDepth,
+    Noesis::DependencyObject** outScopeRoot)
+{
+    *outScopeRoot = nullptr;
+    __try {
+        // Strategy 1: FocusManager.FocusedElement (fast path)
+        Noesis::UIElement* focused = nullptr;
+        if (widgetCount > 0) {
+            for (int i = (int)widgetCount - 1; i >= 0; i--) {
+                if (!widgets[i] || !IsVisibleDP(widgets[i])) continue;
+                focused = TryFocusManager(widgets[i], maxDepth, outScopeRoot);
+                if (focused) return focused;
+            }
+        } else if (root) {
+            focused = TryFocusManager(root, maxDepth, outScopeRoot);
+            if (focused) return focused;
+        }
+
+        // Strategy 2: IsFocused + ls:MoveFocus.IsFocused tree walk
+        if (sIsFocusedProp || sLSMoveFocusIsFocusedProp) {
+            if (widgetCount > 0) {
+                for (int i = (int)widgetCount - 1; i >= 0; i--) {
+                    if (!widgets[i] || !IsVisibleDP(widgets[i])) continue;
+                    focused = FindFocusedInTree(widgets[i], maxDepth);
+                    if (focused) {
+                        *outScopeRoot = static_cast<Noesis::DependencyObject*>(widgets[i]);
+                        return focused;
+                    }
+                }
+            } else if (root) {
+                focused = FindFocusedInTree(root, maxDepth);
+                if (focused) {
+                    *outScopeRoot = static_cast<Noesis::DependencyObject*>(root);
+                    return focused;
+                }
+            }
+        }
+
+        return nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        WARN("[BG3Access] FindFocusedElement_SEH: fault during focus tree walk");
+        *outScopeRoot = nullptr;
+        return nullptr;
+    }
+}
+
+// FindSelectedTab_SEH: runs Strategy 3 (IsSelected tree walk) with SEH
+// protection.  Returns the selected ListBoxItem, or nullptr on failure/fault.
+static Noesis::UIElement* FindSelectedTab_SEH(
+    Noesis::Visual** widgets, bool* widgetVisible, uint32_t widgetCount,
+    Noesis::FrameworkElement* root,
+    Noesis::DependencyObject* scopeRoot, int maxDepth)
+{
+    __try {
+        if (!sIsSelectedProp || !sListBoxItemType) return nullptr;
+
+        if (scopeRoot) {
+            auto result = FindSelectedTabInTree(
+                static_cast<Noesis::Visual*>(scopeRoot), maxDepth);
+            if (result) return result;
+        }
+        if (widgetCount > 0) {
+            for (int i = (int)widgetCount - 1; i >= 0; i--) {
+                if (!widgets[i] || !IsVisibleDP(widgets[i])) continue;
+                auto result = FindSelectedTabInTree(widgets[i], maxDepth);
+                if (result) return result;
+            }
+        }
+        return FindSelectedTabInTree(root, maxDepth);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        WARN("[BG3Access] FindSelectedTab_SEH: fault during selection tree walk");
+        return nullptr;
+    }
 }
 
 // Find a named element within visible widgets by entering their NameScopes.
@@ -2255,52 +2626,47 @@ Noesis::UIElement* GetTopmostWidget()
 //         -> ... all XAML content with x:Name elements
 Noesis::FrameworkElement* FindNameInWidget(char const* name)
 {
-    auto root = GetRoot();
-    if (!root) return nullptr;
+    __try {
+        auto root = GetRoot();
+        if (!root) return nullptr;
 
-    InitFocusProperties(root);
-    auto container = FindWidgetContainer(root);
-    if (!container) return nullptr;
+        InitFocusProperties(root);
+        auto container = FindWidgetContainer(root);
+        if (!container) return nullptr;
 
-    auto widgetCount = container->GetVisualChildrenCount();
+        auto widgetCount = container->GetVisualChildrenCount();
 
-    // Try each visible widget in reverse Z-order (topmost first).
-    for (int wi = (int)widgetCount - 1; wi >= 0; wi--) {
-        auto widget = container->GetVisualChild(wi);
-        if (!widget) continue;
-        // Validate before virtual calls -- element may be stale.
-        if (!ProbeUIElement(static_cast<Noesis::UIElement*>(widget))) continue;
-        if (!IsUIWidgetType(widget) || !IsVisibleDP(widget))
-            continue;
+        for (int wi = (int)widgetCount - 1; wi >= 0; wi--) {
+            auto widget = container->GetVisualChild(wi);
+            if (!widget) continue;
+            if (!ProbeUIElement(static_cast<Noesis::UIElement*>(widget))) continue;
+            if (!IsUIWidgetType(widget) || !IsVisibleDP(widget))
+                continue;
 
-        // Walk down the first-child chain to enter the NameScope.
-        // NameScope owner is typically 2 levels below the UIWidget.
-        // Try FindNodeName at each level; first success wins.
-        Noesis::Visual* cur = widget;
-        for (int depth = 0; depth < 5; depth++) {
-            auto childCount = cur->GetVisualChildrenCount();
-            if (childCount == 0) break;
+            Noesis::Visual* cur = widget;
+            for (int depth = 0; depth < 5; depth++) {
+                auto childCount = cur->GetVisualChildrenCount();
+                if (childCount == 0) break;
 
-            auto child = cur->GetVisualChild(0);
-            if (!child) break;
-            // Validate before virtual calls -- element may be stale.
-            if (!ProbeUIElement(static_cast<Noesis::UIElement*>(child))) break;
+                auto child = cur->GetVisualChild(0);
+                if (!child) break;
+                if (!ProbeUIElement(static_cast<Noesis::UIElement*>(child))) break;
 
-            // All visual tree nodes in Noesis UI are FrameworkElements
-            // (Grid, Border, ContentPresenter, etc.).  static_cast is
-            // safe here -- same pattern as FindSelectedTabInTree.
-            auto childFE = static_cast<Noesis::FrameworkElement*>(child);
-            auto found = Noesis::FrameworkElementHelpers::FindNodeName(childFE, name);
-            if (found) {
-                // Named XAML elements (x:Name) are always FrameworkElements.
-                return static_cast<Noesis::FrameworkElement*>(found);
+                auto childFE = static_cast<Noesis::FrameworkElement*>(child);
+                auto found = Noesis::FrameworkElementHelpers::FindNodeName(childFE, name);
+                if (found) {
+                    return static_cast<Noesis::FrameworkElement*>(found);
+                }
+
+                cur = child;
             }
-
-            cur = child;
         }
-    }
 
-    return nullptr;
+        return nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        WARN("[BG3Access] FindNameInWidget: SEH fault for '%s'", name ? name : "(null)");
+        return nullptr;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2318,49 +2684,56 @@ Noesis::FrameworkElement* FindNameInWidget(char const* name)
 //
 // Returns the found FrameworkElement or nullptr.
 // ---------------------------------------------------------------------------
+// Inner SEH-safe function for FindNameInWidgetScoped.
+// Uses a fixed-size array instead of std::vector (no C++ destructors).
+static Noesis::FrameworkElement* FindNameInWidgetScoped_Unsafe(
+    char const* name, Noesis::Visual* widget)
+{
+    __try {
+        auto widgetFE = static_cast<Noesis::FrameworkElement*>(widget);
+        auto found = Noesis::FrameworkElementHelpers::FindNodeName(widgetFE, name);
+        if (found) return static_cast<Noesis::FrameworkElement*>(found);
+
+        // BFS through visual children, max 5 levels deep, max 256 nodes.
+        Noesis::Visual* queue[256];
+        int front = 0, back = 0;
+
+        auto seedCount = widget->GetVisualChildrenCount();
+        for (uint32_t i = 0; i < seedCount && back < 256; i++) {
+            auto child = widget->GetVisualChild(i);
+            if (child) queue[back++] = child;
+        }
+
+        for (int level = 0; level < 5 && front < back; level++) {
+            int levelEnd = back;
+            while (front < levelEnd) {
+                auto cur = queue[front++];
+                if (!ProbeUIElement(static_cast<Noesis::UIElement*>(cur))) continue;
+                auto curFE = static_cast<Noesis::FrameworkElement*>(cur);
+                found = Noesis::FrameworkElementHelpers::FindNodeName(curFE, name);
+                if (found) return static_cast<Noesis::FrameworkElement*>(found);
+
+                auto childCount = cur->GetVisualChildrenCount();
+                for (uint32_t i = 0; i < childCount && back < 256; i++) {
+                    auto child = cur->GetVisualChild(i);
+                    if (child) queue[back++] = child;
+                }
+            }
+        }
+
+        return nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        WARN("[BG3Access] FindNameInWidgetScoped: SEH fault for '%s'",
+             name ? name : "(null)");
+        return nullptr;
+    }
+}
+
 Noesis::FrameworkElement* FindNameInWidgetScoped(char const* name,
                                                   Noesis::Visual* widget)
 {
     if (!name || !widget) return nullptr;
-
-    // Check the widget itself first.
-    auto widgetFE = static_cast<Noesis::FrameworkElement*>(widget);
-    auto found = Noesis::FrameworkElementHelpers::FindNodeName(widgetFE, name);
-    if (found) return static_cast<Noesis::FrameworkElement*>(found);
-
-    // BFS through visual children, max 5 levels deep, max 256 nodes.
-    // NameScope owners are typically 2-5 levels below the UIWidget root.
-    std::vector<Noesis::Visual*> queue(256);
-    int front = 0, back = 0;
-
-    // Seed with widget's direct children (level 1).
-    auto seedCount = widget->GetVisualChildrenCount();
-    for (uint32_t i = 0; i < seedCount && back < 256; i++) {
-        auto child = widget->GetVisualChild(i);
-        if (child) queue[back++] = child;
-    }
-
-    // Process up to 5 levels of children.
-    for (int level = 0; level < 5 && front < back; level++) {
-        int levelEnd = back;
-        while (front < levelEnd) {
-            auto cur = queue[front++];
-            // Validate before virtual calls -- element may be stale.
-            if (!ProbeUIElement(static_cast<Noesis::UIElement*>(cur))) continue;
-            auto curFE = static_cast<Noesis::FrameworkElement*>(cur);
-            found = Noesis::FrameworkElementHelpers::FindNodeName(curFE, name);
-            if (found) return static_cast<Noesis::FrameworkElement*>(found);
-
-            // Enqueue children for the next level.
-            auto cc = cur->GetVisualChildrenCount();
-            for (uint32_t i = 0; i < cc && back < 256; i++) {
-                auto child = cur->GetVisualChild(i);
-                if (child) queue[back++] = child;
-            }
-        }
-    }
-
-    return nullptr;
+    return FindNameInWidgetScoped_Unsafe(name, widget);
 }
 
 // Diagnostic: dump all ViewModel properties from visible widgets.
@@ -2376,29 +2749,33 @@ Noesis::FrameworkElement* FindNameInWidgetScoped(char const* name,
 // Combined: try FocusManager fast path, then IsFocused tree walk, then IsSelected.
 Noesis::UIElement* GetFocusedElement()
 {
-    auto root = GetRoot();
-    if (!root) return nullptr;
+    __try {
+        auto root = GetRoot();
+        if (!root) return nullptr;
 
-    InitFocusProperties(root);
+        InitFocusProperties(root);
 
-    // Strategy 1: FocusManager.FocusedElement fast path
-    auto focused = TryFocusManager(root, GlobalFocusMonitor::kMaxTreeDepth);
-    if (focused) return focused;
-
-    // Strategy 2: IsFocused + ls:MoveFocus.IsFocused tree walk (safety net)
-    if (sIsFocusedProp || sLSMoveFocusIsFocusedProp) {
-        focused = FindFocusedInTree(root, GlobalFocusMonitor::kMaxTreeDepth);
+        // Strategy 1: FocusManager.FocusedElement fast path
+        auto focused = TryFocusManager(root, GlobalFocusMonitor::kMaxTreeDepth);
         if (focused) return focused;
-    }
 
-    // Strategy 3: IsSelected tree walk (for ListBoxItem-derived tab items).
-    // Catches selected tabs that don't have keyboard focus.
-    if (sIsSelectedProp && sListBoxItemType) {
-        auto focused = FindSelectedTabInTree(root, GlobalFocusMonitor::kMaxTreeDepth);
-        if (focused) return focused;
-    }
+        // Strategy 2: IsFocused + ls:MoveFocus.IsFocused tree walk
+        if (sIsFocusedProp || sLSMoveFocusIsFocusedProp) {
+            focused = FindFocusedInTree(root, GlobalFocusMonitor::kMaxTreeDepth);
+            if (focused) return focused;
+        }
 
-    return nullptr;
+        // Strategy 3: IsSelected tree walk (ListBoxItem tabs)
+        if (sIsSelectedProp && sListBoxItemType) {
+            auto selected = FindSelectedTabInTree(root, GlobalFocusMonitor::kMaxTreeDepth);
+            if (selected) return selected;
+        }
+
+        return nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        WARN("[BG3Access] GetFocusedElement: SEH fault");
+        return nullptr;
+    }
 }
 
 bg3se::ui::UIStateMachine* GetStateMachine()
@@ -2532,10 +2909,15 @@ void ForceGlobalFocusUpdate()
     GlobalFocusMonitor::Instance().ForceNextFire();
 }
 
+
 bool HasProperty(Noesis::BaseObject const* o, bg3se::FixedString const& name)
 {
-    auto const& cls = gClassCache.GetClass(o->GetClassType());
-    return cls.Names.try_get(name) != nullptr;
+    __try {
+        auto const& cls = gClassCache.GetClass(o->GetClassType());
+        return cls.Names.try_get(name) != nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
 }
 
 // Check if a DependencyProperty has been explicitly set (locally) on a
@@ -2554,20 +2936,21 @@ bool HasProperty(Noesis::BaseObject const* o, bg3se::FixedString const& name)
 // of which require symbols not exported from the Noesis Indie SDK.
 bool HasLocalValue(Noesis::BaseObject* target, bg3se::FixedString const& propName)
 {
-    if (!target) return false;
-    // static_cast is safe: Lua only passes UI elements which are all
-    // DependencyObject subclasses.  DynamicCast<DependencyObject*> requires
-    // DependencyObject::StaticGetClassType which is not exported.
-    auto depObj = static_cast<Noesis::DependencyObject*>(target);
-    if (!depObj) return false;
+    __try {
+        if (!target) return false;
+        auto depObj = static_cast<Noesis::DependencyObject*>(target);
+        if (!depObj) return false;
 
-    Noesis::Symbol sym(propName.GetString());
-    for (auto& prop : depObj->mValues) {
-        if (prop.key && prop.key->GetName() == sym) {
-            return true;
+        Noesis::Symbol sym(propName.GetString());
+        for (auto& prop : depObj->mValues) {
+            if (prop.key && prop.key->GetName() == sym) {
+                return true;
+            }
         }
+        return false;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
     }
-    return false;
 }
 
 // Walks the LOGICAL parent chain from the element up to the root,
@@ -2589,35 +2972,36 @@ bool HasLocalValue(Noesis::BaseObject* target, bg3se::FixedString const& propNam
 // Exposed to Lua as Ext.UI.IsElementVisible(element).
 bool IsElementVisible(Noesis::BaseObject* target)
 {
-    if (!sVisibilityProp) {
-        // Fallback: if Visibility DP not resolved, try IsVisible DP.
-        if (!sIsVisibleProp) return true;
-        auto depObj = static_cast<Noesis::DependencyObject*>(target);
-        if (!depObj) return true;
-        auto val = sIsVisibleProp->GetValue(depObj);
-        return !val || *static_cast<const bool*>(val);
-    }
-
-    // Type-check: target must be a FrameworkElement to walk mParent.
-    auto cls = target->GetClassType();
-    if (!Noesis::TypeHelpers::IsDescendantOf(
-            cls, Noesis::gStaticSymbols.TypeClasses.FrameworkElement.Type)) {
-        return true;  // Not a FrameworkElement -- can't check ancestors.
-    }
-
-    // Walk element + logical ancestors, checking effective Visibility.
-    auto ancestor = static_cast<Noesis::FrameworkElement*>(target);
-    constexpr int kMaxDepth = 32;  // logical chains are short
-    for (int i = 0; i < kMaxDepth && ancestor; i++) {
-        auto depObj = static_cast<Noesis::DependencyObject*>(ancestor);
-        auto val = sVisibilityProp->GetValue(depObj);
-        if (val) {
-            auto vis = *static_cast<const Noesis::Visibility*>(val);
-            if (vis != Noesis::Visibility_Visible) return false;
+    __try {
+        if (!sVisibilityProp) {
+            if (!sIsVisibleProp) return true;
+            auto depObj = static_cast<Noesis::DependencyObject*>(target);
+            if (!depObj) return true;
+            auto val = sIsVisibleProp->GetValue(depObj);
+            return !val || *static_cast<const bool*>(val);
         }
-        ancestor = ancestor->mParent;
+
+        auto cls = target->GetClassType();
+        if (!Noesis::TypeHelpers::IsDescendantOf(
+                cls, Noesis::gStaticSymbols.TypeClasses.FrameworkElement.Type)) {
+            return true;
+        }
+
+        auto ancestor = static_cast<Noesis::FrameworkElement*>(target);
+        constexpr int kMaxDepth = 32;
+        for (int i = 0; i < kMaxDepth && ancestor; i++) {
+            auto depObj = static_cast<Noesis::DependencyObject*>(ancestor);
+            auto val = sVisibilityProp->GetValue(depObj);
+            if (val) {
+                auto vis = *static_cast<const Noesis::Visibility*>(val);
+                if (vis != Noesis::Visibility_Visible) return false;
+            }
+            ancestor = ancestor->mParent;
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return true;  // Assume visible on fault (safe default).
     }
-    return true;
 }
 
 // Checks whether an element is connected to the live visual tree by
@@ -2633,20 +3017,24 @@ bool IsElementVisible(Noesis::BaseObject* target)
 // Exposed to Lua as Ext.UI.IsConnectedToWidget(element).
 bool IsConnectedToWidget(Noesis::BaseObject* target)
 {
-    auto cls = target->GetClassType();
-    if (!Noesis::TypeHelpers::IsDescendantOf(
-            cls, Noesis::gStaticSymbols.TypeClasses.Visual.Type)) {
+    __try {
+        auto cls = target->GetClassType();
+        if (!Noesis::TypeHelpers::IsDescendantOf(
+                cls, Noesis::gStaticSymbols.TypeClasses.Visual.Type)) {
+            return false;
+        }
+
+        auto visual = static_cast<Noesis::Visual*>(target);
+        constexpr int kMaxDepth = 64;
+        for (int i = 0; i < kMaxDepth; i++) {
+            visual = visual->mVisualParent;
+            if (!visual) return false;
+            if (IsUIWidgetType(visual)) return true;
+        }
+        return false;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
-
-    auto visual = static_cast<Noesis::Visual*>(target);
-    constexpr int kMaxDepth = 64;
-    for (int i = 0; i < kMaxDepth; i++) {
-        visual = visual->mVisualParent;
-        if (!visual) return false;
-        if (IsUIWidgetType(visual)) return true;
-    }
-    return false;
 }
 
 // Returns the computed IsHitTestVisible state via DependencyProperty
@@ -2659,12 +3047,15 @@ bool IsConnectedToWidget(Noesis::BaseObject* target)
 // Visibility=Collapsed (to avoid layout recalculation).
 bool IsHitTestVisible(Noesis::BaseObject* target)
 {
-    if (!sIsHitTestVisibleProp) return true;
-    // static_cast -- same rationale as HasLocalValue above.
-    auto depObj = static_cast<Noesis::DependencyObject*>(target);
-    if (!depObj) return true;
-    auto val = sIsHitTestVisibleProp->GetValue(depObj);
-    return !val || *static_cast<const bool*>(val);
+    __try {
+        if (!sIsHitTestVisibleProp) return true;
+        auto depObj = static_cast<Noesis::DependencyObject*>(target);
+        if (!depObj) return true;
+        auto val = sIsHitTestVisibleProp->GetValue(depObj);
+        return !val || *static_cast<const bool*>(val);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return true;
+    }
 }
 
 // Returns the DataContext of a FrameworkElement by reading the
@@ -2678,27 +3069,38 @@ bool IsHitTestVisible(Noesis::BaseObject* target)
 // carousel recycling detection (DataContext pointer comparison).
 Noesis::BaseComponent* GetDataContext(Noesis::BaseObject* target)
 {
-    if (!target) return nullptr;
+    __try {
+        if (!target) return nullptr;
 
-    // Ensure sDataContextProp is initialized.
-    auto root = GetRoot();
-    if (root) InitFocusProperties(root);
-    if (!sDataContextProp) return nullptr;
+        auto root = GetRoot();
+        if (root) InitFocusProperties(root);
+        if (!sDataContextProp) return nullptr;
 
-    auto depObj = static_cast<Noesis::DependencyObject*>(target);
-    if (!depObj) return nullptr;
+        auto depObj = static_cast<Noesis::DependencyObject*>(target);
+        if (!depObj) return nullptr;
 
-    auto dcVal = sDataContextProp->GetValue(depObj);
-    if (!dcVal) return nullptr;
+        auto dcVal = sDataContextProp->GetValue(depObj);
+        if (!dcVal) return nullptr;
 
-    return *reinterpret_cast<Noesis::BaseComponent* const*>(dcVal);
+        return *reinterpret_cast<Noesis::BaseComponent* const*>(dcVal);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
 }
 
 // Free functions wrapping GlobalFocusMonitor singleton -- called from
 // LuaClient.cpp which is a different translation unit.
 void TickGlobalFocusMonitor()
 {
-    GlobalFocusMonitor::Instance().Tick();
+    // Top-level SEH guard: catches ANY Noesis crash in the entire Tick()
+    // body, including deeply nested tree walks, DC reads, and text extraction.
+    // Individual sections have their own SEH for diagnostics; this is the
+    // safety net that prevents the game from dying.
+    __try {
+        GlobalFocusMonitor::Instance().Tick();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        WARN("[BG3Access] CRASH in Tick() caught by top-level SEH -- frame skipped");
+    }
 }
 
 void ResetGlobalFocusMonitor()
@@ -2720,11 +3122,15 @@ void ResetGlobalFocusMonitor()
 // are spoken on focus, not dumped as body text.
 bool IsMoveFocusFocusable(Noesis::BaseObject* target)
 {
-    if (!sLSMoveFocusFocusableProp) return false;
-    auto depObj = static_cast<Noesis::DependencyObject*>(target);
-    if (!depObj) return false;
-    auto val = sLSMoveFocusFocusableProp->GetValue(depObj);
-    return val && *static_cast<const bool*>(val);
+    __try {
+        if (!sLSMoveFocusFocusableProp) return false;
+        auto depObj = static_cast<Noesis::DependencyObject*>(target);
+        if (!depObj) return false;
+        auto val = sLSMoveFocusFocusableProp->GetValue(depObj);
+        return val && *static_cast<const bool*>(val);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3348,8 +3754,7 @@ static void CollectNamedTextsFromWidget(
             auto candidate = *reinterpret_cast<Noesis::NameScope* const*>(storedValue);
             if (candidate) {
                 auto candidateSize = candidate->mNamedObjects.Size();
-                WARN("[BG3Access]   NameScope at depth %d: %p (%u entries)",
-                    depth, candidate, candidateSize);
+                // (Diagnostic removed: NameScope depth/address/size)
                 if (candidateSize > bestSize) {
                     nameScope = candidate;
                     bestSize = candidateSize;
@@ -3368,8 +3773,7 @@ static void CollectNamedTextsFromWidget(
 
     if (!nameScope) return;
 
-    WARN("[BG3Access]   NameScope: iterating %u entries",
-        nameScope->mNamedObjects.Size());
+    // (Diagnostic removed: NameScope iteration count)
 
     for (auto iterator = nameScope->mNamedObjects.Begin();
          iterator != nameScope->mNamedObjects.End();

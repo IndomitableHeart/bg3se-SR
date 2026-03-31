@@ -123,6 +123,7 @@ struct TickSnapshot
     bool valueChanged = false;          // INPC property changed on focused element DC
     bool inlineCarouselChanged = false; // Inline appearance carousel value changed
     bool widgetAdded = false;           // New dialog/overlay widget appeared
+    bool radialSlotChanged = false;     // Radial (RT/RB) slot focus changed via LocalFocus
 
     // Current focused element state (full picture, not just changes).
     FocusEventData focusedElement;
@@ -139,6 +140,18 @@ struct TickSnapshot
     // Widget added data (dialog/overlay detection).
     // Only populated when widgetAdded == true.
     FocusEventData widgetData;
+
+    // Radial slot data (RT shortcuts radial, RB action radial).
+    // Only populated when radialSlotChanged == true.
+    // titleText: display name from ActionTitle TextBlock (localized).
+    // descriptionText: description from Description TextBlock (localized).
+    // slotTag: raw Tag string from the LSRadialListItem ("CharacterSheet", etc.)
+    //          or Content.Name from VMHotBarSlot ("Main Hand Attack", etc.).
+    // slotType: identifies which radial ("ShortcutsMenu" or "HotBar").
+    std::string radialTitleText;
+    std::string radialDescriptionText;
+    std::string radialSlotTag;
+    std::string radialSlotType;
 };
 
 class DeferredUIEvents

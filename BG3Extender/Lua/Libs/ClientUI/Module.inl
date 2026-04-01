@@ -3200,13 +3200,13 @@ static std::string ReadTypePropertyAsString(Noesis::BaseObject const* obj,
         float value = 0;
         prop->GetCopy(obj, &value);
         char buf[32];
-        snprintf(buf, sizeof(buf), "%.0f", value);
+        snprintf(buf, sizeof(buf), "%g", value);
         return buf;
     } else if (type == types.Double.Type) {
         double value = 0;
         prop->GetCopy(obj, &value);
         char buf[32];
-        snprintf(buf, sizeof(buf), "%.0f", value);
+        snprintf(buf, sizeof(buf), "%g", value);
         return buf;
     } else if (Noesis::TypeHelpers::IsDescendantOf(
                    type->GetClassType(),
@@ -4675,6 +4675,9 @@ static void ExtractElementData(FocusEventData& out, Noesis::FrameworkElement* el
     // elemId: composite identifier for dedup.
     // For unnamed elements, include DC text to distinguish items with
     // the same type (e.g. ContentPresenters in Options menu).
+    // When multiple elements share the same type::name::text, the DC
+    // pointer address is appended to make the ID unique per DC object
+    // (e.g. save game entries all named "Tav" but with different VMs).
     {
         std::string id = out.elemType;
         if (!out.elemName.empty()) {
@@ -4696,6 +4699,15 @@ static void ExtractElementData(FocusEventData& out, Noesis::FrameworkElement* el
         } else if (!out.elemText.empty()) {
             auto trunc = out.elemText.substr(0, 60);
             id += "::" + trunc;
+        }
+        // Append DC pointer address to ensure uniqueness when multiple
+        // elements have the same type, name, and text (e.g. save game
+        // ExpanderButtons all showing "Tav" for the same character).
+        auto dc = GetDataContext(elem);
+        if (dc) {
+            char addrBuf[20];
+            snprintf(addrBuf, sizeof(addrBuf), "@%p", dc);
+            id += addrBuf;
         }
         out.elemId = std::move(id);
     }

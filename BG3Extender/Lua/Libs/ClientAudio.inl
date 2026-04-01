@@ -188,6 +188,7 @@ bool PlayFile(char const* path)
 {
     // Stop any previous playback.
     if (gFileIsPlaying) {
+        WARN("[BG3Access] PlayFile: stopping previous playback before new file");
         PlaySoundW(nullptr, nullptr, 0);
         gFileIsPlaying = false;
         gPlayingFilePath.clear();
@@ -196,6 +197,7 @@ bool PlayFile(char const* path)
     STDString lsPath = GetStaticSymbols().ToPath(path, PathRootType::Data);
     std::wstring widePath(lsPath.begin(), lsPath.end());
 
+    WARN("[BG3Access] PlayFile: calling PlaySoundW for %s", path);
     BOOL result = PlaySoundW(widePath.c_str(), nullptr,
         SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
     if (!result) {
@@ -203,6 +205,7 @@ bool PlayFile(char const* path)
         return false;
     }
 
+    WARN("[BG3Access] PlayFile: started successfully");
     gFileIsPlaying = true;
     gPlayingFilePath = widePath;
     return true;
@@ -210,16 +213,21 @@ bool PlayFile(char const* path)
 
 void PauseFile()
 {
+    WARN("[BG3Access] PauseFile: called (isPlaying=%d)", (int)gFileIsPlaying);
     // PlaySoundW does not support pause.  Stop instead.
     if (gFileIsPlaying) {
         PlaySoundW(nullptr, nullptr, 0);
+        WARN("[BG3Access] PauseFile: stopped (pause not supported)");
     }
 }
 
 void ResumeFile()
 {
     // PlaySoundW does not support resume.  Restart from beginning.
+    WARN("[BG3Access] ResumeFile: called (isPlaying=%d, hasPath=%d)",
+        (int)gFileIsPlaying, (int)!gPlayingFilePath.empty());
     if (gFileIsPlaying && !gPlayingFilePath.empty()) {
+        WARN("[BG3Access] ResumeFile: restarting playback");
         PlaySoundW(gPlayingFilePath.c_str(), nullptr,
             SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
     }
@@ -227,10 +235,12 @@ void ResumeFile()
 
 void StopFile()
 {
+    WARN("[BG3Access] StopFile: called (isPlaying=%d)", (int)gFileIsPlaying);
     if (gFileIsPlaying) {
         PlaySoundW(nullptr, nullptr, 0);
         gFileIsPlaying = false;
         gPlayingFilePath.clear();
+        WARN("[BG3Access] StopFile: stopped and cleared");
     }
 }
 

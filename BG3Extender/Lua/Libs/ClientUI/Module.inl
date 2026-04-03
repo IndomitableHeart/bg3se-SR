@@ -2109,6 +2109,24 @@ static const Noesis::DependencyProperty* LookupLocalFocusDP(
         classType, bg3se::FixedString("LocalFocus"));
 }
 
+// Read the Noesis class type name from a raw DataContext void* value.
+// The DC object may have been freed after the pointer was obtained, so both
+// the dereference and the vtable call are wrapped in SEH.
+// Returns the type name string (static storage, valid for the tick), or nullptr.
+static const char* ReadWidgetDCTypeName_SEH(const void* widgetDCVal)
+{
+    __try {
+        auto widgetDC = *reinterpret_cast<Noesis::BaseComponent* const*>(widgetDCVal);
+        if (!widgetDC) return nullptr;
+        auto classType = widgetDC->GetClassType();
+        if (!classType) return nullptr;
+        return classType->GetName();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        WARN("[BG3Access] AV in ReadWidgetDCTypeName_SEH -- stale DC pointer skipped");
+        return nullptr;
+    }
+}
+
 // PollRadialLocalFocus_Unsafe: SEH-guarded inner function.
 // Only does raw pointer reads -- no C++ objects with destructors.
 // Returns the focused item element and the widget visual via out params.
@@ -2136,11 +2154,8 @@ static bool PollRadialLocalFocus_Unsafe(
             if (!ProbeUIElement(static_cast<Noesis::UIElement*>(widgetElement))) continue;
             auto widgetDCVal = sDataContextProp->GetValue(widgetDepObj);
             if (!widgetDCVal) continue;
-            auto widgetDC = *reinterpret_cast<Noesis::BaseComponent* const*>(widgetDCVal);
-            if (!widgetDC) continue;
-            auto widgetDCType = widgetDC->GetClassType();
-            if (!widgetDCType) continue;
-            auto widgetDCTypeName = widgetDCType->GetName();
+            // DC object may be freed after GetValue returns -- use SEH helper.
+            auto widgetDCTypeName = ReadWidgetDCTypeName_SEH(widgetDCVal);
             if (!widgetDCTypeName || !strstr(widgetDCTypeName, "DCGameMenu")) continue;
 
             auto menuRadial = FindNameInWidgetScoped(
@@ -3092,6 +3107,29 @@ Noesis::BaseComponent* GetDataContext(Noesis::BaseObject* target)
 // LuaClient.cpp which is a different translation unit.
 void TickGlobalFocusMonitor()
 {
+    // Do NOT tick during loading/teardown states.  Noesis UI elements are
+    // torn down and rebuilt during loads; walking stale element pointers can
+    // hang the thread (pointer lands on memory the loader is paging in, so
+    // SEH never triggers -- it's a deadlock, not a fault).
+    auto clientState = GetStaticSymbols().GetClientState();
+    if (clientState) {
+        switch (*clientState) {
+        case ecl::GameState::SwapLevel:
+        case ecl::GameState::LoadLevel:
+        case ecl::GameState::LoadModule:
+        case ecl::GameState::LoadSession:
+        case ecl::GameState::UnloadLevel:
+        case ecl::GameState::UnloadModule:
+        case ecl::GameState::UnloadSession:
+        case ecl::GameState::StartLoading:
+        case ecl::GameState::StopLoading:
+        case ecl::GameState::StartServer:
+            return;
+        default:
+            break;
+        }
+    }
+
     // Top-level SEH guard: catches ANY Noesis crash in the entire Tick()
     // body, including deeply nested tree walks, DC reads, and text extraction.
     // Individual sections have their own SEH for diagnostics; this is the

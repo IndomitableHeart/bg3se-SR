@@ -154,10 +154,13 @@ static void PollActiveSearchLocalFocus(
     uint32_t widgetCount, ecl::lua::TickSnapshot* snapshot);
 static void PollContextMenu(
     Noesis::Visual* const* widgets, bool const* widgetVisible,
-    uint32_t widgetCount, ecl::lua::TickSnapshot* snapshot);
+    uint32_t widgetCount, Noesis::UIElement* focusedElement,
+    Noesis::Visual* trueRoot, Noesis::Visual* contentChild,
+    ecl::lua::TickSnapshot* snapshot);
 static bool PollContextMenu_Unsafe(
     Noesis::Visual* const* widgets, bool const* widgetVisible,
-    uint32_t widgetCount,
+    uint32_t widgetCount, Noesis::UIElement* focusedElement,
+    Noesis::Visual* trueRoot, Noesis::Visual* contentChild,
     Noesis::FrameworkElement** outHighlightedItem,
     Noesis::FrameworkElement** outTextBlock);
 
@@ -560,6 +563,75 @@ static uint32_t FindElementsByType_SEH(
     return found;
 }
 
+// GetVisualTreeRoot_SEH: walk UP via mVisualParent (direct field access,
+// same pattern as IsConnectedToWidget) to find the true visual tree root.
+// Returns the topmost Visual, or the input element if walk fails.
+static Noesis::Visual* GetVisualTreeRoot_SEH(Noesis::Visual* element)
+{
+    __try {
+        auto current = element;
+        for (int depth = 0; depth < 64; depth++) {
+            auto parent = current->mVisualParent;
+            if (!parent) break;
+            current = parent;
+        }
+        return current;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return element;
+    }
+}
+
+// FindContentChildOfRoot_SEH: walks up from an element via mVisualParent
+// to find the direct child of trueRoot that contains it.  Used to
+// identify the content tree so Source 3 can skip it.
+static Noesis::Visual* FindContentChildOfRoot_SEH(
+    Noesis::Visual* element, Noesis::Visual* trueRoot)
+{
+    __try {
+        auto current = element;
+        for (int depth = 0; depth < 64 && current; depth++) {
+            auto parent = current->mVisualParent;
+            if (parent == trueRoot) return current;
+            current = parent;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return nullptr;
+}
+
+// GetPopupRoots_SEH: returns the visual roots of open Noesis popups.
+// Popups (ContextMenu, Tooltip, ComboBox dropdown, etc.) live as
+// children of the true visual root alongside the content tree.
+// This function returns all non-content children, which are popup roots.
+//
+// trueRoot and contentChild are cached by GlobalFocusMonitor
+// (discovered once per root change).  Per-tick cost: one
+// GetVisualChildrenCount + one GetVisualChild per child.
+//
+// Returns the number of popup roots found (up to maxOut).
+static uint32_t GetPopupRoots_SEH(
+    Noesis::Visual* trueRoot, Noesis::Visual* contentChild,
+    Noesis::Visual** outPopupRoots, uint32_t maxOut)
+{
+    uint32_t found = 0;
+    __try {
+        if (!trueRoot) return 0;
+        if (!ProbeVisualChildren(
+                static_cast<Noesis::UIElement*>(trueRoot)))
+            return 0;
+        auto childCount = trueRoot->GetVisualChildrenCount();
+        for (uint32_t i = 0; i < childCount && found < maxOut; i++) {
+            auto child = trueRoot->GetVisualChild(i);
+            if (!child || child == contentChild) continue;
+            if (!ProbeUIElement(static_cast<Noesis::UIElement*>(child)))
+                continue;
+            outPopupRoots[found++] = child;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        BG3A_LOG("[BG3Access] GetPopupRoots_SEH: fault");
+    }
+    return found;
+}
+
 class GlobalFocusMonitor
 {
 public:
@@ -642,6 +714,16 @@ public:
         if (rootAddr != cachedRootAddr_) {
             cachedRootAddr_ = rootAddr;
             widgetContainer_ = FindWidgetContainer(root);
+            // Discover true visual root and content child for popup
+            // detection.  Only done once per root change.
+            cachedTrueRoot_ = GetVisualTreeRoot_SEH(root);
+            if (cachedTrueRoot_ && cachedTrueRoot_ != root) {
+                cachedContentChild_ = FindContentChildOfRoot_SEH(
+                    root, cachedTrueRoot_);
+            } else {
+                cachedTrueRoot_ = nullptr;
+                cachedContentChild_ = nullptr;
+            }
         }
         if (!widgetContainer_) {
             widgetContainer_ = FindWidgetContainer(root);
@@ -780,6 +862,7 @@ public:
             root, kMaxTreeDepth, &scopeRoot);
 
         // (Context menu polling is in PollContextMenu, called below.)
+
 
         // Subscribe SelectionChanged on each widget (subscribe-only, never
         // Remove).  Per-widget because the event may be handled (stopped)
@@ -1488,7 +1571,9 @@ public:
         // (hadFocusBefore_) -- during loading, FindNameInWidgetScoped
         // can hang on unstable NameScopes.
         if (hadFocusBefore_ && widgetCount > 0 && !snapshot->focusChanged) {
-            PollContextMenu(widgets, widgetVisible, widgetCount, snapshot);
+            PollContextMenu(widgets, widgetVisible, widgetCount,
+                            focused, cachedTrueRoot_, cachedContentChild_,
+                            snapshot);
         }
 
         // ----- HotBar action radial: Tag polling on visible widgets -----
@@ -2010,6 +2095,8 @@ private:
     // via FindWidgetContainer() when cachedRootAddr_ changes.
     uintptr_t cachedRootAddr_ = 0;
     Noesis::Visual* widgetContainer_ = nullptr;  // re-discovered from root each tick when root changes
+    Noesis::Visual* cachedTrueRoot_ = nullptr;   // true visual root (above content), for popup detection
+    Noesis::Visual* cachedContentChild_ = nullptr; // direct child of trueRoot that contains widgets
     uint32_t forcedNullCount_ = 0;  // limits forced re-arms when focus is null
     uint32_t prevWidgetCount_ = 0;
     uintptr_t prevWidgetAddrs_[kMaxWidgets] = {};
@@ -2677,6 +2764,49 @@ static void PollActiveSearchLocalFocus(
 // Outer function: does std::string text extraction and populates snapshot.
 // ---------------------------------------------------------------------------
 
+// Shared IsHighlighted DP cache for ContextMenuItems.
+// Used by both CheckContextMenuOnElement and Source 3 popup search.
+static const Noesis::DependencyProperty* sCtxMenuIsHighlightedProp = nullptr;
+static bool sCtxMenuIsHighlightedLookedUp = false;
+
+// FindHighlightedContextMenuItem: given an array of ContextMenuItems,
+// finds the one with IsHighlighted=true and its first TextBlock child.
+// Shared by CheckContextMenuOnElement (Sources 1/2) and Source 3.
+static bool FindHighlightedContextMenuItem(
+    Noesis::FrameworkElement** menuItems, uint32_t itemCount,
+    Noesis::FrameworkElement** outHighlightedItem,
+    Noesis::FrameworkElement** outTextBlock)
+{
+    if (itemCount == 0) return false;
+
+    // One-time IsHighlighted DP lookup on first item.
+    if (!sCtxMenuIsHighlightedLookedUp) {
+        sCtxMenuIsHighlightedLookedUp = true;
+        auto itemClassType = SafeGetClassType_SEH(menuItems[0]);
+        if (itemClassType) {
+            sCtxMenuIsHighlightedProp =
+                LookupIsHighlightedDP(itemClassType);
+        }
+    }
+    if (!sCtxMenuIsHighlightedProp) return false;
+
+    for (uint32_t mi = 0; mi < itemCount; mi++) {
+        auto itemDepObj = static_cast<Noesis::DependencyObject const*>(
+            menuItems[mi]);
+        if (SafeReadBoolDP_SEH(sCtxMenuIsHighlightedProp, itemDepObj)) {
+            *outHighlightedItem = menuItems[mi];
+            Noesis::FrameworkElement* textBlocks[4];
+            auto tbCount = FindElementsByType_SEH(
+                menuItems[mi], "TextBlock", textBlocks, 4);
+            if (tbCount > 0) {
+                *outTextBlock = textBlocks[0];
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 // CheckContextMenuOnElement: checks if a given element has a ContextMenu
 // DP with IsOpen=true, and if so, finds the highlighted ContextMenuItem.
 // Shared logic for both WorldContextEntity and ActiveSearch item paths.
@@ -2688,13 +2818,13 @@ static bool CheckContextMenuOnElement(
 {
     static const Noesis::DependencyProperty* sContextMenuProp = nullptr;
     static const Noesis::DependencyProperty* sIsOpenProp = nullptr;
-    static const Noesis::DependencyProperty* sIsHighlightedProp = nullptr;
     static bool sContextMenuDPLookedUp = false;
-    static bool sMenuItemDPsLookedUp = false;
 
     if (!element) return false;
     if (!ProbeUIElement(static_cast<Noesis::UIElement*>(element)))
         return false;
+
+  __try {
 
     // One-time ContextMenu DP lookup.
     if (!sContextMenuDPLookedUp) {
@@ -2728,120 +2858,102 @@ static bool CheckContextMenuOnElement(
             reinterpret_cast<Noesis::UIElement*>(cmObj)));
     if (!SafeReadBoolDP_SEH(sIsOpenProp, cmDepObj)) return false;
 
-    // Menu is open.  Find ContextMenuItems.
+    // Menu is open.  Find ContextMenuItems and the highlighted one.
     auto cmElem = reinterpret_cast<Noesis::Visual*>(
         reinterpret_cast<Noesis::UIElement*>(cmObj));
     Noesis::FrameworkElement* menuItems[16];
     auto itemCount = FindElementsByType_SEH(
         cmElem, "ContextMenuItem", menuItems, 16);
-    if (itemCount == 0) return false;
+    return FindHighlightedContextMenuItem(
+        menuItems, itemCount, outHighlightedItem, outTextBlock);
 
-    // One-time IsHighlighted DP lookup on first item.
-    if (!sMenuItemDPsLookedUp) {
-        sMenuItemDPsLookedUp = true;
-        auto itemClassType = SafeGetClassType_SEH(menuItems[0]);
-        if (itemClassType) {
-            sIsHighlightedProp = LookupIsHighlightedDP(itemClassType);
-        }
-    }
-    if (!sIsHighlightedProp) return false;
-
-    // Find the highlighted item.
-    for (uint32_t mi = 0; mi < itemCount; mi++) {
-        auto itemDepObj = static_cast<Noesis::DependencyObject const*>(
-            menuItems[mi]);
-        if (SafeReadBoolDP_SEH(sIsHighlightedProp, itemDepObj)) {
-            *outHighlightedItem = menuItems[mi];
-            Noesis::FrameworkElement* textBlocks[4];
-            auto tbCount = FindElementsByType_SEH(
-                menuItems[mi], "TextBlock", textBlocks, 4);
-            if (tbCount > 0) {
-                *outTextBlock = textBlocks[0];
-            }
-            return true;
-        }
-    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    BG3A_LOG("[BG3Access] CheckContextMenuOnElement: fault (SEH caught)");
+    *outHighlightedItem = nullptr;
+    *outTextBlock = nullptr;
     return false;
+  }
 }
+
 
 // PollContextMenu_Unsafe: tries multiple element sources for an open
 // context menu.  No C++ objects with destructors.
 // Returns true if an open context menu with a highlighted item was found.
 static bool PollContextMenu_Unsafe(
     Noesis::Visual* const* widgets, bool const* widgetVisible,
-    uint32_t widgetCount,
+    uint32_t widgetCount, Noesis::UIElement* focusedElement,
+    Noesis::Visual* trueRoot, Noesis::Visual* contentChild,
     Noesis::FrameworkElement** outHighlightedItem,
     Noesis::FrameworkElement** outTextBlock)
 {
     *outHighlightedItem = nullptr;
     *outTextBlock = nullptr;
 
+  __try {
+    // GATE: check if any popups exist.
+    // GetPopupRoots_SEH returns non-content children of the true
+    // visual root.  If none, no popup is open -- skip everything.
+    // Per-tick cost when no popup: one GetVisualChildrenCount call.
+    Noesis::Visual* popupRoots[8];
+    auto popupCount = GetPopupRoots_SEH(
+        trueRoot, contentChild, popupRoots, 8);
+    if (popupCount == 0) return false;
+
+    // A popup exists.  Check sources for an open context menu.
+
     // Source 1: WorldContextEntity (direct X on world item).
     for (uint32_t i = 0; i < widgetCount; i++) {
         if (!widgets[i] || !widgetVisible[i]) continue;
         if (!ProbeUIElement(static_cast<Noesis::UIElement*>(
                 const_cast<Noesis::Visual*>(widgets[i])))) continue;
-
         auto entity = FindNameInWidgetScoped(
             "WorldContextEntity", widgets[i]);
         if (!entity) continue;
-
         if (CheckContextMenuOnElement(entity,
                 outHighlightedItem, outTextBlock)) {
             return true;
         }
-        break;  // Only one WorldContextEntity exists.
+        break;
     }
 
-    // Source 2: focused element in the ActiveSearch widget.
-    // The game opens the ContextMenu on the focused item element
-    // when ShowContextMenuCommand fires from within ActiveSearch.
-    // Only check widgets with DCActiveSearch DC type to avoid
-    // expensive DP reads on unrelated widgets during loading.
-    if (sFocusedElementProp && sDataContextProp) {
-        for (uint32_t i = 0; i < widgetCount; i++) {
-            if (!widgets[i] || !widgetVisible[i]) continue;
-            if (!ProbeUIElement(static_cast<Noesis::UIElement*>(
-                    const_cast<Noesis::Visual*>(widgets[i])))) continue;
+    // Source 2: focused element (ActiveSearch item ContextMenu).
+    if (focusedElement && ProbeUIElement(focusedElement)) {
+        if (CheckContextMenuOnElement(
+                static_cast<Noesis::FrameworkElement*>(focusedElement),
+                outHighlightedItem, outTextBlock)) {
+            return true;
+        }
+    }
 
-            // Only check ActiveSearch widgets.
-            auto widgetDepObj = static_cast<Noesis::DependencyObject const*>(
-                static_cast<Noesis::FrameworkElement*>(
-                    const_cast<Noesis::Visual*>(widgets[i])));
-            auto widgetDCVal = sDataContextProp->GetValue(widgetDepObj);
-            if (!widgetDCVal) continue;
-            auto widgetDCTypeName = ReadWidgetDCTypeName_SEH(widgetDCVal);
-            if (!widgetDCTypeName ||
-                !strstr(widgetDCTypeName, "DCActiveSearch")) continue;
-
-            // Found ActiveSearch.  Check its FocusedElement's ContextMenu.
-            auto focVal = SafeGetDPValue_SEH(sFocusedElementProp,
-                                              widgetDepObj);
-            if (!focVal) continue;
-            auto focObj = SafeDerefDPObject_SEH(focVal);
-            if (!focObj) continue;
-            if (!ProbeUIElement(
-                    reinterpret_cast<Noesis::UIElement*>(focObj)))
-                continue;
-
-            auto focElem = static_cast<Noesis::FrameworkElement*>(
-                reinterpret_cast<Noesis::UIElement*>(focObj));
-            if (CheckContextMenuOnElement(focElem,
-                    outHighlightedItem, outTextBlock)) {
-                return true;
-            }
-            break;  // Only one ActiveSearch widget.
+    // Source 3: search popup roots for ContextMenuItems directly.
+    for (uint32_t pi = 0; pi < popupCount; pi++) {
+        Noesis::FrameworkElement* popupMenuItems[16];
+        auto popupItemCount = FindElementsByType_SEH(
+            popupRoots[pi], "ContextMenuItem", popupMenuItems, 16);
+        if (FindHighlightedContextMenuItem(
+                popupMenuItems, popupItemCount,
+                outHighlightedItem, outTextBlock)) {
+            return true;
         }
     }
 
     return false;
+
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    BG3A_LOG("[BG3Access] PollContextMenu_Unsafe: fault (SEH caught)");
+    *outHighlightedItem = nullptr;
+    *outTextBlock = nullptr;
+    return false;
+  }
 }
 
-// PollContextMenu: outer wrapper.  Calls the inner SEH function,
+// PollContextMenu: outer wrapper.  Calls the inner function,
 // then does std::string text extraction and populates the snapshot.
 static void PollContextMenu(
     Noesis::Visual* const* widgets, bool const* widgetVisible,
-    uint32_t widgetCount, ecl::lua::TickSnapshot* snapshot)
+    uint32_t widgetCount, Noesis::UIElement* focusedElement,
+    Noesis::Visual* trueRoot, Noesis::Visual* contentChild,
+    ecl::lua::TickSnapshot* snapshot)
 {
     static uintptr_t sLastContextMenuHighlightAddr = 0;
 
@@ -2849,6 +2961,7 @@ static void PollContextMenu(
     Noesis::FrameworkElement* textBlock = nullptr;
 
     if (!PollContextMenu_Unsafe(widgets, widgetVisible, widgetCount,
+                               focusedElement, trueRoot, contentChild,
                                &highlightedItem, &textBlock)) {
         // Context menu closed or no highlighted item.
         // Reset tracker so re-opening detects the first item.

@@ -977,7 +977,10 @@ public:
         // "Added" means: widgetSetChanged AND there is at least one widget
         // pointer in the current set that was NOT in the previous set.
         // This avoids firing on widget REMOVAL (menu closing).
-        if (widgetSetChanged && widgetCount > 0 && hadFocusBefore_) {
+        // Allow widgetAdded when focus arrives WITH the new widget
+        // (focusChanged + new widget on same tick, e.g. SelectionFlyOut).
+        if (widgetSetChanged && widgetCount > 0
+            && (hadFocusBefore_ || focusChanged)) {
             bool widgetAdded = false;
             if (widgetCount > oldWidgetCount) {
                 widgetAdded = true;
@@ -1732,7 +1735,6 @@ private:
         data.eventType = "WidgetAdded";
 
         auto frameworkElem = static_cast<Noesis::FrameworkElement*>(elem);
-        WARN("[BG3Access]   FireWidgetCallback: elem=%p", elem);
         auto classType = SafeGetClassType_SEH(frameworkElem);
         if (!classType) {
             WARN("[BG3Access]   FireWidgetCallback: GetClassType returned null for %p, skipping", elem);
@@ -1740,6 +1742,8 @@ private:
         }
         data.elemType = classType->GetName();
         data.elemName = ReadPropertyAsString(frameworkElem, "Name");
+        WARN("[BG3Access]   FireWidgetCallback: elem=%p type=%s name=%s",
+             elem, data.elemType.c_str(), data.elemName.c_str());
 
         // Widget root ID (the widget itself IS the root for widget-added)
         char ptrBuf[32];
@@ -1754,6 +1758,8 @@ private:
                 static_cast<Noesis::DependencyObject const*>(frameworkElem));
             if (dataContext) {
                 auto dcTypeName = SafeBaseObjectTypeName_SEH(dataContext);
+                WARN("[BG3Access]   FireWidgetCallback: DC=%s",
+                     dcTypeName ? dcTypeName : "(null)");
                 if (dcTypeName) {
                     data.dcType = dcTypeName;
                     CollectDCProperties(data, dataContext);

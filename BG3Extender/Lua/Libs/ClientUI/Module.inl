@@ -224,6 +224,165 @@ static bool ProbeVisualChildren(Noesis::Visual* elem)
     }
 }
 
+// ---------------------------------------------------------------------------
+// Reusable SEH helpers for Noesis pointer dereferences.
+// Every raw dereference of a pointer obtained from Noesis APIs is a crash
+// risk if the object was freed.  These helpers isolate the dangerous
+// operations into standalone functions (no C++ objects with destructors)
+// so __try/__except is MSVC-compatible.
+// ---------------------------------------------------------------------------
+
+// Read DataContext from a DependencyObject.  Combines GetValue + dereference.
+// Returns BaseComponent* or nullptr on fault/missing.
+static Noesis::BaseComponent* SafeReadDC_SEH(Noesis::DependencyObject const* depObj)
+{
+    __try {
+        if (!sDataContextProp) return nullptr;
+        auto dcVal = sDataContextProp->GetValue(depObj);
+        if (!dcVal) return nullptr;
+        return *reinterpret_cast<Noesis::BaseComponent* const*>(dcVal);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+// Read a DependencyProperty value from a DependencyObject.
+// Returns raw void* or nullptr on fault.
+static const void* SafeGetDPValue_SEH(
+    Noesis::DependencyProperty const* prop,
+    Noesis::DependencyObject const* depObj)
+{
+    __try {
+        return prop->GetValue(depObj);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+// Dereference a void* from GetValue as BaseObject*.
+// GetValue returns a pointer to the stored value; for object DPs the
+// stored value is itself a pointer, so we need a double dereference.
+// Returns BaseObject* or nullptr on fault.
+static Noesis::BaseObject* SafeDerefDPObject_SEH(const void* dpVal)
+{
+    __try {
+        if (!dpVal) return nullptr;
+        return *reinterpret_cast<Noesis::BaseObject* const*>(dpVal);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+// GetClassType()->GetName() on any BaseObject.  Returns nullptr on fault.
+static const char* SafeBaseObjectTypeName_SEH(Noesis::BaseObject const* obj)
+{
+    __try {
+        auto classType = obj->GetClassType();
+        if (!classType) return nullptr;
+        return classType->GetName();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+// GetClassType() on any BaseObject, returning the Type* for class hierarchy
+// walks.  Returns nullptr on fault.
+static Noesis::TypeClass const* SafeGetClassType_SEH(Noesis::BaseObject const* obj)
+{
+    __try {
+        return obj->GetClassType();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+// DynamicCast to INotifyPropertyChanged.  Returns nullptr on fault.
+static Noesis::INotifyPropertyChanged* SafeDynamicCastINPC_SEH(
+    Noesis::BaseComponent* dc)
+{
+    __try {
+        return Noesis::DynamicCast<
+            Noesis::INotifyPropertyChanged*, Noesis::BaseComponent*>(dc);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+// TypeProperty::Get() on an object.  Returns raw void* or nullptr on fault.
+static const void* SafeTypePropertyGet_SEH(
+    Noesis::TypeProperty const* prop, Noesis::BaseObject const* obj)
+{
+    __try {
+        return prop->Get(obj);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+// TypeProperty::GetCopy() for pointer types.  Writes to outPtr, returns
+// true on success.  Returns false on fault.
+static bool SafeTypePropertyGetCopy_SEH(
+    Noesis::TypeProperty const* prop, Noesis::BaseObject const* obj,
+    void* outPtr)
+{
+    __try {
+        prop->GetCopy(obj, outPtr);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Inner function: calls GetComponent (returns Ptr<> with destructor).
+// Extracts raw pointer with AddRef so caller can Release() when done.
+// Must NOT contain __try (Ptr<> has destructor).
+static Noesis::BaseComponent* GetComponentRaw(
+    Noesis::TypeProperty const* prop, Noesis::BaseObject* owner)
+{
+    auto component = prop->GetComponent(owner);
+    auto raw = component.GetPtr();
+    if (raw) raw->AddReference();
+    return raw;
+}
+
+// SEH wrapper: calls GetComponentRaw inside __try.
+// Returns raw BaseComponent* with extra ref, or nullptr on fault.
+static Noesis::BaseComponent* SafeGetComponent_SEH(
+    Noesis::TypeProperty const* prop, Noesis::BaseObject* owner)
+{
+    __try {
+        return GetComponentRaw(prop, owner);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+// Inner function: calls BaseCollection::GetComponent (returns Ptr<>).
+// Must NOT contain __try.
+static Noesis::BaseComponent* CollectionGetItemRaw(
+    Noesis::BaseCollection* collection, uint32_t index)
+{
+    auto itemPtr = collection->GetComponent(index);
+    auto raw = itemPtr.GetPtr();
+    if (raw) raw->AddReference();
+    return raw;
+}
+
+// SEH wrapper: calls CollectionGetItemRaw inside __try.
+// Returns raw BaseComponent* with extra ref, or nullptr on fault.
+static Noesis::BaseComponent* SafeCollectionGetItem_SEH(
+    Noesis::BaseCollection* collection, uint32_t index)
+{
+    __try {
+        return CollectionGetItemRaw(collection, index);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+// Forward declarations for post-processors defined after CollectDCProperties.
+static void TryCollectSelectionFlyOutTitle(FocusEventData& out, Noesis::BaseObject* dc);
+
 // Handler for Selector.SelectionChanged routed events.  Uses the
 // DummyDelegate pattern (same as UIEventHooks): 'this' is a fake pointer
 // that is never dereferenced.  Extracts the selected element directly
@@ -283,12 +442,15 @@ static Noesis::BaseObject* GetListBoxSelectedItem(Noesis::FrameworkElement* list
     if (!sSelectedItemKey) {
         sSelectedItemKey = FixedString("SelectedItem");
     }
-    auto const& listBoxClass = Noesis::gClassCache.GetClass(
-        listBox->GetClassType());
+    auto listBoxClassType = SafeGetClassType_SEH(listBox);
+    if (!listBoxClassType) return nullptr;
+
+    auto const& listBoxClass = Noesis::gClassCache.GetClass(listBoxClassType);
     auto selectedItemProp = listBoxClass.Names.try_get(sSelectedItemKey);
     if (!selectedItemProp || !selectedItemProp->Property) return nullptr;
 
-    auto selectedItemRaw = selectedItemProp->Property->Get(listBox);
+    auto selectedItemRaw = SafeTypePropertyGet_SEH(
+        selectedItemProp->Property, listBox);
     if (!selectedItemRaw) return nullptr;
 
     return *reinterpret_cast<Noesis::BaseObject* const*>(selectedItemRaw);
@@ -301,8 +463,11 @@ static std::string TryReadInlineCarouselText(Noesis::FrameworkElement* listBox)
     auto selectedItem = GetListBoxSelectedItem(listBox);
     if (!selectedItem) return {};
 
+    // Validate the item pointer before class cache lookup.
+    auto selectedItemClassType = SafeGetClassType_SEH(selectedItem);
+    if (!selectedItemClassType) return {};
     auto const& selectedItemClass = Noesis::gClassCache.GetClass(
-        selectedItem->GetClassType());
+        selectedItemClassType);
     const char* propertyNames[] = {"Name", "ColorName", "Title"};
     for (auto candidatePropName : propertyNames) {
         auto propKey = FixedString(candidatePropName);
@@ -761,7 +926,7 @@ public:
             // Check isTab by type
             bool isTab = false;
             if (sListBoxItemType) {
-                auto cls = selData->GetClassType();
+                auto cls = SafeGetClassType_SEH(selData);
                 while (cls) {
                     if (cls == sListBoxItemType) { isTab = true; break; }
                     cls = cls->GetBase();
@@ -913,13 +1078,11 @@ public:
                 if (!widgets[i] || !IsVisibleDP(widgets[i])) continue;
                 auto widgetElem = static_cast<Noesis::FrameworkElement*>(
                     const_cast<Noesis::Visual*>(widgets[i]));
-                if (!sDataContextProp) continue;
-                auto depObj = static_cast<Noesis::DependencyObject const*>(widgetElem);
-                auto dcVal = sDataContextProp->GetValue(depObj);
-                if (!dcVal) continue;
-                auto dataContext = *reinterpret_cast<Noesis::BaseComponent* const*>(dcVal);
+                auto dataContext = SafeReadDC_SEH(
+                    static_cast<Noesis::DependencyObject const*>(widgetElem));
                 if (!dataContext) continue;
-                auto dcTypeName = dataContext->GetClassType()->GetName();
+                auto dcTypeName = SafeBaseObjectTypeName_SEH(dataContext);
+                if (!dcTypeName) continue;
                 if (IsOverlayDCType(dcTypeName)) continue;
                 WARN("[BG3Access]   -> Post-settle INPC subscribe (widget[%u] DC=%s)", i, dcTypeName);
                 SubscribeWidgetINPC(dataContext, widgetElem);
@@ -971,15 +1134,13 @@ public:
                     bool isOverlay = false;
                     auto widgetElem = static_cast<Noesis::FrameworkElement*>(
                         const_cast<Noesis::Visual*>(widgets[i]));
-                    if (sDataContextProp) {
-                        auto depObj = static_cast<Noesis::DependencyObject const*>(widgetElem);
-                        auto dcVal = sDataContextProp->GetValue(depObj);
-                        if (dcVal) {
-                            auto dc = *reinterpret_cast<Noesis::BaseComponent* const*>(dcVal);
-                            if (dc) {
-                                scanDCType = dc->GetClassType()->GetName();
-                                isOverlay = IsOverlayDCType(scanDCType);
-                            }
+                    auto scanDC = SafeReadDC_SEH(
+                        static_cast<Noesis::DependencyObject const*>(widgetElem));
+                    if (scanDC) {
+                        auto typeName = SafeBaseObjectTypeName_SEH(scanDC);
+                        if (typeName) {
+                            scanDCType = typeName;
+                            isOverlay = IsOverlayDCType(scanDCType);
                         }
                     }
                     WARN("[BG3Access]   widget[%d] vis=%d DC=%s%s", i,
@@ -997,10 +1158,14 @@ public:
                     if (snapshot->focusedElement.namedTexts.empty()) {
                         std::vector<std::string> visualTexts;
                         GatherVisibleTextBlocks(widgetElem, visualTexts);
+                        // Use indexed keys (_visualText_1, _visualText_2, ...)
+                        // so Lua tables don't silently overwrite duplicate keys.
+                        int visualIndex = 0;
                         for (auto& visualText : visualTexts) {
                             WARN("[BG3Access]     Visual text: %s", visualText.c_str());
+                            std::string key = "_visualText_" + std::to_string(++visualIndex);
                             snapshot->focusedElement.namedTexts.push_back(
-                                {"_visualText", std::move(visualText)});
+                                {std::move(key), std::move(visualText)});
                         }
                     }
                 }
@@ -1050,8 +1215,10 @@ public:
 
             // Re-discover the widget from the live widget list using its
             // stored address.  NEVER dereference stored addresses directly.
+            // widgetContainer_ is a cross-tick pointer -- probe before use.
             Noesis::FrameworkElement* freshWidget = nullptr;
-            if (widgetContainer_) {
+            if (widgetContainer_
+                && ProbeVisualChildren(widgetContainer_)) {
                 auto containerChildCount = widgetContainer_->GetVisualChildrenCount();
                 for (uint32_t i = 0; i < containerChildCount; i++) {
                     auto child = widgetContainer_->GetVisualChild(i);
@@ -1068,20 +1235,17 @@ public:
             }
             if (freshWidget) {
                 // Re-read DC from the fresh widget pointer (obtained this frame).
-                Noesis::BaseComponent* freshDC = nullptr;
-                if (sDataContextProp) {
-                    auto depObj = static_cast<Noesis::DependencyObject const*>(freshWidget);
-                    auto dcVal = sDataContextProp->GetValue(depObj);
-                    if (dcVal) {
-                        freshDC = *reinterpret_cast<Noesis::BaseComponent* const*>(dcVal);
-                    }
-                }
+                auto freshDC = SafeReadDC_SEH(
+                    static_cast<Noesis::DependencyObject const*>(freshWidget));
 
                 if (freshDC) {
+                    auto freshDCTypeName = SafeBaseObjectTypeName_SEH(freshDC);
+                    if (!freshDCTypeName) freshDCTypeName = "";
+
                     // Write widget DC data directly into snapshot.
                     auto widgetDCData = std::make_unique<FocusEventData>();
                     widgetDCData->eventType = "WidgetDCChanged";
-                    widgetDCData->dcType = freshDC->GetClassType()->GetName();
+                    widgetDCData->dcType = freshDCTypeName;
                     CollectDCProperties(*widgetDCData, freshDC);
 
                     // Collect namedTexts from the fresh widget.
@@ -1106,7 +1270,7 @@ public:
                     if (!snapshot->widgetAdded) {
                         snapshot->widgetAdded = true;
                         snapshot->widgetData.eventType = "WidgetDCChanged";
-                        snapshot->widgetData.dcType = freshDC->GetClassType()->GetName();
+                        snapshot->widgetData.dcType = freshDCTypeName;
                         CollectDCProperties(snapshot->widgetData, freshDC);
                     }
                 }
@@ -1160,7 +1324,7 @@ public:
                 // Validate before virtual calls -- element may be stale.
                 if (!ProbeUIElement(static_cast<Noesis::UIElement*>(currentNode))) continue;
 
-                auto nodeTypeName = currentNode->GetClassType()->GetName();
+                auto nodeTypeName = SafeBaseObjectTypeName_SEH(currentNode);
 
                 // Check for TextBlock named "selectionName"
                 if (nodeTypeName && strstr(nodeTypeName, "TextBlock")) {
@@ -1238,18 +1402,16 @@ public:
 
                 // Only process the DCHotBar widget (ActionRadials).
                 // Other widgets may have Tags for unrelated purposes.
-                auto dcVal = sDataContextProp->GetValue(widgetDepObj);
-                if (!dcVal) continue;
-                auto widgetDC = *reinterpret_cast<Noesis::BaseComponent* const*>(dcVal);
+                auto widgetDC = SafeReadDC_SEH(widgetDepObj);
                 if (!widgetDC) continue;
-                auto widgetDCTypeName = widgetDC->GetClassType()->GetName();
+                auto widgetDCTypeName = SafeBaseObjectTypeName_SEH(widgetDC);
                 if (!widgetDCTypeName || !strstr(widgetDCTypeName, "DCHotBar")) continue;
                 foundHotBarWidget = true;
 
                 // Read Tag property from the HotBar widget.
-                auto tagVal = sTagProp->GetValue(widgetDepObj);
+                auto tagVal = SafeGetDPValue_SEH(sTagProp, widgetDepObj);
                 if (!tagVal) { break; }
-                auto tagObject = *reinterpret_cast<Noesis::BaseObject* const*>(tagVal);
+                auto tagObject = SafeDerefDPObject_SEH(tagVal);
                 if (!tagObject) { break; }
                 hotBarHasTag = true;
                 auto tagAddr = reinterpret_cast<uintptr_t>(tagObject);
@@ -1257,10 +1419,10 @@ public:
                 if (tagAddr != lastRadialTagAddr_) {
                     lastRadialTagAddr_ = tagAddr;
 
-                    if (!ProbeUIElement(reinterpret_cast<Noesis::UIElement*>(tagObject)))
-                        continue;
-
-                    auto tagTypeName = tagObject->GetClassType()->GetName();
+                    // Tag holds a ViewModel (BaseObject), NOT a UIElement.
+                    // Use SafeBaseObjectTypeName_SEH instead of ProbeUIElement.
+                    auto tagTypeName = SafeBaseObjectTypeName_SEH(tagObject);
+                    if (!tagTypeName) continue;
 
                     // HotBar action radial: Tag is VMHotBarSlot.
                     // C++ extracts the slot's identifying properties (Name,
@@ -1552,15 +1714,10 @@ private:
 
         // No UnsubscribeINPC needed -- fire-and-forget pattern.
         // Previous subscription's delegate just sets inpcDirty_ (harmless).
-        if (sDataContextProp) {
-            auto depObj = static_cast<Noesis::DependencyObject const*>(frameworkElem);
-            auto dcVal = sDataContextProp->GetValue(depObj);
-            if (dcVal) {
-                auto dataContext = *reinterpret_cast<Noesis::BaseComponent* const*>(dcVal);
-                if (dataContext) {
-                    SubscribeINPC(dataContext);
-                }
-            }
+        auto dataContext = SafeReadDC_SEH(
+            static_cast<Noesis::DependencyObject const*>(frameworkElem));
+        if (dataContext) {
+            SubscribeINPC(dataContext);
         }
     }
 
@@ -1576,7 +1733,7 @@ private:
 
         auto frameworkElem = static_cast<Noesis::FrameworkElement*>(elem);
         WARN("[BG3Access]   FireWidgetCallback: elem=%p", elem);
-        auto classType = frameworkElem->GetClassType();
+        auto classType = SafeGetClassType_SEH(frameworkElem);
         if (!classType) {
             WARN("[BG3Access]   FireWidgetCallback: GetClassType returned null for %p, skipping", elem);
             return;
@@ -1592,14 +1749,15 @@ private:
         // Collect ALL DC properties from the widget's DataContext.
         // This captures ViewModel-driven content: titles, descriptions,
         // dialog text (LSMessageBoxData), status messages, etc.
-        if (sDataContextProp) {
-            auto depObj = static_cast<Noesis::DependencyObject const*>(frameworkElem);
-            auto dcVal = sDataContextProp->GetValue(depObj);
-            if (dcVal) {
-                auto dataContext = *reinterpret_cast<Noesis::BaseComponent* const*>(dcVal);
-                if (dataContext) {
-                    data.dcType = dataContext->GetClassType()->GetName();
+        {
+            auto dataContext = SafeReadDC_SEH(
+                static_cast<Noesis::DependencyObject const*>(frameworkElem));
+            if (dataContext) {
+                auto dcTypeName = SafeBaseObjectTypeName_SEH(dataContext);
+                if (dcTypeName) {
+                    data.dcType = dcTypeName;
                     CollectDCProperties(data, dataContext);
+                    TryCollectSelectionFlyOutTitle(data, dataContext);
 
                     // NOTE: Actions collection enumeration via DynamicCast<IList*>
                     // crashes the Noesis Indie SDK type registry.  Dialog button
@@ -1633,8 +1791,7 @@ private:
     // harmless if it fires during destruction.
     void SubscribeINPC(Noesis::BaseComponent* dataContext)
     {
-        auto notifies = Noesis::DynamicCast<
-            Noesis::INotifyPropertyChanged*, Noesis::BaseComponent*>(dataContext);
+        auto notifies = SafeDynamicCastINPC_SEH(dataContext);
         if (!notifies) return;
 
         // Fire-and-forget: subscribe and let Noesis manage the lifetime.
@@ -1669,8 +1826,7 @@ private:
         if (dcAddr == widgetInpcDCAddr_ && dcAddr != 0)
             return;
 
-        auto notifies = Noesis::DynamicCast<
-            Noesis::INotifyPropertyChanged*, Noesis::BaseComponent*>(dataContext);
+        auto notifies = SafeDynamicCastINPC_SEH(dataContext);
         if (!notifies) return;
 
         // Fire-and-forget: subscribe and store addresses for re-discovery.
@@ -2048,6 +2204,23 @@ void InitFocusProperties(Noesis::FrameworkElement* root)
 // property named "FocusedElement" and cache the DependencyProperty* once
 // found.  This is called lazily from Tick() when widgets are available.
 // ---------------------------------------------------------------------------
+// SEH helper: scan mValues for a named DependencyProperty.
+// Returns the DP* or nullptr on fault.
+static Noesis::DependencyProperty const* SafeScanMValuesForDP_SEH(
+    Noesis::DependencyObject const* depObj, Noesis::Symbol targetName)
+{
+    __try {
+        for (auto& prop : depObj->mValues) {
+            if (prop.key->GetName() == targetName) {
+                return prop.key;
+            }
+        }
+        return nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
 static void TryDiscoverFocusedElementProp(Noesis::Visual* const* widgets, uint32_t count)
 {
     if (sFocusedElementProp) return;  // already resolved
@@ -2056,12 +2229,11 @@ static void TryDiscoverFocusedElementProp(Noesis::Visual* const* widgets, uint32
     for (uint32_t i = 0; i < count; i++) {
         if (!widgets[i]) continue;
         auto depObj = static_cast<Noesis::DependencyObject const*>(widgets[i]);
-        for (auto& prop : depObj->mValues) {
-            if (prop.key->GetName() == sFocusedElementSym) {
-                sFocusedElementProp = prop.key;
-                WARN("[BG3Access] FocusedElement discovered from widget mValues: %p", sFocusedElementProp);
-                return;
-            }
+        auto found = SafeScanMValuesForDP_SEH(depObj, sFocusedElementSym);
+        if (found) {
+            sFocusedElementProp = found;
+            WARN("[BG3Access] FocusedElement discovered from widget mValues: %p", sFocusedElementProp);
+            return;
         }
     }
 }
@@ -2075,7 +2247,7 @@ static void TryDiscoverFocusedElementProp(Noesis::Visual* const* widgets, uint32
 static bool IsVisibleDP(Noesis::Visual const* elem)
 {
     if (!sIsVisibleProp) return true;
-    auto val = sIsVisibleProp->GetValue(
+    auto val = SafeGetDPValue_SEH(sIsVisibleProp,
         static_cast<Noesis::DependencyObject const*>(elem));
     return !val || *static_cast<const bool*>(val);
 }
@@ -2083,7 +2255,7 @@ static bool IsVisibleDP(Noesis::Visual const* elem)
 // Check if an element's class derives from ls.UIWidget.
 static bool IsUIWidgetType(Noesis::Visual const* elem)
 {
-    auto cls = elem->GetClassType();
+    auto cls = SafeGetClassType_SEH(elem);
     while (cls) {
         if (sUIWidgetType && cls == sUIWidgetType) return true;
         if (sDCWidgetType && cls == sDCWidgetType) return true;
@@ -2408,7 +2580,7 @@ Noesis::UIElement* FindFocusedInTree(Noesis::Visual* elem, int depth)
 static bool IsListBoxItemType(Noesis::Visual const* elem)
 {
     if (!sListBoxItemType) return false;
-    auto cls = elem->GetClassType();
+    auto cls = SafeGetClassType_SEH(elem);
     while (cls) {
         if (cls == sListBoxItemType) return true;
         cls = cls->GetBase();
@@ -3201,14 +3373,16 @@ static std::string ReadTypePropertyAsString(Noesis::BaseObject const* obj,
     if (!type) return {};
 
     if (type == types.String.Type) {
-        auto value = reinterpret_cast<Noesis::String const*>(prop->Get(obj));
+        auto value = reinterpret_cast<Noesis::String const*>(
+            SafeTypePropertyGet_SEH(prop, obj));
         if (value && value->Size() > 0) return value->Str();
     } else if (type == types.CStringPtr.Type) {
         char const* value = nullptr;
-        prop->GetCopy(obj, &value);
+        if (!SafeTypePropertyGetCopy_SEH(prop, obj, &value)) return {};
         if (value && value[0] != '\0') return value;
     } else if (type == types.LocaString.Type) {
-        auto ts = reinterpret_cast<TranslatedString const*>(prop->Get(obj));
+        auto ts = reinterpret_cast<TranslatedString const*>(
+            SafeTypePropertyGet_SEH(prop, obj));
         if (ts) {
             auto resolved = ts->Get();
             if (resolved && !resolved->empty()
@@ -3220,29 +3394,29 @@ static std::string ReadTypePropertyAsString(Noesis::BaseObject const* obj,
         }
     } else if (type == types.Bool.Type) {
         bool value = false;
-        prop->GetCopy(obj, &value);
+        if (!SafeTypePropertyGetCopy_SEH(prop, obj, &value)) return {};
         return value ? "On" : "Off";
     } else if (type == types.Int32.Type) {
         int32_t value = 0;
-        prop->GetCopy(obj, &value);
+        if (!SafeTypePropertyGetCopy_SEH(prop, obj, &value)) return {};
         return std::to_string(value);
     } else if (type == types.UInt32.Type) {
         uint32_t value = 0;
-        prop->GetCopy(obj, &value);
+        if (!SafeTypePropertyGetCopy_SEH(prop, obj, &value)) return {};
         return std::to_string(value);
     } else if (type == types.Int64.Type) {
         int64_t value = 0;
-        prop->GetCopy(obj, &value);
+        if (!SafeTypePropertyGetCopy_SEH(prop, obj, &value)) return {};
         return std::to_string(value);
     } else if (type == types.Single.Type) {
         float value = 0;
-        prop->GetCopy(obj, &value);
+        if (!SafeTypePropertyGetCopy_SEH(prop, obj, &value)) return {};
         char buf[32];
         snprintf(buf, sizeof(buf), "%g", value);
         return buf;
     } else if (type == types.Double.Type) {
         double value = 0;
-        prop->GetCopy(obj, &value);
+        if (!SafeTypePropertyGetCopy_SEH(prop, obj, &value)) return {};
         char buf[32];
         snprintf(buf, sizeof(buf), "%g", value);
         return buf;
@@ -3252,7 +3426,7 @@ static std::string ReadTypePropertyAsString(Noesis::BaseObject const* obj,
         // Enum properties (e.g. Ability=Strength, Skill=Deception).
         // Read the underlying integer and look up the symbolic name.
         int64_t enumValue = 0;
-        prop->GetCopy(obj, &enumValue);
+        if (!SafeTypePropertyGetCopy_SEH(prop, obj, &enumValue)) return {};
         auto enumType = static_cast<Noesis::TypeEnum const*>(type);
         for (auto const& entry : enumType->mValues) {
             if (entry.second == enumValue) {
@@ -3761,17 +3935,14 @@ static void CollectNamedTextsFromWidget(
 
     // Part 3: DC type filter -- skip overlay widgets whose TextBlocks
     // have unresolved bindings that crash ReadTextBlockText.
-    if (sDataContextProp) {
-        auto depObj = static_cast<Noesis::DependencyObject const*>(widgetElem);
-        auto dcVal = sDataContextProp->GetValue(depObj);
-        if (dcVal) {
-            auto dataContext = *reinterpret_cast<Noesis::BaseComponent* const*>(dcVal);
-            if (dataContext) {
-                auto dcTypeName = dataContext->GetClassType()->GetName();
-                if (IsOverlayDCType(dcTypeName)) {
-                    WARN("[BG3Access]   NameScope: skipping overlay widget DC=%s", dcTypeName);
-                    return;
-                }
+    {
+        auto dataContext = SafeReadDC_SEH(
+            static_cast<Noesis::DependencyObject const*>(widgetElem));
+        if (dataContext) {
+            auto dcTypeName = SafeBaseObjectTypeName_SEH(dataContext);
+            if (dcTypeName && IsOverlayDCType(dcTypeName)) {
+                WARN("[BG3Access]   NameScope: skipping overlay widget DC=%s", dcTypeName);
+                return;
             }
         }
     }
@@ -3899,7 +4070,9 @@ static int SafeCollectionCount(Noesis::BaseCollection* collection)
 static void TryCollectSelectedBonusAbility(
     FocusEventData& out, Noesis::BaseObject* dc)
 {
-    auto const& cls = Noesis::gClassCache.GetClass(dc->GetClassType());
+    auto dcClassType = SafeGetClassType_SEH(dc);
+    if (!dcClassType) return;
+    auto const& cls = Noesis::gClassCache.GetClass(dcClassType);
 
     Noesis::TypeProperty const* bonusProp = nullptr;
     Noesis::TypeProperty const* indexProp = nullptr;
@@ -3919,19 +4092,24 @@ static void TryCollectSelectedBonusAbility(
     int32_t selectedIndex = atoi(indexVal.c_str());
     if (selectedIndex < 0) return;
 
-    auto collectionComponent = bonusProp->GetComponent(dc);
-    auto collectionRaw = collectionComponent.GetPtr();
+    auto collectionRaw = SafeGetComponent_SEH(bonusProp, dc);
     if (!collectionRaw) return;
 
     auto collection = static_cast<Noesis::BaseCollection*>(collectionRaw);
     int count = SafeCollectionCount(collection);
-    if (selectedIndex >= count) return;
+    if (selectedIndex >= count) {
+        collectionRaw->Release();
+        return;
+    }
 
-    auto itemPtr = collection->GetComponent((uint32_t)selectedIndex);
-    auto item = itemPtr.GetPtr();
+    auto item = SafeCollectionGetItem_SEH(collection, (uint32_t)selectedIndex);
+    collectionRaw->Release();
     if (!item) return;
 
-    auto const& itemCls = Noesis::gClassCache.GetClass(item->GetClassType());
+    auto itemClassType = SafeGetClassType_SEH(item);
+    if (!itemClassType) { item->Release(); return; }
+
+    auto const& itemCls = Noesis::gClassCache.GetClass(itemClassType);
     for (auto& entry : itemCls.Names) {
         if (!entry.Value().Property) continue;
         if (strcmp(entry.Key().GetString(), "Ability") != 0) continue;
@@ -3942,9 +4120,91 @@ static void TryCollectSelectedBonusAbility(
         if (!abilityVal.empty()) {
             out.dcScalarProps.emplace_back("SelectedBonusAbility",
                 std::move(abilityVal));
+            item->Release();
             return;
         }
     }
+    item->Release();
+}
+
+// ---------------------------------------------------------------------------
+// TryCollectSelectionFlyOutTitle: reads the Title from the first group in
+// ObjectCollectionList for DCSelectionFlyOut widgets.
+//
+// The XAML renders {Binding Title} on each group inside the outer LSListBox,
+// so the title text (e.g. "Search Results") is buried inside a collection
+// sub-object and not reachable by the generic CollectDCProperties path.
+// This post-processor surfaces it as a top-level "CollectionTitle" scalar.
+//
+// SEH helpers isolate every raw pointer dereference.  __try cannot coexist
+// with C++ objects that have destructors (Ptr<>), so the dangerous reads
+// are extracted into standalone functions that operate on raw pointers only.
+// ---------------------------------------------------------------------------
+
+static void TryCollectSelectionFlyOutTitle(
+    FocusEventData& out, Noesis::BaseObject* dc)
+{
+    // Only run for DCSelectionFlyOut.
+    if (out.dcType.find("DCSelectionFlyOut") == std::string::npos) return;
+
+    auto dcClassType = SafeGetClassType_SEH(dc);
+    if (!dcClassType) return;
+    auto const& cls = Noesis::gClassCache.GetClass(dcClassType);
+
+    Noesis::TypeProperty const* collectionListProp = nullptr;
+    for (auto& entry : cls.Names) {
+        if (!entry.Value().Property) continue;
+        if (strcmp(entry.Key().GetString(), "ObjectCollectionList") == 0) {
+            collectionListProp = entry.Value().Property;
+            break;
+        }
+    }
+    if (!collectionListProp) return;
+
+    // Get the collection -- SEH-guarded.
+    auto collectionRaw = SafeGetComponent_SEH(collectionListProp, dc);
+    if (!collectionRaw) return;
+
+    auto collection = static_cast<Noesis::BaseCollection*>(collectionRaw);
+    int count = SafeCollectionCount(collection);
+    if (count <= 0) {
+        collectionRaw->Release();
+        return;
+    }
+
+    // Get the first group item -- SEH-guarded.
+    auto item = SafeCollectionGetItem_SEH(collection, 0);
+    collectionRaw->Release();
+    if (!item) return;
+
+    // Get the item's type name -- SEH-guarded.
+    auto itemTypeName = SafeBaseObjectTypeName_SEH(item);
+    if (!itemTypeName) {
+        item->Release();
+        return;
+    }
+
+    // Read Title from the item using the class cache (safe: class cache
+    // lookups and ReadTypePropertyAsString are used throughout the codebase
+    // on validated objects from GetComponent).
+    auto const& itemCls = Noesis::gClassCache.GetClass(
+        item->GetClassType());
+    for (auto& entry : itemCls.Names) {
+        if (!entry.Value().Property) continue;
+        if (strcmp(entry.Key().GetString(), "Title") != 0) continue;
+
+        auto titleVal = ReadTypePropertyAsString(
+            static_cast<Noesis::BaseObject*>(item),
+            entry.Value().Property);
+        if (!titleVal.empty()
+            && titleVal.find("[ForceUpdate]") == std::string::npos) {
+            out.dcScalarProps.emplace_back("CollectionTitle",
+                std::move(titleVal));
+            break;
+        }
+    }
+
+    item->Release();
 }
 
 // Lua-table version: pushes SelectedBonusAbility into dcProps table.
@@ -4200,8 +4460,8 @@ static std::string ExtractTabName(Noesis::FrameworkElement* elem)
                 auto cur = queue[front++];
                 // Validate before virtual calls -- element may be stale.
                 if (!ProbeUIElement(static_cast<Noesis::UIElement*>(cur))) continue;
-                auto typeName = cur->GetClassType()->GetName();
-                if (strstr(typeName, "TextBlock")) {
+                auto typeName = SafeBaseObjectTypeName_SEH(cur);
+                if (typeName && strstr(typeName, "TextBlock")) {
                     auto tbText = ReadTextBlockText(
                         static_cast<Noesis::FrameworkElement*>(cur));
                     if (!tbText.empty()) return tbText;
@@ -4436,7 +4696,9 @@ static void CollectDCProperties(FocusEventData& out, Noesis::BaseObject* dc)
 {
     if (!dc) return;
 
-    auto const& cls = Noesis::gClassCache.GetClass(dc->GetClassType());
+    auto dcClassType = SafeGetClassType_SEH(dc);
+    if (!dcClassType) return;
+    auto const& cls = Noesis::gClassCache.GetClass(dcClassType);
     auto& types = Noesis::gStaticSymbols.Types;
 
     for (auto& entry : cls.Names) {
@@ -4480,20 +4742,23 @@ static void CollectDCProperties(FocusEventData& out, Noesis::BaseObject* dc)
             Noesis::BaseObject* subObj = nullptr;
             if (typeOfType == types.TypePtr.Type) {
                 auto ptrVal = reinterpret_cast<Noesis::Ptr<Noesis::BaseRefCounted>*>(
-                    const_cast<void*>(propInfo->Property->Get(dc)));
+                    const_cast<void*>(SafeTypePropertyGet_SEH(propInfo->Property, dc)));
                 if (ptrVal) subObj = static_cast<Noesis::BaseObject*>(ptrVal->GetPtr());
             } else if (typeOfType == types.TypePointer.Type) {
-                propInfo->Property->GetCopy(dc, &subObj);
+                if (!SafeTypePropertyGetCopy_SEH(propInfo->Property, dc, &subObj))
+                    subObj = nullptr;
             } else {
                 subObj = reinterpret_cast<Noesis::BaseObject*>(
-                    const_cast<void*>(propInfo->Property->Get(dc)));
+                    const_cast<void*>(SafeTypePropertyGet_SEH(propInfo->Property, dc)));
             }
 
             if (subObj) {
-                auto const& subCls = Noesis::gClassCache.GetClass(subObj->GetClassType());
+                auto subClassType = SafeGetClassType_SEH(subObj);
+                if (!subClassType) continue;
+                auto const& subCls = Noesis::gClassCache.GetClass(subClassType);
                 FocusEventData::SubObject subData;
                 subData.propName = entry.Key().GetString();
-                subData.typeName = subObj->GetClassType()->GetName();
+                subData.typeName = subClassType->GetName();
 
                 for (auto& subEntry : subCls.Names) {
                     if (!subEntry.Value().Property) continue;
@@ -4619,7 +4884,9 @@ static void ExtractElementData(FocusEventData& out, Noesis::FrameworkElement* el
     if (!elem) return;
 
     // elemType
-    out.elemType = elem->GetClassType()->GetName();
+    auto elemClassTypeName = SafeBaseObjectTypeName_SEH(elem);
+    if (!elemClassTypeName) return;
+    out.elemType = elemClassTypeName;
 
     // elemName
     out.elemName = ReadPropertyAsString(elem, "Name");
@@ -4630,20 +4897,17 @@ static void ExtractElementData(FocusEventData& out, Noesis::FrameworkElement* el
     // isFocusable
     if (sLSMoveFocusFocusableProp) {
         auto depObj = static_cast<Noesis::DependencyObject*>(elem);
-        auto val = sLSMoveFocusFocusableProp->GetValue(depObj);
+        auto val = SafeGetDPValue_SEH(sLSMoveFocusFocusableProp, depObj);
         out.isFocusable = val && *static_cast<const bool*>(val);
     }
 
     // DataContext
-    Noesis::BaseComponent* dataContext = nullptr;
-    if (sDataContextProp) {
-        auto depObj = static_cast<Noesis::DependencyObject const*>(elem);
-        auto dcVal = sDataContextProp->GetValue(depObj);
-        if (dcVal) {
-            dataContext = *reinterpret_cast<Noesis::BaseComponent* const*>(dcVal);
-            if (dataContext) {
-                out.dcType = dataContext->GetClassType()->GetName();
-            }
+    auto dataContext = SafeReadDC_SEH(
+        static_cast<Noesis::DependencyObject const*>(elem));
+    if (dataContext) {
+        auto dcTypeName = SafeBaseObjectTypeName_SEH(dataContext);
+        if (dcTypeName) {
+            out.dcType = dcTypeName;
         }
     }
 
@@ -4653,6 +4917,9 @@ static void ExtractElementData(FocusEventData& out, Noesis::FrameworkElement* el
         // Post-process: read selected ability name from BonusAbilities
         // collection if present.  Adds SelectedBonusAbility to dcScalarProps.
         TryCollectSelectedBonusAbility(out, dataContext);
+        // Post-process: read ObjectCollectionList[0].Title for
+        // DCSelectionFlyOut.  Adds CollectionTitle to dcScalarProps.
+        TryCollectSelectionFlyOutTitle(out, dataContext);
     }
 
     // elemText: primary extraction -- direct property reads.

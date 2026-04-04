@@ -48,6 +48,12 @@ struct FocusEventData
     // Element's own text (TextBlock text, Content, ToString)
     std::string elemText;
 
+    // All visible TextBlock texts from the element's template children.
+    // Populated via bounded GatherVisibleTextBlocks -- includes all text
+    // rendered inside the element (converter outputs, DataTrigger-shown
+    // labels, etc.).  Gives Lua the full picture without enum resolution.
+    std::vector<std::string> templateTexts;
+
     // Tab name (only for isTab=true)
     std::string tabName;
 
@@ -157,6 +163,11 @@ struct TickSnapshot
     // Context menu data (WorldContextMenu popup).
     // Only populated when contextMenuChanged == true.
     std::string contextMenuItemText;    // Display text of highlighted item
+
+    // Tooltip data (Examine panel, stat tooltips).
+    // Only populated when tooltipChanged == true.
+    bool tooltipChanged = false;        // Tooltip text changed (new popup or text delta)
+    std::vector<std::string> tooltipTexts;  // Individual TextBlock texts from tooltip popup
 };
 
 class DeferredUIEvents

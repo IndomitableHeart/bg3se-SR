@@ -124,6 +124,7 @@ struct TickSnapshot
     bool inlineCarouselChanged = false; // Inline appearance carousel value changed
     bool widgetAdded = false;           // New dialog/overlay widget appeared
     bool radialSlotChanged = false;     // Radial (RT/RB) slot focus changed via LocalFocus
+    bool contextMenuChanged = false;    // Context menu highlight changed (d-pad in popup)
 
     // Current focused element state (full picture, not just changes).
     FocusEventData focusedElement;
@@ -152,6 +153,10 @@ struct TickSnapshot
     std::string radialDescriptionText;
     std::string radialSlotTag;
     std::string radialSlotType;
+
+    // Context menu data (WorldContextMenu popup).
+    // Only populated when contextMenuChanged == true.
+    std::string contextMenuItemText;    // Display text of highlighted item
 };
 
 class DeferredUIEvents

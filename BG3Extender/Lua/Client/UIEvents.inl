@@ -476,6 +476,21 @@ static void PushTickSnapshotTable(lua_State* L, TickSnapshot const& snapshot)
         }
         lua_settable(L, -3);
     }
+
+    // Context menu data (only if contextMenuChanged)
+    lua_pushstring(L, "contextMenuChanged");
+    lua_pushboolean(L, snapshot.contextMenuChanged);
+    lua_settable(L, -3);
+
+    if (snapshot.contextMenuChanged) {
+        lua_pushstring(L, "contextMenuItemText");
+        if (!snapshot.contextMenuItemText.empty()) {
+            lua_pushstring(L, snapshot.contextMenuItemText.c_str());
+        } else {
+            lua_pushnil(L);
+        }
+        lua_settable(L, -3);
+    }
 }
 
 END_NS()

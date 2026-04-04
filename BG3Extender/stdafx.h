@@ -32,3 +32,12 @@
 #include <Extender/Shared/Utils.h>
 #include <GameDefinitions/Base/Base.h>
 #include <Extender/Shared/Optick.h>
+
+// BG3Access diagnostic logging macro.
+// Define BG3ACCESS_VERBOSE in preprocessor definitions to enable.
+// Game Release builds compile these out entirely (zero runtime cost).
+#ifdef BG3ACCESS_VERBOSE
+#define BG3A_LOG(...) WARN(__VA_ARGS__)
+#else
+#define BG3A_LOG(...) ((void)0)
+#endif

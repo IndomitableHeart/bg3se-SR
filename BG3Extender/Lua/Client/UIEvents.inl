@@ -224,6 +224,17 @@ static void PushFocusEventTable(lua_State* L, FocusEventData const& data)
     }
     lua_settable(L, -3);
 
+    // templateTexts: array of all visible TextBlock texts from template children
+    if (!data.templateTexts.empty()) {
+        lua_pushstring(L, "templateTexts");
+        lua_newtable(L);
+        for (size_t i = 0; i < data.templateTexts.size(); i++) {
+            lua_pushstring(L, data.templateTexts[i].c_str());
+            lua_rawseti(L, -2, (int)(i + 1));
+        }
+        lua_settable(L, -3);
+    }
+
     // tabName
     lua_pushstring(L, "tabName");
     if (!data.tabName.empty()) {
@@ -488,6 +499,21 @@ static void PushTickSnapshotTable(lua_State* L, TickSnapshot const& snapshot)
             lua_pushstring(L, snapshot.contextMenuItemText.c_str());
         } else {
             lua_pushnil(L);
+        }
+        lua_settable(L, -3);
+    }
+
+    // Tooltip data (only if tooltipChanged)
+    lua_pushstring(L, "tooltipChanged");
+    lua_pushboolean(L, snapshot.tooltipChanged);
+    lua_settable(L, -3);
+
+    if (snapshot.tooltipChanged && !snapshot.tooltipTexts.empty()) {
+        lua_pushstring(L, "tooltipTexts");
+        lua_newtable(L);
+        for (size_t i = 0; i < snapshot.tooltipTexts.size(); i++) {
+            lua_pushstring(L, snapshot.tooltipTexts[i].c_str());
+            lua_rawseti(L, -2, (int)(i + 1));
         }
         lua_settable(L, -3);
     }

@@ -74,6 +74,9 @@ static void GatherVisibleTextBlocks(
     std::vector<std::string>& outTexts,
     int maxDepth = 12,
     int maxNodes = 256);
+static void PollTooltip(
+    Noesis::Visual* trueRoot, Noesis::Visual* contentChild,
+    ecl::lua::TickSnapshot* snapshot);
 
 Noesis::FrameworkElement* GetRoot()
 {
@@ -1576,6 +1579,15 @@ public:
                             snapshot);
         }
 
+        // ----- Tooltip polling (Examine panel, stat tooltips) -----
+        // Tooltips appear as popup children when focus lands on certain
+        // elements (e.g. resistance rows in the Examine panel).  Poll
+        // every tick when focus exists -- tooltips appear on focus, not
+        // just on d-pad navigation.
+        if (hadFocusBefore_ && cachedTrueRoot_ && cachedContentChild_) {
+            PollTooltip(cachedTrueRoot_, cachedContentChild_, snapshot);
+        }
+
         // ----- HotBar action radial: Tag polling on visible widgets -----
         // The XAML sets ActionRadials.Tag = LocalFocus.DataContext whenever
         // the radial pointer moves to a different slot.  Poll each visible
@@ -1747,6 +1759,9 @@ public:
                 shouldDispatch = true;
             }
             if (snapshot->contextMenuChanged) {
+                shouldDispatch = true;
+            }
+            if (snapshot->tooltipChanged) {
                 shouldDispatch = true;
             }
             if (!snapshot->focusedElement.namedTexts.empty()) {
@@ -2992,6 +3007,132 @@ static void PollContextMenu(
                  ? "(empty)" : snapshot->contextMenuItemText.c_str());
 }
 
+// ---------------------------------------------------------------------------
+// FindTooltipTextBlocks_SEH: SEH-guarded BFS through popup roots to find
+// TextBlock elements in tooltip popups.  No C++ objects with destructors.
+// Returns the number of TextBlock pointers written to outTextBlocks.
+// Skips popup roots that contain ContextMenuItems (those are context menus).
+// ---------------------------------------------------------------------------
+static uint32_t FindTooltipTextBlocks_SEH(
+    Noesis::Visual* trueRoot, Noesis::Visual* contentChild,
+    Noesis::FrameworkElement** outTextBlocks, uint32_t maxOut)
+{
+    uint32_t found = 0;
+  __try {
+    Noesis::Visual* popupRoots[8];
+    auto popupCount = GetPopupRoots_SEH(
+        trueRoot, contentChild, popupRoots, 8);
+    if (popupCount == 0) return 0;
+
+    for (uint32_t pi = 0; pi < popupCount && found < maxOut; pi++) {
+        auto popupRoot = popupRoots[pi];
+        if (!popupRoot) continue;
+
+        // Skip popup roots that contain ContextMenuItems -- those are
+        // context menus, not tooltips.
+        Noesis::FrameworkElement* cmCheck[1];
+        if (FindElementsByType_SEH(popupRoot, "ContextMenuItem", cmCheck, 1) > 0)
+            continue;
+
+        // BFS through this popup root looking for TextBlocks.
+        // 128 nodes is enough for typical tooltip templates.
+        Noesis::Visual* queue[128];
+        int queueFront = 0, queueBack = 0;
+        queue[queueBack++] = popupRoot;
+        bool foundInThisPopup = false;
+
+        while (queueFront < queueBack && found < maxOut) {
+            auto node = queue[queueFront++];
+            if (!node) continue;
+            if (!ProbeUIElement(static_cast<Noesis::UIElement*>(node)))
+                continue;
+            // Skip collapsed/hidden elements -- tooltip templates use
+            // DataTriggers to show only applicable TextBlocks.
+            if (!IsVisibleDP(node)) continue;
+
+            auto typeName = node->GetClassType()->GetName();
+            if (typeName && strstr(typeName, "TextBlock")) {
+                outTextBlocks[found++] = static_cast<Noesis::FrameworkElement*>(node);
+                foundInThisPopup = true;
+                // Don't recurse into TextBlock children (they are Inlines).
+                continue;
+            }
+
+            // Enqueue visible children for BFS.
+            if (!ProbeVisualChildren(static_cast<Noesis::UIElement*>(node)))
+                continue;
+            auto childCount = node->GetVisualChildrenCount();
+            for (uint32_t ci = 0; ci < childCount && queueBack < 128; ci++) {
+                auto child = node->GetVisualChild(ci);
+                if (child) queue[queueBack++] = child;
+            }
+        }
+
+        // If we found TextBlocks in this popup, stop (first tooltip wins).
+        if (foundInThisPopup) break;
+    }
+
+    return found;
+
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    BG3A_LOG("[BG3Access] FindTooltipTextBlocks_SEH: fault");
+    return found;  // return whatever we found before the fault
+  }
+}
+
+// PollTooltip: outer wrapper.  Calls the SEH-guarded finder to get
+// TextBlock pointers, then reads their text outside SEH (ReadTextBlockText
+// uses std::string which has a destructor).  Delta-compares against
+// previous tooltip text to avoid re-firing.
+// Sends individual texts as an array so Lua can identify title vs description.
+static void PollTooltip(
+    Noesis::Visual* trueRoot, Noesis::Visual* contentChild,
+    ecl::lua::TickSnapshot* snapshot)
+{
+    static std::string sLastTooltipFingerprint;
+
+    // Phase 1: find TextBlocks in tooltip popups (SEH-guarded, no C++ objects).
+    Noesis::FrameworkElement* textBlocks[16];
+    auto textBlockCount = FindTooltipTextBlocks_SEH(
+        trueRoot, contentChild, textBlocks, 16);
+
+    if (textBlockCount == 0) {
+        // No tooltip popup present.  Reset tracker so re-opening fires.
+        if (!sLastTooltipFingerprint.empty()) {
+            BG3A_LOG("[BG3Access] TOOLTIP: closed (resetting tracker)");
+        }
+        sLastTooltipFingerprint.clear();
+        return;
+    }
+
+    // Phase 2: extract text from found TextBlocks (outside SEH -- uses std::string).
+    std::vector<std::string> texts;
+    std::string fingerprint;
+    for (uint32_t i = 0; i < textBlockCount; i++) {
+        auto text = ReadTextBlockText(textBlocks[i]);
+        if (text.empty()) continue;
+        if (text.find("[ForceUpdate]") != std::string::npos) continue;
+        if (text.find("s_HandleUnknown") != std::string::npos) continue;
+        if (!fingerprint.empty()) fingerprint += '|';
+        fingerprint += text;
+        texts.push_back(std::move(text));
+    }
+
+    if (texts.empty()) return;
+
+    // Delta compare: only fire when text changes.
+    if (fingerprint == sLastTooltipFingerprint) return;
+    sLastTooltipFingerprint = fingerprint;
+
+    snapshot->tooltipChanged = true;
+    snapshot->tooltipTexts = std::move(texts);
+
+    BG3A_LOG("[BG3Access] TOOLTIP: %d texts", (int)snapshot->tooltipTexts.size());
+    for (auto const& text : snapshot->tooltipTexts) {
+        BG3A_LOG("[BG3Access]   TT: %s", text.c_str());
+    }
+}
+
 // Find the widget container: drill down from root following first children
 // until we find an element whose children are UIWidgets.
 // The BG3 tree structure is: UICanvas -> Viewbox -> Decorator -> Grid -> UIWidget(s)
@@ -4009,8 +4150,29 @@ static std::string ReadTypePropertyAsString(Noesis::BaseObject const* obj,
                 return std::string(entry.first.Str());
             }
         }
-        // Enum value not found in the mapping -- return the numeric value
-        // so callers at least get something.
+        // Enum value not registered in Noesis.  Larian's enum registrations
+        // are incomplete -- they only register values used in XAML triggers.
+        // Log once per (type, value) pair to avoid per-tick spam.
+        auto enumTypeName = enumType->GetName();
+        {
+            struct EnumGapEntry { const char* typeName; int64_t value; };
+            static EnumGapEntry sLoggedGaps[32];
+            static uint32_t sLoggedGapCount = 0;
+            bool alreadyLogged = false;
+            for (uint32_t gi = 0; gi < sLoggedGapCount; gi++) {
+                if (sLoggedGaps[gi].value == enumValue
+                    && sLoggedGaps[gi].typeName == enumTypeName) {
+                    alreadyLogged = true;
+                    break;
+                }
+            }
+            if (!alreadyLogged && sLoggedGapCount < 32) {
+                sLoggedGaps[sLoggedGapCount++] = { enumTypeName, enumValue };
+                BG3A_LOG("[BG3Access] Unresolved enum: type=%s value=%lld",
+                         enumTypeName ? enumTypeName : "?", (long long)enumValue);
+            }
+        }
+
         return std::to_string(enumValue);
     }
     // Pointer / Ptr / object types -- not convertible to string here.
@@ -5451,6 +5613,46 @@ static void ExtractBindingInfo(FocusEventData& out, Noesis::FrameworkElement* el
 }
 
 // ---------------------------------------------------------------------------
+// ReadTemplatedParentTag_SEH: SEH-guarded read of the TemplatedParent's Tag
+// property.  Returns the raw Tag object pointer so the caller can call
+// ToString outside SEH (ToString returns std::string which has a destructor).
+// No C++ objects with destructors in this function.
+// ---------------------------------------------------------------------------
+static Noesis::BaseObject* ReadTemplatedParentTag_SEH(
+    Noesis::FrameworkElement* elem,
+    const Noesis::DependencyProperty* tagDp)
+{
+    __try {
+        if (!elem || !tagDp) return nullptr;
+        auto templatedParent = elem->mTemplatedParent;
+        if (!templatedParent) return nullptr;
+        if (!ProbeUIElement(static_cast<Noesis::UIElement*>(templatedParent)))
+            return nullptr;
+
+        // Read the Tag DP value from the TemplatedParent.
+        auto depObj = static_cast<Noesis::DependencyObject*>(templatedParent);
+        auto entry = depObj->mValues.Find(tagDp);
+        if (entry == depObj->mValues.End()) return nullptr;
+
+        auto storedVal = entry->value;
+        if (!storedVal || !storedVal->flags.isInitialized) return nullptr;
+
+        void* rawVal = nullptr;
+        if (storedVal->flags.isComplex) {
+            rawVal = storedVal->value.complex->base;
+        } else {
+            rawVal = storedVal->value.simple;
+        }
+        if (!rawVal) return nullptr;
+
+        return reinterpret_cast<Noesis::BaseObject*>(rawVal);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        BG3A_LOG("[BG3Access] ReadTemplatedParentTag_SEH: fault");
+        return nullptr;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ExtractElementData: fills a FocusEventData struct from a FrameworkElement.
 // Called during Tick() when the element is alive.  Pure C++ -- no Lua.
 // Mirrors ExtractElementInfo but stores into the struct.
@@ -5498,6 +5700,26 @@ static void ExtractElementData(FocusEventData& out, Noesis::FrameworkElement* el
         TryCollectSelectionFlyOutTitle(out, dataContext);
     }
 
+    // TemplatedParent Tag: in DataTemplate-hosted elements (e.g. Examine
+    // panel stat rows), the label comes from the ContentPresenter's Tag
+    // property, bound via RelativeSource TemplatedParent.  Read it here
+    // so Lua can use it as the stat label without hardcoded DC type maps.
+    if (sTagProp) {
+        auto tagObj = ReadTemplatedParentTag_SEH(elem, sTagProp);
+        if (tagObj) {
+            // ToString is outside SEH -- it returns std::string (has destructor).
+            auto tagRaw = Noesis::ObjectHelpers::ToString(tagObj);
+            std::string tagStr(tagRaw.data(), tagRaw.size());
+            if (!tagStr.empty()
+                && tagStr.find("[ForceUpdate]") == std::string::npos
+                && tagStr.find("s_HandleUnknown") == std::string::npos
+                && tagStr.find("Noesis::") != 0
+                && tagStr.find("ls.") != 0) {
+                out.dcScalarProps.push_back(std::make_pair(std::string("TemplatedParentTag"), std::move(tagStr)));
+            }
+        }
+    }
+
     // elemText: primary extraction -- direct property reads.
     if (strstr(out.elemType.c_str(), "TextBlock")) {
         out.elemText = ReadTextBlockText(elem);
@@ -5525,6 +5747,17 @@ static void ExtractElementData(FocusEventData& out, Noesis::FrameworkElement* el
     // during UI rebuilds (race/class tab switches in character creation).
     if (out.elemText.empty()) {
         out.elemText = TryShallowChildTextScan(elem);
+    }
+
+    // templateTexts: all visible TextBlock texts from template children.
+    // Bounded walk (8 levels, 64 nodes) captures converter outputs and
+    // DataTrigger-shown labels without needing C++ enum resolution.
+    // Gives Lua the full rendered text of the element's template.
+    // Only run when DC exists -- transient elements during loading have
+    // no DC and their visual trees may be partially constructed.
+    // SEH-guarded: probe element before walking its visual children.
+    if (dataContext && ProbeTextBlockElement(elem)) {
+        GatherVisibleTextBlocks(elem, out.templateTexts, 8, 64);
     }
 
     // tabName

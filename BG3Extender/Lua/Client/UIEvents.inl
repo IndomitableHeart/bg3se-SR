@@ -503,6 +503,13 @@ static void PushTickSnapshotTable(lua_State* L, TickSnapshot const& snapshot)
         lua_settable(L, -3);
     }
 
+    // Visual text source widget name
+    if (!snapshot.visualTextWidgetName.empty()) {
+        lua_pushstring(L, "visualTextWidgetName");
+        lua_pushstring(L, snapshot.visualTextWidgetName.c_str());
+        lua_settable(L, -3);
+    }
+
     // Tooltip data (only if tooltipChanged)
     lua_pushstring(L, "tooltipChanged");
     lua_pushboolean(L, snapshot.tooltipChanged);

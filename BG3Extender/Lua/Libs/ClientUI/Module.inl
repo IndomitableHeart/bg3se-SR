@@ -1338,6 +1338,12 @@ public:
                             snapshot->focusedElement.namedTexts.push_back(
                                 {std::move(key), std::move(visualText)});
                         }
+                        // Record which widget these visual texts came from
+                        // so Lua can route to the correct handler.
+                        if (!visualTexts.empty()) {
+                            snapshot->visualTextWidgetName =
+                                ReadPropertyAsString(widgetElem, "Name");
+                        }
                     }
                 }
             }

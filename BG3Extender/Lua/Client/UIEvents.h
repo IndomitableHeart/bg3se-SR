@@ -160,6 +160,11 @@ struct TickSnapshot
     std::string radialSlotTag;
     std::string radialSlotType;
 
+    // Visual text source widget name (from initial widget scan).
+    // Identifies which widget the _visualText_N entries came from
+    // (e.g. "shortcutsMenu" vs other widgets sharing the same DC type).
+    std::string visualTextWidgetName;
+
     // Context menu data (WorldContextMenu popup).
     // Only populated when contextMenuChanged == true.
     std::string contextMenuItemText;    // Display text of highlighted item

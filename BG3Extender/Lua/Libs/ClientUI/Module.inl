@@ -5876,6 +5876,150 @@ UserReturn GetFocusedElementInfo(lua_State* L)
 }
 
 // ---------------------------------------------------------------------------
+// ReadHUDInfo: on-demand HUD text reader for accessibility.
+//
+// Walks visible widgets, finds PartyLine_c, TargetInfo_c, and CursorText_c
+// by their Name property, then enters each widget's NameScope to read
+// specific named TextBlocks.
+//
+// Returns a Lua table:
+//   { characterName="Tav", characterInfo="Lv 1 High Elf Rogue",
+//     targetName="Mind Flayer Pod", actionText="Use" }
+//
+// All fields are strings (empty string if not found / not visible).
+// SEH-guarded throughout -- never crashes, just returns empty fields.
+// ---------------------------------------------------------------------------
+
+// POD struct for HUD widget pointers.  No destructors -- safe inside __try.
+struct HUDWidgetPointers {
+    Noesis::Visual* partyLine;
+    Noesis::Visual* targetInfo;
+    Noesis::Visual* cursorText;
+};
+
+// Inner function: single-pass widget lookup for all HUD widgets.
+// Uses std::string (C++ destructor) so it CANNOT live inside __try.
+static HUDWidgetPointers FindHUDWidgets_Inner()
+{
+    HUDWidgetPointers result = {nullptr, nullptr, nullptr};
+
+    auto root = GetRoot();
+    if (!root) return result;
+
+    InitFocusProperties(root);
+    auto container = FindWidgetContainer(root);
+    if (!container) return result;
+
+    auto widgetCount = container->GetVisualChildrenCount();
+    int foundCount = 0;
+
+    for (int widgetIndex = (int)widgetCount - 1;
+         widgetIndex >= 0 && foundCount < 3; widgetIndex--) {
+        auto widget = container->GetVisualChild(widgetIndex);
+        if (!widget) continue;
+        if (!ProbeUIElement(static_cast<Noesis::UIElement*>(widget))) continue;
+        if (!IsUIWidgetType(widget) || !IsVisibleDP(widget)) continue;
+
+        auto name = ReadPropertyAsString(
+            static_cast<Noesis::FrameworkElement*>(widget), "Name");
+        if (name == "PartyLine_c")  { result.partyLine  = widget; foundCount++; }
+        else if (name == "TargetInfo_c") { result.targetInfo = widget; foundCount++; }
+        else if (name == "CursorText_c") { result.cursorText = widget; foundCount++; }
+    }
+    return result;
+}
+
+// SEH wrapper: HUDWidgetPointers is POD (no destructors).
+static HUDWidgetPointers FindHUDWidgets_SEH()
+{
+    __try {
+        return FindHUDWidgets_Inner();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        BG3A_LOG("[BG3Access] FindHUDWidgets_SEH: fault");
+        HUDWidgetPointers empty = {nullptr, nullptr, nullptr};
+        return empty;
+    }
+}
+
+// Inner function: find a named element in a widget and read its text.
+// Writes into caller-owned char buffer (no C++ objects cross into SEH).
+static void ReadNamedTextInWidget_Inner(Noesis::Visual* widget,
+                                         const char* elementName,
+                                         char* outBuf, size_t outBufSize)
+{
+    outBuf[0] = '\0';
+    auto found = FindNameInWidgetScoped_Unsafe(elementName, widget);
+    if (!found) return;
+    if (!ProbeUIElement(static_cast<Noesis::UIElement*>(found))) return;
+
+    auto typeName = found->GetClassType()->GetName();
+    if (!typeName) return;
+
+    auto text = ReadTextBlockText(found, false);
+
+    if (text.find("[ForceUpdate]") != std::string::npos) return;
+    if (text.find("s_HandleUnknown") != std::string::npos) return;
+
+    if (!text.empty()) {
+        size_t copyLen = (text.size() < outBufSize - 1)
+            ? text.size() : (outBufSize - 1);
+        memcpy(outBuf, text.data(), copyLen);
+        outBuf[copyLen] = '\0';
+    }
+}
+
+// SEH wrapper: no C++ objects with destructors.
+static void ReadNamedTextInWidget_SEH(Noesis::Visual* widget,
+                                       const char* elementName,
+                                       char* outBuf, size_t outBufSize)
+{
+    outBuf[0] = '\0';
+    __try {
+        ReadNamedTextInWidget_Inner(widget, elementName, outBuf, outBufSize);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        BG3A_LOG("[BG3Access] ReadNamedTextInWidget_SEH: fault for '%s'",
+             elementName ? elementName : "(null)");
+        outBuf[0] = '\0';
+    }
+}
+
+// Helper: read a named TextBlock from a widget and push to Lua stack.
+// Pushes empty string if widget is null or text not found.
+static void PushNamedWidgetText(lua_State* L, Noesis::Visual* widget,
+                                 const char* elementName, const char* luaField,
+                                 char* textBuf, size_t textBufSize)
+{
+    if (widget) {
+        ReadNamedTextInWidget_SEH(widget, elementName, textBuf, textBufSize);
+        lua_pushstring(L, textBuf);
+    } else {
+        lua_pushstring(L, "");
+    }
+    lua_setfield(L, -2, luaField);
+}
+
+UserReturn ReadHUDInfo(lua_State* L)
+{
+    static const size_t kTextBufSize = 512;
+    char textBuf[kTextBufSize];
+
+    lua_createtable(L, 0, 4);
+
+    // Single-pass widget lookup.
+    auto widgets = FindHUDWidgets_SEH();
+
+    PushNamedWidgetText(L, widgets.partyLine,  "ExtraInfoName",
+                        "characterName", textBuf, kTextBufSize);
+    PushNamedWidgetText(L, widgets.partyLine,  "ExtraInfoMisc",
+                        "characterInfo", textBuf, kTextBufSize);
+    PushNamedWidgetText(L, widgets.targetInfo,  "Name",
+                        "targetName",    textBuf, kTextBufSize);
+    PushNamedWidgetText(L, widgets.cursorText, "TaskDescription",
+                        "actionText",    textBuf, kTextBufSize);
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
 
 void NoesisErrorHandler(const char* file, uint32_t line, const char* message, bool fatal)
 {
@@ -5922,6 +6066,8 @@ void RegisterUILib()
     MODULE_FUNCTION(FindNameInWidgetScoped)
     // Phase 1 refactor: C++ data extraction test API
     MODULE_FUNCTION(GetFocusedElementInfo)
+    // HUD info reader (on-demand, called from RS direction handler)
+    MODULE_FUNCTION(ReadHUDInfo)
     END_MODULE()
 }
 

@@ -149,7 +149,8 @@ bool ClientState::IsEventCancelable(SDL_Event* event)
         || event->type == SDL_MOUSEBUTTONDOWN
         || event->type == SDL_MOUSEBUTTONUP
         || event->type == SDL_MOUSEWHEEL
-        || event->type == SDL_CONTROLLERBUTTONDOWN 
+        || event->type == SDL_CONTROLLERAXISMOTION
+        || event->type == SDL_CONTROLLERBUTTONDOWN
         || event->type == SDL_CONTROLLERBUTTONUP;
 }
 

@@ -3041,7 +3041,7 @@ static uint32_t FindTooltipTextBlocks_SEH(
             continue;
 
         // BFS through this popup root looking for TextBlocks.
-        // 128 nodes is enough for typical tooltip templates.
+        // 128 nodes covers typical tooltip templates.
         Noesis::Visual* queue[128];
         int queueFront = 0, queueBack = 0;
         queue[queueBack++] = popupRoot;

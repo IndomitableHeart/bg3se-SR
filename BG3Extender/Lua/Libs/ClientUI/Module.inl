@@ -3014,9 +3014,57 @@ static void PollContextMenu(
 }
 
 // ---------------------------------------------------------------------------
-// FindTooltipTextBlocks_SEH: SEH-guarded BFS through popup roots to find
-// TextBlock elements in tooltip popups.  No C++ objects with destructors.
-// Returns the number of TextBlock pointers written to outTextBlocks.
+// ---------------------------------------------------------------------------
+// BFS_CollectTextBlocks_SEH: shared SEH-guarded BFS that collects visible
+// TextBlock elements from any visual subtree.  Used by both the tooltip
+// poller (popup roots) and the on-demand widget text reader (Lua API).
+// No C++ objects with destructors.
+// Returns the number of TextBlock pointers written starting at
+// outTextBlocks[startIndex].
+// ---------------------------------------------------------------------------
+static uint32_t BFS_CollectTextBlocks_SEH(
+    Noesis::Visual* root,
+    Noesis::FrameworkElement** outTextBlocks, uint32_t startIndex,
+    uint32_t maxOut)
+{
+    uint32_t found = startIndex;
+  __try {
+    // 512 nodes: popup tooltips need ~200, full widget trees (e.g.
+    // PinnedTooltips_c inspect panel) can be much larger.
+    Noesis::Visual* queue[512];
+    int queueFront = 0, queueBack = 0;
+    queue[queueBack++] = root;
+
+    while (queueFront < queueBack && found < maxOut) {
+        auto node = queue[queueFront++];
+        if (!node) continue;
+        if (!ProbeUIElement(static_cast<Noesis::UIElement*>(node)))
+            continue;
+        if (!IsVisibleDP(node)) continue;
+
+        auto typeName = node->GetClassType()->GetName();
+        if (typeName && strstr(typeName, "TextBlock")) {
+            outTextBlocks[found++] = static_cast<Noesis::FrameworkElement*>(node);
+            // Don't recurse into TextBlock children (they are Inlines).
+            continue;
+        }
+
+        if (!ProbeVisualChildren(static_cast<Noesis::UIElement*>(node)))
+            continue;
+        auto childCount = node->GetVisualChildrenCount();
+        for (uint32_t ci = 0; ci < childCount && queueBack < 512; ci++) {
+            auto child = node->GetVisualChild(ci);
+            if (child) queue[queueBack++] = child;
+        }
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    BG3A_LOG("[BG3Access] BFS_CollectTextBlocks_SEH: fault");
+  }
+    return found;
+}
+
+// ---------------------------------------------------------------------------
+// FindTooltipTextBlocks_SEH: scans popup roots for TextBlock elements.
 // Skips popup roots that contain ContextMenuItems (those are context menus).
 // ---------------------------------------------------------------------------
 static uint32_t FindTooltipTextBlocks_SEH(
@@ -3034,55 +3082,22 @@ static uint32_t FindTooltipTextBlocks_SEH(
         auto popupRoot = popupRoots[pi];
         if (!popupRoot) continue;
 
-        // Skip popup roots that contain ContextMenuItems -- those are
-        // context menus, not tooltips.
         Noesis::FrameworkElement* cmCheck[1];
         if (FindElementsByType_SEH(popupRoot, "ContextMenuItem", cmCheck, 1) > 0)
             continue;
 
-        // BFS through this popup root looking for TextBlocks.
-        // 128 nodes covers typical tooltip templates.
-        Noesis::Visual* queue[128];
-        int queueFront = 0, queueBack = 0;
-        queue[queueBack++] = popupRoot;
-        bool foundInThisPopup = false;
-
-        while (queueFront < queueBack && found < maxOut) {
-            auto node = queue[queueFront++];
-            if (!node) continue;
-            if (!ProbeUIElement(static_cast<Noesis::UIElement*>(node)))
-                continue;
-            // Skip collapsed/hidden elements -- tooltip templates use
-            // DataTriggers to show only applicable TextBlocks.
-            if (!IsVisibleDP(node)) continue;
-
-            auto typeName = node->GetClassType()->GetName();
-            if (typeName && strstr(typeName, "TextBlock")) {
-                outTextBlocks[found++] = static_cast<Noesis::FrameworkElement*>(node);
-                foundInThisPopup = true;
-                // Don't recurse into TextBlock children (they are Inlines).
-                continue;
-            }
-
-            // Enqueue visible children for BFS.
-            if (!ProbeVisualChildren(static_cast<Noesis::UIElement*>(node)))
-                continue;
-            auto childCount = node->GetVisualChildrenCount();
-            for (uint32_t ci = 0; ci < childCount && queueBack < 128; ci++) {
-                auto child = node->GetVisualChild(ci);
-                if (child) queue[queueBack++] = child;
-            }
-        }
+        auto prevFound = found;
+        found = BFS_CollectTextBlocks_SEH(popupRoot, outTextBlocks, found, maxOut);
 
         // If we found TextBlocks in this popup, stop (first tooltip wins).
-        if (foundInThisPopup) break;
+        if (found > prevFound) break;
     }
 
     return found;
 
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     BG3A_LOG("[BG3Access] FindTooltipTextBlocks_SEH: fault");
-    return found;  // return whatever we found before the fault
+    return found;
   }
 }
 
@@ -3098,9 +3113,10 @@ static void PollTooltip(
     static std::string sLastTooltipFingerprint;
 
     // Phase 1: find TextBlocks in tooltip popups (SEH-guarded, no C++ objects).
-    Noesis::FrameworkElement* textBlocks[16];
+    // 32 slots: basic tooltip ~9 TextBlocks + inspect panels add more.
+    Noesis::FrameworkElement* textBlocks[32];
     auto textBlockCount = FindTooltipTextBlocks_SEH(
-        trueRoot, contentChild, textBlocks, 16);
+        trueRoot, contentChild, textBlocks, 32);
 
     if (textBlockCount == 0) {
         // No tooltip popup present.  Reset tracker so re-opening fires.
@@ -4437,6 +4453,56 @@ static std::string ReadTextBlockText(Noesis::FrameworkElement* elem, bool skipTo
                             }
                         } else if (strstr(typeName, "LineBreak")) {
                             parts += " ";
+                        } else {
+                            // Hyperlink, Bold, Italic, Span, etc.
+                            // These contain child Runs in their own Inlines
+                            // collection.  Access via the same class cache.
+                            auto& spanCls = Noesis::gClassCache.GetClass(
+                                inlineObj->GetClassType());
+                            bg3se::FixedString fsSpanInlines("Inlines");
+                            auto spanProp = spanCls.Names.try_get(fsSpanInlines);
+                            if (spanProp && spanProp->Property) {
+                                Noesis::BaseCollection* spanColl = nullptr;
+                                auto spanType = UnwrapType(
+                                    spanProp->Property->GetContentType());
+                                auto spanTypeOfType = spanType
+                                    ? spanType->GetClassType() : nullptr;
+                                if (spanTypeOfType == types.TypePtr.Type) {
+                                    auto ptrVal = reinterpret_cast<
+                                        Noesis::Ptr<Noesis::BaseRefCounted>*>(
+                                        const_cast<void*>(
+                                            spanProp->Property->Get(inlineObj)));
+                                    if (ptrVal) spanColl =
+                                        static_cast<Noesis::BaseCollection*>(
+                                            static_cast<Noesis::BaseObject*>(
+                                                ptrVal->GetPtr()));
+                                } else if (spanTypeOfType == types.TypePointer.Type) {
+                                    Noesis::BaseObject* raw = nullptr;
+                                    spanProp->Property->GetCopy(inlineObj, &raw);
+                                    if (raw) spanColl =
+                                        static_cast<Noesis::BaseCollection*>(raw);
+                                }
+                                if (spanColl) {
+                                    int spanCount = spanColl->Count();
+                                    for (int si = 0; si < spanCount; si++) {
+                                        auto spanComp = spanColl->GetComponent(si);
+                                        if (!spanComp) continue;
+                                        auto spanChild = spanComp.GetPtr();
+                                        if (!spanChild) continue;
+                                        auto childType =
+                                            spanChild->GetClassType()->GetName();
+                                        if (strstr(childType, "Run")) {
+                                            auto runText = ReadPropertyAsString(
+                                                spanChild, "Text");
+                                            if (!runText.empty()
+                                                && runText.find("[ForceUpdate]")
+                                                    == std::string::npos) {
+                                                parts += runText;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     // Collapse multiple spaces.
@@ -5876,6 +5942,159 @@ UserReturn GetFocusedElementInfo(lua_State* L)
 }
 
 // ---------------------------------------------------------------------------
+// ReadWidgetTextBlocks: on-demand BFS text reader for any named widget.
+// Finds the widget by name, BFS's its visual tree for TextBlocks, reads
+// their text, and returns a Lua array of strings.
+// Architecture: inner function uses std::string (has destructor), SEH
+// wrapper returns a POD pointer.  Same pattern as FindHUDWidgets.
+// ---------------------------------------------------------------------------
+
+// Inner: find a widget by x:Name.  Uses std::string from ReadPropertyAsString
+// so it CANNOT live inside __try.
+static Noesis::Visual* FindWidgetByName_Inner(const char* widgetName)
+{
+    auto root = GetRoot();
+    if (!root) return nullptr;
+
+    InitFocusProperties(root);
+    auto container = FindWidgetContainer(root);
+    if (!container) return nullptr;
+
+    auto widgetCount = container->GetVisualChildrenCount();
+    for (int widgetIndex = (int)widgetCount - 1; widgetIndex >= 0; widgetIndex--) {
+        auto widget = container->GetVisualChild(widgetIndex);
+        if (!widget) continue;
+        if (!ProbeUIElement(static_cast<Noesis::UIElement*>(widget)))
+            continue;
+        if (!IsUIWidgetType(widget) || !IsVisibleDP(widget))
+            continue;
+        auto name = ReadPropertyAsString(
+            static_cast<Noesis::FrameworkElement*>(widget), "Name");
+        if (name == widgetName)
+            return widget;
+    }
+    return nullptr;
+}
+
+// SEH wrapper: returns POD pointer (no destructors).
+static Noesis::Visual* FindWidgetByName_SEH(const char* widgetName)
+{
+    __try {
+        return FindWidgetByName_Inner(widgetName);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        BG3A_LOG("[BG3Access] FindWidgetByName_SEH: fault for '%s'",
+                 widgetName ? widgetName : "(null)");
+        return nullptr;
+    }
+}
+
+// Inner: BFS a visual subtree, reading TextBlock text AS each node is
+// found (not after collecting pointers).  This avoids the stale-pointer
+// problem: reading one TextBlock's bound properties (ToString, Inlines)
+// can trigger Noesis layout/binding cascades that destroy sibling
+// elements in LSElementCopy cloned trees.
+// Uses std::string (destructor) so it CANNOT live inside __try.
+static void ReadWidgetTexts_Inner(
+    Noesis::Visual* root, std::vector<std::string>& outTexts)
+{
+    Noesis::Visual* queue[512];
+    int queueFront = 0, queueBack = 0;
+    queue[queueBack++] = root;
+
+    while (queueFront < queueBack && outTexts.size() < 64) {
+        auto node = queue[queueFront++];
+        if (!node) continue;
+        if (!ProbeUIElement(static_cast<Noesis::UIElement*>(node)))
+            continue;
+        if (!IsVisibleDP(node)) continue;
+
+        auto typeName = node->GetClassType()->GetName();
+        if (typeName && strstr(typeName, "TextBlock")) {
+            // Read text immediately -- before finding more TextBlocks,
+            // so binding evaluation can't destabilize unfound nodes.
+            auto text = ReadTextBlockText(
+                static_cast<Noesis::FrameworkElement*>(node));
+            if (!text.empty()
+                && text.find("[ForceUpdate]") == std::string::npos
+                && text.find("s_HandleUnknown") == std::string::npos) {
+                outTexts.push_back(std::move(text));
+            }
+            continue;  // Don't recurse into TextBlock children.
+        }
+
+        if (!ProbeVisualChildren(static_cast<Noesis::UIElement*>(node)))
+            continue;
+        auto childCount = node->GetVisualChildrenCount();
+        for (uint32_t ci = 0; ci < childCount && queueBack < 512; ci++) {
+            auto child = node->GetVisualChild(ci);
+            if (child) queue[queueBack++] = child;
+        }
+    }
+}
+
+// SEH wrapper for ReadWidgetTexts_Inner.  The outTexts reference is a
+// pointer under the hood (no destructor in this frame), so __try is safe.
+// If the inner function faults, outTexts retains partial results.
+static void ReadWidgetTexts_SEH(
+    Noesis::Visual* root, std::vector<std::string>& outTexts)
+{
+    __try {
+        ReadWidgetTexts_Inner(root, outTexts);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        BG3A_LOG("[BG3Access] ReadWidgetTexts_SEH: fault after %d texts",
+                 (int)outTexts.size());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ReadFocusedTextBlocks: reads TextBlock texts from the currently focused
+// element's visual subtree.  For inspect panel d-pad navigation where
+// each side panel is a focusable ContentPresenter with TextBlock children.
+// Returns a Lua array of strings.
+// ---------------------------------------------------------------------------
+UserReturn ReadFocusedTextBlocks(lua_State* L)
+{
+    auto focused = GetFocusedElement();
+    if (!focused) {
+        lua_createtable(L, 0, 0);
+        return 1;
+    }
+
+    std::vector<std::string> texts;
+    ReadWidgetTexts_SEH(static_cast<Noesis::Visual*>(focused), texts);
+
+    lua_createtable(L, (int)texts.size(), 0);
+    for (int i = 0; i < (int)texts.size(); i++) {
+        lua_pushstring(L, texts[i].c_str());
+        lua_rawseti(L, -2, i + 1);
+    }
+    return 1;
+}
+
+UserReturn ReadWidgetTextBlocks(lua_State* L)
+{
+    auto widgetName = luaL_checkstring(L, 1);
+
+    auto widgetVisual = FindWidgetByName_SEH(widgetName);
+    if (!widgetVisual) {
+        lua_createtable(L, 0, 0);
+        return 1;
+    }
+
+    // BFS + text reading in one pass (SEH-guarded).  Reads text as each
+    // TextBlock is found to avoid stale pointers from binding cascades.
+    std::vector<std::string> texts;
+    ReadWidgetTexts_SEH(widgetVisual, texts);
+
+    lua_createtable(L, (int)texts.size(), 0);
+    for (int i = 0; i < (int)texts.size(); i++) {
+        lua_pushstring(L, texts[i].c_str());
+        lua_rawseti(L, -2, i + 1);
+    }
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
 // ReadHUDInfo: on-demand HUD text reader for accessibility.
 //
 // Walks visible widgets, finds PartyLine_c, TargetInfo_c, and CursorText_c
@@ -6066,6 +6285,9 @@ void RegisterUILib()
     MODULE_FUNCTION(FindNameInWidgetScoped)
     // Phase 1 refactor: C++ data extraction test API
     MODULE_FUNCTION(GetFocusedElementInfo)
+    // Widget/element text readers (on-demand BFS for TextBlocks)
+    MODULE_FUNCTION(ReadWidgetTextBlocks)
+    MODULE_FUNCTION(ReadFocusedTextBlocks)
     // HUD info reader (on-demand, called from RS direction handler)
     MODULE_FUNCTION(ReadHUDInfo)
     END_MODULE()

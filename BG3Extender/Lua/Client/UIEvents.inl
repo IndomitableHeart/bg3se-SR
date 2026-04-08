@@ -168,6 +168,13 @@ static void PushFocusEventTable(lua_State* L, FocusEventData const& data)
     lua_pushboolean(L, data.isFocusable);
     lua_settable(L, -3);
 
+    // isChecked (only for ToggleButton-derived elements)
+    if (data.isChecked >= 0) {
+        lua_pushstring(L, "isChecked");
+        lua_pushboolean(L, data.isChecked == 1);
+        lua_settable(L, -3);
+    }
+
     // dcType
     lua_pushstring(L, "dcType");
     if (!data.dcType.empty()) {
@@ -249,6 +256,13 @@ static void PushFocusEventTable(lua_State* L, FocusEventData const& data)
         lua_pushnil(L);
     }
     lua_settable(L, -3);
+
+    // ancestorContext
+    if (!data.ancestorContext.empty()) {
+        lua_pushstring(L, "ancestorContext");
+        lua_pushstring(L, data.ancestorContext.c_str());
+        lua_settable(L, -3);
+    }
 
     // bindings: array of {property, path, value} tables
     if (!data.bindings.empty()) {
@@ -443,6 +457,19 @@ static void PushTickSnapshotTable(lua_State* L, TickSnapshot const& snapshot)
     if (snapshot.widgetAdded) {
         lua_pushstring(L, "widgetData");
         PushFocusEventTable(L, snapshot.widgetData);
+        lua_settable(L, -3);
+    }
+
+    // All widget DC types seen this tick (array of strings).
+    // Lets Lua check ALL widget types for routing, not just the last
+    // one in widgetData.dcType (which gets overwritten each callback).
+    if (!snapshot.widgetDCTypes.empty()) {
+        lua_pushstring(L, "widgetDCTypes");
+        lua_createtable(L, static_cast<int>(snapshot.widgetDCTypes.size()), 0);
+        for (size_t typeIndex = 0; typeIndex < snapshot.widgetDCTypes.size(); typeIndex++) {
+            lua_pushstring(L, snapshot.widgetDCTypes[typeIndex].c_str());
+            lua_rawseti(L, -2, static_cast<int>(typeIndex) + 1);
+        }
         lua_settable(L, -3);
     }
 

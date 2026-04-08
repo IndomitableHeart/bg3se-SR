@@ -1692,6 +1692,8 @@ public:
         // elements (e.g. resistance rows in the Examine panel).  Poll
         // every tick when focus exists -- tooltips appear on focus, not
         // just on d-pad navigation.
+        // Read the focused element's item name for tooltip ownership
+        // validation (prevents stale popup content on revisit).
         if (hadFocusBefore_ && cachedTrueRoot_ && cachedContentChild_) {
             PollTooltip(cachedTrueRoot_, cachedContentChild_, snapshot);
         }
@@ -1833,6 +1835,14 @@ public:
             // caused duplicate VALUE dispatches that interrupted speech.
             // INPC is the single source of truth for value changes.
 
+            // Expander toggle detection: if isChecked changed on the same
+            // element (no focus change), the user pressed A to expand/collapse.
+            // Set valueChanged so Lua re-speaks the header with updated state.
+            if (!focusChanged && snapshot->focusedElement.isChecked >= 0
+                && snapshot->focusedElement.isChecked != lastDispatchedIsChecked_) {
+                snapshot->valueChanged = true;
+            }
+
             // Widget, widgetDC, and namedTexts data were written directly
             // into snapshot by ExtractWidgetData() and the widgetDCDirty
             // handler above.  No accumulator reads needed.
@@ -1935,6 +1945,7 @@ public:
                 previousSnapshotElemId_ = snapshot->focusedElement.elemId;
                 previousSnapshotCarousel_ = snapshot->inlineCarouselValue;
                 previousSnapshotDCProps_ = snapshot->focusedElement.dcScalarProps;
+                lastDispatchedIsChecked_ = snapshot->focusedElement.isChecked;
 
                 // Set INPC cooldown to suppress stray echoes for 2 ticks
                 // after any focus/selection dispatch.
@@ -2077,6 +2088,11 @@ private:
                      dcTypeName ? dcTypeName : "(null)");
                 if (dcTypeName) {
                     data.dcType = dcTypeName;
+                    // Record this DC type in the all-types array so Lua
+                    // can check ALL widget types for routing, not just
+                    // the last one (which widgetData.dcType reflects).
+                    snapshot.widgetDCTypes.push_back(dcTypeName);
+
                     CollectDCProperties(data, dataContext);
                     TryCollectSelectionFlyOutTitle(data, dataContext);
 
@@ -2270,6 +2286,7 @@ private:
     std::string previousSnapshotElemId_;    // Delta: last sent elemId
     std::string previousSnapshotCarousel_;  // Delta: last sent inline carousel value
     std::vector<std::pair<std::string, std::string>> previousSnapshotDCProps_; // Delta: last sent DC props
+    int lastDispatchedIsChecked_ = -1;     // Delta: last dispatched isChecked for expander toggle detection
 
     // Tree settle: number of frames to skip ALL tree walks after a
     // selection change or widget set change.  Noesis tears down and
@@ -2502,6 +2519,7 @@ void InitFocusProperties(Noesis::FrameworkElement* root)
     // FrameworkElement.Tag -- standard WPF property, always resolvable.
     sTagProp = Noesis::TypeHelpers::GetDependencyProperty(
         rootClassType, bg3se::FixedString("Tag"));
+
 
     // Discover Selector.SelectionChanged routed event at runtime.
     // Used for event-driven tab detection.  Subscribe-only pattern:
@@ -3222,28 +3240,42 @@ static uint32_t FindTooltipTextBlocks_SEH(
 // uses std::string which has a destructor).  Delta-compares against
 // previous tooltip text to avoid re-firing.
 // Sends individual texts as an array so Lua can identify title vs description.
+//
+// focusedItemName / focusedItemDesc: the focused element's DC "Text" and
+// "Description" properties.  Used to validate tooltip ownership -- on
+// revisit, a recycled popup may briefly show stale template-internal
+// TextBlocks.  The item description is the reliable marker: it appears
+// in the fully-resolved tooltip but not the stale wave.
 static void PollTooltip(
     Noesis::Visual* trueRoot, Noesis::Visual* contentChild,
     ecl::lua::TickSnapshot* snapshot)
 {
     static std::string sLastTooltipFingerprint;
+    // Reopen stabilization: when a tooltip closes and reopens, a recycled
+    // popup may briefly show stale TextBlocks from a previous tooltip.
+    // After reopen, require the fingerprint to be stable for one tick
+    // before firing.  This adds exactly one tick of delay on reopen only.
+    static bool sWaitingForStable = false;
+    static std::string sPendingFingerprint;
+    static std::vector<std::string> sPendingTexts;
 
     // Phase 1: find TextBlocks in tooltip popups (SEH-guarded, no C++ objects).
-    // 32 slots: basic tooltip ~9 TextBlocks + inspect panels add more.
     Noesis::FrameworkElement* textBlocks[32];
     auto textBlockCount = FindTooltipTextBlocks_SEH(
         trueRoot, contentChild, textBlocks, 32);
 
     if (textBlockCount == 0) {
-        // No tooltip popup present.  Reset tracker so re-opening fires.
         if (!sLastTooltipFingerprint.empty()) {
             BG3A_LOG("[BG3Access] TOOLTIP: closed (resetting tracker)");
         }
         sLastTooltipFingerprint.clear();
+        sWaitingForStable = false;
+        sPendingFingerprint.clear();
+        sPendingTexts.clear();
         return;
     }
 
-    // Phase 2: extract text from found TextBlocks (outside SEH -- uses std::string).
+    // Phase 2: extract text from found TextBlocks (outside SEH).
     std::vector<std::string> texts;
     std::string fingerprint;
     for (uint32_t i = 0; i < textBlockCount; i++) {
@@ -3258,7 +3290,50 @@ static void PollTooltip(
 
     if (texts.empty()) return;
 
-    // Delta compare: only fire when text changes.
+    // Reopen detection: fingerprint was empty (tooltip was closed), now
+    // we have content.  Enter stabilization: store but don't fire.
+    if (sLastTooltipFingerprint.empty()) {
+        sWaitingForStable = true;
+        sPendingFingerprint = fingerprint;
+        sPendingTexts = std::move(texts);
+        sLastTooltipFingerprint = fingerprint;
+        BG3A_LOG("[BG3Access] TOOLTIP: reopen detected, waiting for stable (%d texts)",
+                 (int)sPendingTexts.size());
+        return;
+    }
+
+    // Stabilization: waiting for fingerprint to settle after reopen.
+    if (sWaitingForStable) {
+        if (fingerprint == sPendingFingerprint) {
+            // Same as last tick -- stable.  Fire the pending data.
+            sWaitingForStable = false;
+            BG3A_LOG("[BG3Access] TOOLTIP: stable after reopen (%d texts)",
+                     (int)sPendingTexts.size());
+            // Fall through to normal dispatch with pending data.
+            // Update sLastTooltipFingerprint (already set).
+            snapshot->tooltipChanged = true;
+            snapshot->tooltipTexts = std::move(sPendingTexts);
+            sPendingFingerprint.clear();
+            sPendingTexts.clear();
+
+            BG3A_LOG("[BG3Access] TOOLTIP: %d texts", (int)snapshot->tooltipTexts.size());
+            for (auto const& text : snapshot->tooltipTexts) {
+                BG3A_LOG("[BG3Access]   TT: %s", text.c_str());
+            }
+            return;
+        } else {
+            // Fingerprint changed -- bindings still resolving.  Update
+            // pending and wait another tick.
+            sPendingFingerprint = fingerprint;
+            sPendingTexts = std::move(texts);
+            sLastTooltipFingerprint = fingerprint;
+            BG3A_LOG("[BG3Access] TOOLTIP: still resolving after reopen (%d texts)",
+                     (int)sPendingTexts.size());
+            return;
+        }
+    }
+
+    // Normal path (tooltip already open, not reopening): delta compare.
     if (fingerprint == sLastTooltipFingerprint) return;
     sLastTooltipFingerprint = fingerprint;
 
@@ -4572,6 +4647,45 @@ static std::string ReadPropertyAsString(Noesis::BaseObject const* obj,
     std::string result;
     if (!SafeReadPropertyAsString_SEH(obj, propName, &result)) result.clear();
     return result;
+}
+
+// Read expanded state for a ToggleButton inside an Expander template.
+// Walks up via mVisualParent to find an Expander ancestor, then reads
+// its IsExpanded DP (regular bool, not Nullable).  Returns 1 (expanded),
+// 0 (collapsed), or -1 (not found / fault).
+// No C++ objects needing destructors -- safe for __try.
+static int ReadExpanderState_Invoke(Noesis::Visual* elem)
+{
+    // Walk up to find the Expander ancestor (typically 3-4 hops).
+    Noesis::Visual* current = elem;
+    for (int i = 0; i < 8 && current; i++) {
+        auto parent = current->mVisualParent;
+        if (!parent) break;
+        auto parentTypeName = parent->GetClassType()->GetName();
+        if (parentTypeName && strstr(parentTypeName, "Expander")) {
+            // Found the Expander -- read IsExpanded via GetValue.
+            auto expanderDepObj = static_cast<Noesis::DependencyObject const*>(parent);
+            // Look up IsExpanded DP from the Expander's class.
+            auto expanderClass = parent->GetClassType();
+            auto& cls = Noesis::gClassCache.GetClass(expanderClass);
+            bg3se::FixedString fsName("IsExpanded");
+            auto prop = cls.Names.try_get(fsName);
+            if (prop && prop->DepProperty) {
+                auto val = prop->DepProperty->GetValue(expanderDepObj);
+                if (val) {
+                    return *static_cast<const bool*>(val) ? 1 : 0;
+                }
+            }
+            return -1;
+        }
+        current = parent;
+    }
+    return -1;
+}
+static int SafeReadExpanderState_SEH(Noesis::Visual* elem)
+{
+    __try { return ReadExpanderState_Invoke(elem); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 }
 
 // ---------------------------------------------------------------------------
@@ -6046,6 +6160,16 @@ static void ExtractElementData_Inner(FocusEventData& out, Noesis::FrameworkEleme
         out.isFocusable = val && *static_cast<const bool*>(val);
     }
 
+    // isChecked: expander state for ToggleButtons inside Expander templates.
+    // Walks up to the Expander ancestor and reads its IsExpanded DP
+    // (regular bool, unlike ToggleButton.IsChecked which is Nullable<bool>).
+    {
+        auto typeName = SafeBaseObjectTypeName_SEH(elem);
+        if (typeName && strstr(typeName, "ToggleButton")) {
+            out.isChecked = SafeReadExpanderState_SEH(elem);
+        }
+    }
+
     // DataContext
     auto dataContext = SafeReadDC_SEH(
         static_cast<Noesis::DependencyObject const*>(elem));
@@ -6151,6 +6275,32 @@ static void ExtractElementData_Inner(FocusEventData& out, Noesis::FrameworkEleme
             char buf[32];
             snprintf(buf, sizeof(buf), "%p", static_cast<void*>(widgetRoot));
             out.widgetRootId = buf;
+        }
+    }
+
+    // ancestorContext: walk a few parents looking for x:Name containing
+    // "Melee" or "Ranged".  Qualifies stats like "Attack Bonus" so Lua
+    // can prefix with the attack type.  Own SEH block -- parent Names
+    // are separate from the widgetRootId walk above.
+    {
+        Noesis::Visual* cur = elem;
+        for (int i = 0; i < 6 && cur; i++) {
+            auto parent = SafeGetVisualParent_SEH(cur);
+            if (!parent) break;
+            auto parentFE = static_cast<Noesis::FrameworkElement*>(parent);
+            std::string parentName;
+            if (SafeReadPropertyAsString_SEH(parentFE, "Name", &parentName)
+                && !parentName.empty()) {
+                if (parentName.find("Melee") != std::string::npos) {
+                    out.ancestorContext = "Melee";
+                    break;
+                }
+                if (parentName.find("Ranged") != std::string::npos) {
+                    out.ancestorContext = "Ranged";
+                    break;
+                }
+            }
+            cur = parent;
         }
     }
 

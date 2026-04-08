@@ -29,6 +29,7 @@ struct FocusEventData
     // Element classification
     bool isTab = false;         // IsListBoxItemType
     bool isFocusable = false;   // ls:MoveFocus.Focusable
+    int isChecked = -1;         // ToggleButton.IsChecked: 1=true, 0=false, -1=N/A
 
     // DataContext (ViewModel) data
     std::string dcType;         // DC class name or empty
@@ -70,6 +71,11 @@ struct FocusEventData
         std::string resolvedValue;  // The cached binding result (actual text)
     };
     std::vector<BindingInfo> bindings;
+
+    // Ancestor context: first parent x:Name containing "Melee" or "Ranged".
+    // Empty if no such ancestor found within a few hops.  Used by Lua to
+    // qualify stats like "Attack Bonus" -> "Melee Attack Bonus".
+    std::string ancestorContext;
 
     // Named TextBlock texts from the widget's NameScope.
     // Key = x:Name, Value = resolved text from three-step extraction.
@@ -147,6 +153,12 @@ struct TickSnapshot
     // Widget added data (dialog/overlay detection).
     // Only populated when widgetAdded == true.
     FocusEventData widgetData;
+
+    // All widget DC types seen this tick.  When multiple widgets fire
+    // in one tick, widgetData only carries the last one.  This array
+    // lets Lua check ALL widget DC types for routing decisions (e.g.,
+    // finding gui::DCCharacterPanels even when ls.Widget fires last).
+    std::vector<std::string> widgetDCTypes;
 
     // Radial slot data (RT shortcuts radial, RB action radial).
     // Only populated when radialSlotChanged == true.

@@ -992,16 +992,30 @@ public:
             initialSelectionDone_ = false;
         }
 
-        // Post-settle tick ALWAYS runs Strategy 3 because SelectionChanged
-        // subscriptions may not exist during settle (they're created after).
-        // selectionFiredDuringSettle_ handles the common case (RB/LB tab
-        // switch mid-menu).  postSettle_ handles initial menu entry where
-        // subscriptions weren't active during the settle window.
+        // Detect whether a dialog widget (Dialogue_c) is visible.
+        // BG3's dialog LSListBox marks SelectionChanged as Handled
+        // so the event never reaches our widget-level subscription.
+        // When a dialog is visible we bypass the initialSelectionDone_
+        // gate and run Strategy 3 every tick to catch D-pad-driven
+        // selection changes.  Cost: one tree walk per tick (~2ms)
+        // but ONLY while the dialog is on screen.
+        bool dialogWidgetVisible = false;
+        for (uint32_t wi = 0; wi < widgetCount && !dialogWidgetVisible; wi++) {
+            if (!widgets[wi] || !widgetVisible[wi]) continue;
+            auto name = ReadPropertyAsString(
+                static_cast<Noesis::FrameworkElement*>(
+                    const_cast<Noesis::Visual*>(widgets[wi])), "Name");
+            if (name == "Dialogue_c") {
+                dialogWidgetVisible = true;
+            }
+        }
+
         bool shouldRunStrategy3 = !sSelectionChangedEvent
                                || subscribedWidgetCount_ == 0
                                || !initialSelectionDone_
                                || selectionFiredDuringSettle_
-                               || postSettle_;
+                               || postSettle_
+                               || dialogWidgetVisible;
         selectionFiredDuringSettle_ = false;
 
         Noesis::UIElement* selected = nullptr;
@@ -1397,6 +1411,7 @@ public:
             initialWidgetScanDelay_++;
             if (initialWidgetScanDelay_ == 10) {
                 BG3A_LOG("[BG3Access] Initial widget scan (%u widgets)", widgetCount);
+
                 for (int i = (int)widgetCount - 1; i >= 0; i--) {
                     if (!widgets[i]) continue;
 
@@ -1678,10 +1693,16 @@ public:
         // Noesis ContextMenu popups live in a separate rendering layer
         // invisible to visual tree walking.  We reach the popup through
         // the ContextMenu DP on WorldContextEntity.  Polls IsOpen and
-        // IsHighlighted each tick.  Only runs during active gameplay
-        // (hadFocusBefore_) -- during loading, FindNameInWidgetScoped
-        // can hang on unstable NameScopes.
-        if (hadFocusBefore_ && widgetCount > 0 && !snapshot->focusChanged) {
+        // IsHighlighted each tick.  Runs whenever widgets exist and
+        // focus is not actively changing.  Does NOT require
+        // hadFocusBefore_ because world context menus (X on a world
+        // object) can open before any Noesis focus element has ever
+        // been detected -- the previous hadFocusBefore_ guard silently
+        // blocked ALL context menu detection until the player happened
+        // to trigger a focus event (opening inventory, search flyout,
+        // etc.).  SEH wrapping in PollContextMenu_Unsafe protects
+        // against unstable NameScopes during loading.
+        if (widgetCount > 0 && !snapshot->focusChanged) {
             PollContextMenu(widgets, widgetVisible, widgetCount,
                             focused, cachedTrueRoot_, cachedContentChild_,
                             snapshot);
@@ -2663,8 +2684,12 @@ static bool PollRadialLocalFocus_Unsafe(
     Noesis::FrameworkElement** outFocusedItem,
     Noesis::Visual** outWidgetVisual)
 {
+    // LocalFocus DP cache.  Retries on every call until a successful
+    // lookup populates the cache -- the previous sLocalFocusLookupDone
+    // latch could stick in the "failed forever" state if the first
+    // lookup happened on a transient element whose class chain wasn't
+    // fully wired yet.  Same bug pattern as the context menu latches.
     static const Noesis::DependencyProperty* sLocalFocusProp = nullptr;
-    static bool sLocalFocusLookupDone = false;
     static uintptr_t sLastLocalFocusAddr = 0;
 
     *outFocusedItem = nullptr;
@@ -2688,8 +2713,7 @@ static bool PollRadialLocalFocus_Unsafe(
                 "MenuRadial", widgets[widgetIdx]);
             if (!menuRadial) continue;
 
-            if (!sLocalFocusLookupDone) {
-                sLocalFocusLookupDone = true;
+            if (!sLocalFocusProp) {
                 sLocalFocusProp = LookupLocalFocusDP(menuRadial->GetClassType());
                 if (sLocalFocusProp) {
                     BG3A_LOG("[BG3Access] LocalFocus DP found on %s",
@@ -2789,8 +2813,12 @@ static bool PollActiveSearchLocalFocus_Unsafe(
     Noesis::FrameworkElement** outFocusedItem,
     Noesis::Visual** outWidgetVisual)
 {
+    // ActiveSearch LocalFocus DP cache.  Retries until a successful
+    // lookup populates the pointer.  Previous sActiveSearchLocalFocusLookupDone
+    // latch could stick in "failed forever" if the first lookup happened
+    // on a transient element -- same bug pattern as the context menu
+    // and radial latches.
     static const Noesis::DependencyProperty* sActiveSearchLocalFocusProp = nullptr;
-    static bool sActiveSearchLocalFocusLookupDone = false;
     static uintptr_t sLastActiveSearchLocalFocusAddr = 0;
 
     *outFocusedItem = nullptr;
@@ -2823,9 +2851,9 @@ static bool PollActiveSearchLocalFocus_Unsafe(
             BG3A_LOG("[BG3Access] ActiveSearch: OptionsContainer found, class=%s",
                      optionsContainer->GetClassType()->GetName());
 
-            // One-time LocalFocus DP discovery on the OptionsContainer element.
-            if (!sActiveSearchLocalFocusLookupDone) {
-                sActiveSearchLocalFocusLookupDone = true;
+            // LocalFocus DP discovery on the OptionsContainer element.
+            // Retries until successful; does not latch on failure.
+            if (!sActiveSearchLocalFocusProp) {
                 sActiveSearchLocalFocusProp = LookupLocalFocusDP(
                     optionsContainer->GetClassType());
                 if (sActiveSearchLocalFocusProp) {
@@ -2921,8 +2949,10 @@ static void PollActiveSearchLocalFocus(
 
 // Shared IsHighlighted DP cache for ContextMenuItems.
 // Used by both CheckContextMenuOnElement and Source 3 popup search.
+// Cache persists the FIRST SUCCESSFUL lookup; failed lookups do not
+// latch, so a transient/unready first item cannot disable highlight
+// detection for the session.
 static const Noesis::DependencyProperty* sCtxMenuIsHighlightedProp = nullptr;
-static bool sCtxMenuIsHighlightedLookedUp = false;
 
 // FindHighlightedContextMenuItem: given an array of ContextMenuItems,
 // finds the one with IsHighlighted=true and its first TextBlock child.
@@ -2934,9 +2964,9 @@ static bool FindHighlightedContextMenuItem(
 {
     if (itemCount == 0) return false;
 
-    // One-time IsHighlighted DP lookup on first item.
-    if (!sCtxMenuIsHighlightedLookedUp) {
-        sCtxMenuIsHighlightedLookedUp = true;
+    // IsHighlighted DP lookup.  Retries on every call until a
+    // successful lookup populates the cache.
+    if (!sCtxMenuIsHighlightedProp) {
         auto itemClassType = SafeGetClassType_SEH(menuItems[0]);
         if (itemClassType) {
             sCtxMenuIsHighlightedProp =
@@ -2966,6 +2996,14 @@ static bool FindHighlightedContextMenuItem(
 // DP with IsOpen=true, and if so, finds the highlighted ContextMenuItem.
 // Shared logic for both WorldContextEntity and ActiveSearch item paths.
 // DP caches are static -- one-time lookups, persist across frames.
+//
+// Latch discipline: the DP caches persist the FIRST SUCCESSFUL lookup
+// across frames.  A failed lookup (SafeGetClassType returned null, or
+// the class type didn't carry the DP) does NOT latch -- it's retried
+// on the next call, because the next call may arrive with a properly
+// initialized element whose class chain does expose the DP.  Without
+// this retry the very first call with a transient/unready element
+// would disable ContextMenu detection for the entire session.
 static bool CheckContextMenuOnElement(
     Noesis::FrameworkElement* element,
     Noesis::FrameworkElement** outHighlightedItem,
@@ -2973,7 +3011,6 @@ static bool CheckContextMenuOnElement(
 {
     static const Noesis::DependencyProperty* sContextMenuProp = nullptr;
     static const Noesis::DependencyProperty* sIsOpenProp = nullptr;
-    static bool sContextMenuDPLookedUp = false;
 
     if (!element) return false;
     if (!ProbeUIElement(static_cast<Noesis::UIElement*>(element)))
@@ -2981,9 +3018,9 @@ static bool CheckContextMenuOnElement(
 
   __try {
 
-    // One-time ContextMenu DP lookup.
-    if (!sContextMenuDPLookedUp) {
-        sContextMenuDPLookedUp = true;
+    // ContextMenu DP lookup.  Retries on every call until a successful
+    // lookup populates the cache -- then stays cached for the session.
+    if (!sContextMenuProp) {
         auto elemType = SafeGetClassType_SEH(element);
         if (elemType) {
             sContextMenuProp = LookupContextMenuDP(elemType);
@@ -2998,7 +3035,8 @@ static bool CheckContextMenuOnElement(
     auto cmObj = SafeDerefDPObject_SEH(cmVal);
     if (!cmObj) return false;
 
-    // One-time IsOpen DP lookup on the ContextMenu.
+    // IsOpen DP lookup on the ContextMenu.  Same retry-until-success
+    // discipline as the ContextMenu DP lookup above.
     if (!sIsOpenProp) {
         auto cmClassType = SafeGetClassType_SEH(cmObj);
         if (cmClassType) {
@@ -3034,6 +3072,35 @@ static bool CheckContextMenuOnElement(
 // PollContextMenu_Unsafe: tries multiple element sources for an open
 // context menu.  No C++ objects with destructors.
 // Returns true if an open context menu with a highlighted item was found.
+//
+// Source ordering and gating notes (the bug this avoids):
+//
+// Sources 1 and 2 read the ContextMenu DP DIRECTLY on a known element
+// (WorldContextEntity in a widget NameScope, or the currently focused
+// element).  They do NOT need popup-root walking, and they MUST run
+// unconditionally on every poll -- the previous implementation put a
+// GetPopupRoots_SEH gate at the top of the function that short-circuited
+// out when no Noesis popup roots were found under the cached trueRoot.
+//
+// That gate fails silently in the "pure world X-press" case: when the
+// player opens a world context menu without any other popup visible,
+// ls:ContextMenu's popup layer is NOT guaranteed to surface as a child
+// of our cached trueRoot (either because cachedTrueRoot_ resolved to
+// nullptr on an early frame, or because ls:ContextMenu's rendering
+// plants its popup on a different layer).  The gate returns 0 and the
+// whole function bails -- even though Source 1 could successfully read
+// the ContextMenu DP on WorldContextEntity in one cheap lookup.
+//
+// The symptom was the VERY FIRST world context menu of a session going
+// silent with nothing at all in the log (no detection, no "closed"
+// tracker reset).  The workaround was to trigger ANY other popup
+// (SelectionFlyOut, tooltip, etc.) to populate popup roots, at which
+// point the gate passed and Source 1 started working.
+//
+// Fix: run Source 1 and Source 2 unconditionally (both are cheap -- a
+// NameScope lookup + one DP read per element, no BFS).  Only compute
+// popup roots lazily if Source 1 and Source 2 both fail, since Source 3
+// is the only branch that actually needs them.
 static bool PollContextMenu_Unsafe(
     Noesis::Visual* const* widgets, bool const* widgetVisible,
     uint32_t widgetCount, Noesis::UIElement* focusedElement,
@@ -3045,18 +3112,13 @@ static bool PollContextMenu_Unsafe(
     *outTextBlock = nullptr;
 
   __try {
-    // GATE: check if any popups exist.
-    // GetPopupRoots_SEH returns non-content children of the true
-    // visual root.  If none, no popup is open -- skip everything.
-    // Per-tick cost when no popup: one GetVisualChildrenCount call.
-    Noesis::Visual* popupRoots[8];
-    auto popupCount = GetPopupRoots_SEH(
-        trueRoot, contentChild, popupRoots, 8);
-    if (popupCount == 0) return false;
-
-    // A popup exists.  Check sources for an open context menu.
-
-    // Source 1: WorldContextEntity (direct X on world item).
+    // Source 1: WorldContextEntity (direct X on world item).  Runs
+    // unconditionally -- no popup-root dependency.  Iterates every
+    // visible widget looking for the named entity.  Does NOT break
+    // early when one widget yields a WorldContextEntity with an
+    // un-open menu -- a stale widget during a transition could host
+    // the wrong entity, so we keep checking until we find one with
+    // an open menu or exhaust the list.
     for (uint32_t i = 0; i < widgetCount; i++) {
         if (!widgets[i] || !widgetVisible[i]) continue;
         if (!ProbeUIElement(static_cast<Noesis::UIElement*>(
@@ -3068,10 +3130,13 @@ static bool PollContextMenu_Unsafe(
                 outHighlightedItem, outTextBlock)) {
             return true;
         }
-        break;
+        // Keep looping -- don't break.  Multiple widgets may transiently
+        // host a WorldContextEntity during screen transitions, and the
+        // wrong one may appear first in widgets[].
     }
 
     // Source 2: focused element (ActiveSearch item ContextMenu).
+    // Also runs unconditionally -- no popup-root dependency.
     if (focusedElement && ProbeUIElement(focusedElement)) {
         if (CheckContextMenuOnElement(
                 static_cast<Noesis::FrameworkElement*>(focusedElement),
@@ -3081,6 +3146,13 @@ static bool PollContextMenu_Unsafe(
     }
 
     // Source 3: search popup roots for ContextMenuItems directly.
+    // This is the only branch that actually needs popupRoots, so the
+    // popup scan is lazy -- only runs if Sources 1 and 2 both failed.
+    // GetPopupRoots_SEH returns 0 (and this branch is a no-op) if
+    // cachedTrueRoot_ is nullptr or no popups exist.
+    Noesis::Visual* popupRoots[8];
+    auto popupCount = GetPopupRoots_SEH(
+        trueRoot, contentChild, popupRoots, 8);
     for (uint32_t pi = 0; pi < popupCount; pi++) {
         Noesis::FrameworkElement* popupMenuItems[16];
         auto popupItemCount = FindElementsByType_SEH(

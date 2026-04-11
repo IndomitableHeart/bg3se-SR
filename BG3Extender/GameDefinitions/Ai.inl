@@ -216,6 +216,17 @@ bool CheckPlayerWeightCell(AiPlayerWeightFuncData const& data, AiGrid* aiGrid, A
         if (!surfaceCost) {
             surfaceCost = CalculateInfluenceCost(*data.SurfacePathInfluences, area, data.DamagingSurfacesThreshold) / 5;
         }
+        // Apply the computed surface cost to the path score.  Without
+        // this line the surfaceCost local is a dead store and the
+        // entire UsePlayerWeighting surface-influence mechanism is a
+        // no-op -- the A* search will happily route through fire,
+        // acid, cloudkill, etc. because those tiles cost the same as
+        // clear ground.  Matches the += pattern used by the other
+        // three branches in this function (obstacles, dynamics,
+        // traps).  BG3Access relies on this in WorldNav.lua's
+        // ApplyHazardAvoidance to detour around hazardous surfaces
+        // during GPS routing.
+        pathScore += surfaceCost;
     }
 
     if (data.IsAvoidingTraps) {

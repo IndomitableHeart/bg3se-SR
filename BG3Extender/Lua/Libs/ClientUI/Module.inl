@@ -792,9 +792,27 @@ public:
 
     void ForceNextFire() { forceNext_ = true; }
 
+    // Suppress all Noesis tree walking during loading states.
+    // Set from Lua via SuppressGlobalFocusTick() when the game enters
+    // a loading state.  Prevents deadlocks caused by our Tick()
+    // calling Noesis virtual functions while the loading thread
+    // constructs/destroys UI objects under a Noesis internal mutex.
+    //
+    // Grace period: the first ~20 frames after suppress starts are
+    // allowed so the initial widget scan can fire (at frame 10) and
+    // collect loading tips.  Hangs occur later in loading when Noesis
+    // rebuilds the widget tree, not during the initial tip display.
+    void SetSuppressTick(bool suppress) {
+        suppressTick_ = suppress;
+        if (suppress) {
+            initialScanFiredDuringSuppress_ = false;
+        }
+    }
+
     void Tick()
     {
         if (!callback_) return;
+        if (suppressTick_ && initialScanFiredDuringSuppress_) return;
 
         // Decrement INPC cooldown each tick.
         if (inpcCooldown_ > 0) inpcCooldown_--;
@@ -828,6 +846,9 @@ public:
                 cachedTrueRoot_ = nullptr;
                 cachedContentChild_ = nullptr;
             }
+
+            BG3A_LOG("[BG3Access] Root changed: root=%p container=%p",
+                root, widgetContainer_);
         }
         if (!widgetContainer_) {
             widgetContainer_ = FindWidgetContainer(root);
@@ -1263,7 +1284,7 @@ public:
         // Allow widgetAdded when focus arrives WITH the new widget
         // (focusChanged + new widget on same tick, e.g. SelectionFlyOut).
         if (widgetSetChanged && widgetCount > 0
-            && (hadFocusBefore_ || focusChanged)) {
+            && (hadFocusBefore_ || focusChanged || !suppressTick_)) {
             bool widgetAdded = false;
             if (widgetCount > oldWidgetCount) {
                 widgetAdded = true;
@@ -1411,6 +1432,7 @@ public:
             initialWidgetScanDelay_++;
             if (initialWidgetScanDelay_ == 10) {
                 BG3A_LOG("[BG3Access] Initial widget scan (%u widgets)", widgetCount);
+                if (suppressTick_) initialScanFiredDuringSuppress_ = true;
 
                 for (int i = (int)widgetCount - 1; i >= 0; i--) {
                     if (!widgets[i]) continue;
@@ -1436,7 +1458,16 @@ public:
 
                     if (!isVisible || isOverlay) continue;
 
-                    ExtractWidgetData(widgetElem, *snapshot);
+                    // Only set widgetData if Strategy 4 didn't already
+                    // fire on this tick.  The initial scan processes ALL
+                    // widgets (bottom-up), so the last ExtractWidgetData
+                    // call overwrites widgetData with the least interesting
+                    // widget (e.g., DCOverheads).  When Strategy 4 already
+                    // identified the actual new widget (e.g., shortcutsMenu
+                    // with DCGameMenu), preserve that data.
+                    if (!snapshot->widgetAdded) {
+                        ExtractWidgetData(widgetElem, *snapshot);
+                    }
                     TryCollectNamedTexts(widgetElem, snapshot->focusedElement.namedTexts);
 
                     // Fallback: if NameScope found no text, BFS the visual
@@ -2277,6 +2308,8 @@ private:
     bool forceNext_ = false;
     bool postSettle_ = false;           // true on the ONE tick after settle expires
     bool hadFocusBefore_ = false;       // true once any focus/selection was found
+    bool suppressTick_ = false;         // skip all Noesis calls during loading
+    bool initialScanFiredDuringSuppress_ = false;  // initial scan ran, safe to stop
     int inpcCooldown_ = 0;              // ticks since last focus/selection dispatch; suppresses stray INPC echoes
     int initialWidgetScanDelay_ = 0;      // stability counter for pre-focus scan
     uint32_t lastScanWidgetCount_ = 0;   // fingerprint: widget count at last scan
@@ -4091,6 +4124,10 @@ void ForceGlobalFocusUpdate()
     GlobalFocusMonitor::Instance().ForceNextFire();
 }
 
+void SuppressGlobalFocusTick(bool suppress)
+{
+    GlobalFocusMonitor::Instance().SetSuppressTick(suppress);
+}
 
 bool HasProperty(Noesis::BaseObject const* o, bg3se::FixedString const& name)
 {
@@ -6799,6 +6836,7 @@ void RegisterUILib()
     MODULE_FUNCTION(SubscribeGlobalFocusChanged)
     MODULE_FUNCTION(UnsubscribeGlobalFocusChanged)
     MODULE_FUNCTION(ForceGlobalFocusUpdate)
+    MODULE_FUNCTION(SuppressGlobalFocusTick)
     MODULE_FUNCTION(HasProperty)
     MODULE_FUNCTION(HasLocalValue)
     MODULE_FUNCTION(IsElementVisible)

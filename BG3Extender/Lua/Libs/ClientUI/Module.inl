@@ -132,6 +132,9 @@ static Noesis::RoutedEvent* sSelectionChangedEvent = nullptr;
 // SelectionChanged event handler outputs.  Read and cleared in Tick().
 // Single-threaded: Noesis events fire on the main thread, stable during Tick.
 static bool sSelectionDirtyFlag = false;
+// Static mirror of suppressTick_ for use by SelectionDirtyDelegate,
+// which is defined before the GlobalFocusMonitor class.
+static bool sSuppressCallbacks = false;
 // Address of the newly selected element from the last SelectionChanged event.
 // Stored as uintptr_t -- NEVER cast back to a pointer.  Used only to check
 // whether the selected item is a ListBoxItem by finding it fresh in the tree.
@@ -146,10 +149,16 @@ static bool IsUIWidgetType(Noesis::Visual const* elem);
 static Noesis::Visual* FindWidgetContainer(Noesis::Visual* root);
 
 // Loading tip buffer: persists across Lua VM resets.  Read during
-// loading states by BufferLoadingTips, delivered on first tick after
-// Lua VM reconnects.  Cleared by SetSuppressTick on each new load.
+// loading states by BufferLoadingTips / CaptureLoadingHintFromINPC,
+// delivered on first tick after Lua VM reconnects.
 static std::vector<std::string> sBufferedLoadingTips;
 static int sLastBufferedHintIndex = -2;  // -2 = uninitialized
+
+// Persistent set of tip texts already delivered to Lua this session.
+// Prevents the same tip text from being spoken twice, even across
+// multi-phase boot sequences and load cycles.  Never cleared -- tips
+// rotate between loads, so the set stays small.
+static std::vector<std::string> sDeliveredTipTexts;
 
 // Forward declarations -- defined below, after InitFocusProperties.
 Noesis::UIElement* GetFocusedElement();
@@ -474,6 +483,13 @@ struct SelectionDirtyDelegate
 {
     void Handler(Noesis::BaseComponent* source, const Noesis::RoutedEventArgs& args)
     {
+        // Skip during loading states.  No carousels to navigate while
+        // loading, and the spurious SelectionChanged events from widget
+        // destruction walk GetClassType/GetBase on stale objects.
+        // sSuppressCallbacks mirrors suppressTick_ and is maintained
+        // by SetSuppressTick.
+        if (sSuppressCallbacks) return;
+
         __try {
             // Only fire for tab carousel selections, not inline carousels.
             auto& selArgs = static_cast<const Noesis::SelectionChangedEventArgs&>(args);
@@ -497,7 +513,8 @@ struct SelectionDirtyDelegate
             }
             sSelectionDirtyFlag = true;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
-            BG3A_LOG("[BG3Access] SelectionChanged handler: SEH fault (stale widget during destruction?)");
+            // No BG3A_LOG here -- this handler can fire during dangerous
+            // states when SE logging may contend with the loading thread.
         }
     }
 };
@@ -859,12 +876,6 @@ public:
             settleBaselineWidgetVisible_[i] = false;
         }
         settleBaselineWidgetCount_ = 0;
-        // Deliver any buffered loading tips on the first tick.
-        // The buffer persists (not cleared here or in SetSuppressTick)
-        // so BufferLoadingTips dedup works across re-entrant loading
-        // states within the same load sequence.  The buffer only clears
-        // implicitly: old tips are deduped out by BufferLoadingTips_Inner.
-        deliverBufferedTips_ = !sBufferedLoadingTips.empty();
         return true;
     }
 
@@ -881,6 +892,14 @@ public:
 
     bool IsActive() const { return callback_.operator bool(); }
     bool TipsAlreadyDelivered() const { return tipsAlreadyDelivered_; }
+    bool ConsumeHintINPCFlag() {
+        bool was = hintIndexChangedViaINPC_;
+        hintIndexChangedViaINPC_ = false;
+        if (was) {
+            BG3A_LOG("[BG3Access] INPC hint flag consumed (safe state)");
+        }
+        return was;
+    }
 
     void ForceNextFire() { forceNext_ = true; }
 
@@ -896,11 +915,19 @@ public:
     // new Lua VM subscribes.
     void SetSuppressTick(bool suppress) {
         suppressTick_ = suppress;
+        sSuppressCallbacks = suppress;
         if (suppress) {
-            // New loading phase: clear stale buffer and reset delivery flag
-            // so BufferLoadingTips can capture fresh tips.
-            sBufferedLoadingTips.clear();
-            sLastBufferedHintIndex = -2;
+            // Reset delivery flag so INPC and BufferLoadingTips can
+            // capture fresh tips during this loading phase.
+            //
+            // Do NOT clear sBufferedLoadingTips or sLastBufferedHintIndex.
+            // The buffer may contain INPC-captured tips from BEFORE
+            // the Lua VM reset (CaptureLoadingHintFromINPC fires during
+            // UnloadLevel).  Clearing here destroys them before the
+            // new VM's first tick can deliver.  The index tracker
+            // prevents BufferLoadingTips from re-reading the same hint
+            // during multi-phase boot sequences (Menu -> StartLoading
+            // -> Idle -> InitConnection -> StartLoading -> Idle).
             tipsAlreadyDelivered_ = false;
         }
     }
@@ -1068,14 +1095,35 @@ public:
         auto snapshotPtr = std::make_unique<ecl::lua::TickSnapshot>();
         auto snapshot = snapshotPtr.get();
 
-        // ----- Deliver buffered loading tips (once, on first tick after subscribe) -----
-        if (deliverBufferedTips_ && !sBufferedLoadingTips.empty()) {
-            deliverBufferedTips_ = false;
+        // ----- Per-tick widgetDCTypes collection (cached) -----
+        // Widget DC types don't change between ticks -- only when the
+        // widget set itself changes.  Cache the result and reuse it on
+        // unchanged ticks.  This eliminates per-tick Noesis DP reads
+        // (SafeReadDC_SEH, ProbeUIElement) that can deadlock against
+        // the Noesis rendering thread.  SEH cannot catch deadlocks.
+        if (widgetSetJustChanged || cachedWidgetDCTypes_.empty()) {
+            // TICK[A] breadcrumb removed -- per-tick logging floods the log.
+            cachedWidgetDCTypes_.clear();
+            CollectWidgetDCTypes_SEH(
+                widgets, widgetVisible, widgetCount,
+                cachedWidgetDCTypes_);
+        }
+        snapshot->widgetDCTypes = cachedWidgetDCTypes_;
+
+        // ----- Deliver buffered loading tips -----
+        // Check the buffer directly every tick instead of using a flag.
+        // Tips can be buffered by BufferLoadingTips_SEH during safe
+        // states AFTER Subscribe() runs, so a flag set at subscribe
+        // time misses late-buffered tips.
+        if (!sBufferedLoadingTips.empty()) {
             snapshot->widgetAdded = true;
             snapshot->widgetData.dcType = "ls.LoadingScreen";
             snapshot->widgetData.eventType = "WidgetAdded";
             int tipNumber = 0;
             for (auto& tipText : sBufferedLoadingTips) {
+                // Record in the persistent delivered set so the same
+                // text is never spoken again this session.
+                sDeliveredTipTexts.push_back(tipText);
                 tipNumber++;
                 std::string key = "_loadingHint_"
                     + std::to_string(tipNumber);
@@ -1085,10 +1133,11 @@ public:
             BG3A_LOG("[BG3Access] Delivering %d buffered loading tips",
                      tipNumber);
             sBufferedLoadingTips.clear();
-            sLastBufferedHintIndex = -2;
+            // Do NOT reset sLastBufferedHintIndex here.  Keeping it
+            // at its last value prevents BufferLoadingTips from
+            // re-reading the same VisibileHintIndex on a subsequent
+            // loading phase within the same boot sequence.
             tipsAlreadyDelivered_ = true;
-        } else {
-            deliverBufferedTips_ = false;
         }
 
         // ----- Lazy FocusedElement property discovery -----
@@ -1517,20 +1566,10 @@ public:
 
         }
         // ----- Per-tick widgetDCTypes collection -----
-        // Populate widgetDCTypes with ALL visible widget DC types so
-        // Lua's panel close detection always knows what panels are
-        // present.  Only ExtractWidgetData populated this before, so
-        // on normal ticks (no widget events) it was empty, causing
-        // false panel deactivation.
-        CollectWidgetDCTypes_SEH(
-            widgets, widgetVisible, widgetCount,
-            snapshot->widgetDCTypes);
-
+        // TICK[B]-[E] breadcrumbs removed -- per-tick logging floods the log.
         bool wasPostSettle = postSettle_;
         postSettle_ = false;
 
-        // ----- Deferred namedTexts re-collection on tab switch -----
-        // After a tab switch, wait for Noesis to update Visibility states
         // Track whether we've ever had focus (for Strategy 4 guard).
         if (focused || selected) hadFocusBefore_ = true;
 
@@ -1834,37 +1873,54 @@ public:
         // ----- Radial LocalFocus polling (RT shortcuts menu) -----
         // Delegated to PollRadialLocalFocus (SEH-guarded, no C++ destructors).
         // Populates snapshot->radialSlotChanged and related fields.
-        if (!focused && !selected && widgetCount > 0 && sDataContextProp && sTagProp) {
-            PollRadialLocalFocus(widgets, widgetVisible, widgetCount, snapshot);
+        //
+        // All three polling functions are wrapped in try/catch in
+        // addition to their internal SEH.  SEH catches hardware faults
+        // (access violations) but NOT C++ exceptions thrown by Noesis
+        // SDK internals (FindNodeName, GetVisualChildrenCount, etc.).
+        // Uncaught C++ exceptions call std::terminate -> abort(),
+        // killing the game.  try/catch(...) catches those.
+        //
+        // Polling stability gate: defer FindNameInWidgetScoped-based
+        // polling until the widget set has been stable for 10 frames.
+        // During post-load transitions, widgets appear over several
+        // ticks and BFS on partially-constructed widgets can deadlock
+        // against the Noesis rendering thread.  The counter resets on
+        // every widget change, stays at 10 during normal gameplay.
+        if (widgetSetJustChanged) {
+            pollStableFrames_ = 0;
+        } else if (pollStableFrames_ < 10) {
+            pollStableFrames_++;
+        }
+        bool pollingAllowed = (pollStableFrames_ >= 10);
+
+        if (pollingAllowed && !focused && !selected && widgetCount > 0 && sDataContextProp && sTagProp) {
+            try {
+                PollRadialLocalFocus(widgets, widgetVisible, widgetCount, snapshot);
+            } catch (...) {
+                BG3A_LOG("[BG3Access] PollRadialLocalFocus: C++ exception caught");
+            }
         }
 
         // ----- ActiveSearch LocalFocus polling (hold-A item list) -----
-        // The ActiveSearch panel and its X actions submenu use Larian's
-        // LocalFocus DP on the OptionsContainer LSListBox for controller
-        // navigation.  Our three focus strategies miss these entirely.
-        // Only poll when no regular focus/selection and radial didn't fire.
-        if (!focused && !selected && widgetCount > 0 && sDataContextProp
+        if (pollingAllowed && !focused && !selected && widgetCount > 0 && sDataContextProp
             && !snapshot->radialSlotChanged) {
-            PollActiveSearchLocalFocus(widgets, widgetVisible, widgetCount, snapshot);
+            try {
+                PollActiveSearchLocalFocus(widgets, widgetVisible, widgetCount, snapshot);
+            } catch (...) {
+                BG3A_LOG("[BG3Access] PollActiveSearchLocalFocus: C++ exception caught");
+            }
         }
 
         // ----- Context menu polling (WorldContextMenu popup) -----
-        // Noesis ContextMenu popups live in a separate rendering layer
-        // invisible to visual tree walking.  We reach the popup through
-        // the ContextMenu DP on WorldContextEntity.  Polls IsOpen and
-        // IsHighlighted each tick.  Runs whenever widgets exist and
-        // focus is not actively changing.  Does NOT require
-        // hadFocusBefore_ because world context menus (X on a world
-        // object) can open before any Noesis focus element has ever
-        // been detected -- the previous hadFocusBefore_ guard silently
-        // blocked ALL context menu detection until the player happened
-        // to trigger a focus event (opening inventory, search flyout,
-        // etc.).  SEH wrapping in PollContextMenu_Unsafe protects
-        // against unstable NameScopes during loading.
-        if (widgetCount > 0 && !snapshot->focusChanged) {
-            PollContextMenu(widgets, widgetVisible, widgetCount,
-                            focused, cachedTrueRoot_, cachedContentChild_,
-                            snapshot);
+        if (pollingAllowed && widgetCount > 0 && !snapshot->focusChanged) {
+            try {
+                PollContextMenu(widgets, widgetVisible, widgetCount,
+                                focused, cachedTrueRoot_, cachedContentChild_,
+                                snapshot);
+            } catch (...) {
+                BG3A_LOG("[BG3Access] PollContextMenu: C++ exception caught");
+            }
         }
 
         // ----- Tooltip polling (Examine panel, stat tooltips) -----
@@ -2182,6 +2238,8 @@ public:
         widgetDCDirty_ = false;
         widgetInpcDCAddr_ = 0;
         widgetInpcWidgetAddr_ = 0;
+        cachedWidgetDCTypes_.clear();
+        pollStableFrames_ = 0;
         settling_ = false;
         settleStableCount_ = 0;
         settleTotalCount_ = 0;
@@ -2390,13 +2448,15 @@ public:
                      dcTypeName ? dcTypeName : "(null)");
                 if (dcTypeName) {
                     data.dcType = dcTypeName;
-                    // Record this DC type in the all-types array so Lua
-                    // can check ALL widget types for routing, not just
-                    // the last one (which widgetData.dcType reflects).
-                    snapshot.widgetDCTypes.push_back(dcTypeName);
+                    // widgetDCTypes is populated by CollectWidgetDCTypes
+                    // (runs once per tick before widgetAdded callbacks).
+                    // No need to push here -- avoids duplicates.
 
+                    BG3A_LOG("[BG3Access]   EWD[1] CollectDCProperties");
                     CollectDCProperties(data, dataContext);
+                    BG3A_LOG("[BG3Access]   EWD[2] TryCollectSelectionFlyOutTitle");
                     TryCollectSelectionFlyOutTitle(data, dataContext);
+                    BG3A_LOG("[BG3Access]   EWD[3] TryCollectFinalResult");
                     TryCollectFinalResult(data, dataContext);
 
                     // NOTE: Actions collection enumeration via DynamicCast<IList*>
@@ -2405,38 +2465,27 @@ public:
 
                     // Subscribe widget DC INPC for property change tracking.
                     // Pass widget element for namedTexts collection on DC change.
+                    BG3A_LOG("[BG3Access]   EWD[4] SubscribeWidgetINPC");
                     SubscribeWidgetINPC(dataContext, frameworkElem);
                 }
             }
         }
 
-        // Extract binding metadata from the widget element's properties.
+        BG3A_LOG("[BG3Access]   EWD[5] ExtractBindingInfo");
         ExtractBindingInfo(data, frameworkElem);
 
         // Collect named TextBlock texts from the widget via NameScope lookup.
-        // Captures LocaString-bound titles/descriptions authored in XAML
-        // that are not accessible through the ViewModel DataContext.
-        // SEH guard at the call site as a last resort -- if an unexpected
-        // element crashes ReadTextBlockText, we lose NameScope texts for
-        // this widget but don't crash the game.
+        BG3A_LOG("[BG3Access]   EWD[6] TryCollectNamedTexts");
         TryCollectNamedTexts(frameworkElem, data.namedTexts);
+        BG3A_LOG("[BG3Access]   EWD[7] done");
 
-        // Loading hints: targeted extraction for ls.LoadingScreen.
-        // Skip if buffered tips were already injected into this snapshot
-        // by the deliverBufferedTips_ path in Tick() -- check for
-        // existing _loadingHint_ keys to avoid duplicate entries.
-        if (data.dcType.find("LoadingScreen") != std::string::npos) {
-            bool alreadyHasBufferedHints = false;
-            for (auto const& namedText : snapshot.widgetData.namedTexts) {
-                if (namedText.first.find("_loadingHint_") == 0) {
-                    alreadyHasBufferedHints = true;
-                    break;
-                }
-            }
-            if (!alreadyHasBufferedHints) {
-                CollectLoadingHints(frameworkElem, data.namedTexts);
-            }
-        }
+        // Loading hints are handled exclusively by the buffer path:
+        // BufferLoadingTips_SEH (safe-state polling) and
+        // CaptureLoadingHintFromINPC (INPC on VisibileHintIndex).
+        // Do NOT call CollectLoadingHints here -- ExtractWidgetData
+        // fires for the loading screen widget on every phase of the
+        // multi-phase boot sequence and on post-load Idle transitions,
+        // reading stale TextBlock Inlines that persist at Opacity=0.
     }
 
     // ----- Auto-INPC subscription (Phase 2) -----
@@ -2505,6 +2554,25 @@ public:
         // Batch per frame: just set dirty flag.  The tick fires ONE
         // WidgetDCChanged event instead of one per property change.
         widgetDCDirty_ = true;
+
+        // Loading tip capture: when VisibileHintIndex changes on an
+        // ls.LoadingScreen DC, set a flag so BufferLoadingTips_SEH
+        // (which runs only during safe states) reads the tip text.
+        //
+        // Do NOT walk the tree here.  This INPC callback fires from
+        // Noesis's property change processing, which can happen during
+        // dangerous states (LoadLevel, SwapLevel) when the loading
+        // thread is active.  GetRoot() / FindWidgetContainer() /
+        // GetVisualChild() can deadlock against the loading thread.
+        // SEH cannot catch deadlocks.
+        if (!tipsAlreadyDelivered_
+            && args.propertyName.Str()
+            && strcmp(args.propertyName.Str(), "VisibileHintIndex") == 0) {
+            // Just set the flag.  Do NOT log here -- this callback fires
+            // during dangerous states (LoadLevel, UnloadLevel) when the
+            // SE logging system may contend with the loading thread.
+            hintIndexChangedViaINPC_ = true;
+        }
     }
 
     // Focus/selection tracking.
@@ -2548,8 +2616,8 @@ public:
     // per frame, eliminating the multi-property-change event storm.
     bool inpcDirty_ = false;
     bool widgetDCDirty_ = false;
-    bool deliverBufferedTips_ = false;  // inject buffered loading tips on first tick
     bool tipsAlreadyDelivered_ = false; // blocks BufferLoadingTips after delivery until next suppress(true)
+    bool hintIndexChangedViaINPC_ = false; // set by OnWidgetINPCChanged, consumed by BufferLoadingTips_SEH
 
     // Widget container tracking (Strategy 4).
     // All stored as uintptr_t -- comparison only, never dereferenced.
@@ -2622,6 +2690,20 @@ public:
     bool selectionFiredDuringSettle_ = false;
 
     // (Accumulators removed -- snapshot is a local in Tick(), populated directly.)
+
+    // Polling stability counter: FindNameInWidgetScoped-based polling
+    // (context menu, radial, active search) is deferred until the widget
+    // set has been stable for 10 consecutive frames.  Resets on any
+    // widget set change.  This prevents deadlocks from BFS on partially-
+    // constructed widgets during the post-load transition without
+    // affecting the settle window (which would batch widgets and break
+    // radial/party menu ordering).
+    int pollStableFrames_ = 0;
+
+    // Cached widget DC type names.  Refreshed only when the widget set
+    // changes, avoiding per-tick Noesis DP reads that can deadlock
+    // against the rendering thread.
+    std::vector<std::string> cachedWidgetDCTypes_;
 
     // Subscribe SelectionChanged on visible widgets.  Skip already-subscribed.
     // Prunes dead entries first: any tracked widget NOT in the current set
@@ -4665,21 +4747,32 @@ static void BufferLoadingTips_Inner()
         if (dcTypeName && strstr(dcTypeName, "LoadingScreen")) {
             loadingWidget = static_cast<Noesis::FrameworkElement*>(widget);
 
-            // Read VisibileHintIndex from DC to detect tip changes.
-            auto dcClassType = SafeGetClassType_SEH(widgetDC);
-            if (!dcClassType) break;
-            auto const& cls = Noesis::gClassCache.GetClass(dcClassType);
-            bg3se::FixedString fsHintIndex("VisibileHintIndex");
-            auto hintIndexProp = cls.Names.try_get(fsHintIndex);
-            if (hintIndexProp && hintIndexProp->Property) {
-                auto indexStr = ReadTypePropertyAsString(
-                    widgetDC, hintIndexProp->Property);
-                int hintIndex = indexStr.empty() ? -1 : atoi(indexStr.c_str());
-                if (hintIndex < 0 || hintIndex == sLastBufferedHintIndex) {
-                    // No change or no visible hint.
-                    return;
+            // Check whether the hint index changed since the last read.
+            // Two sources: (1) direct read of VisibileHintIndex here
+            // during safe states, (2) the INPC flag set by
+            // OnWidgetINPCChanged during any state (including dangerous).
+            // The INPC flag bypasses the index dedup because INPC already
+            // confirmed the property changed.
+            bool hintChangedViaINPC =
+                GlobalFocusMonitor::Instance().ConsumeHintINPCFlag();
+            if (!hintChangedViaINPC) {
+                auto dcClassType = SafeGetClassType_SEH(widgetDC);
+                if (!dcClassType) break;
+                auto const& cls =
+                    Noesis::gClassCache.GetClass(dcClassType);
+                bg3se::FixedString fsHintIndex("VisibileHintIndex");
+                auto hintIndexProp = cls.Names.try_get(fsHintIndex);
+                if (hintIndexProp && hintIndexProp->Property) {
+                    auto indexStr = ReadTypePropertyAsString(
+                        widgetDC, hintIndexProp->Property);
+                    int hintIndex = indexStr.empty()
+                        ? -1 : atoi(indexStr.c_str());
+                    if (hintIndex < 0
+                        || hintIndex == sLastBufferedHintIndex) {
+                        return;
+                    }
+                    sLastBufferedHintIndex = hintIndex;
                 }
-                sLastBufferedHintIndex = hintIndex;
             }
             break;
         }
@@ -4692,10 +4785,19 @@ static void BufferLoadingTips_Inner()
     GlobalFocusMonitor::CollectLoadingHints(loadingWidget, hintTexts);
 
     for (auto& hint : hintTexts) {
-        // Dedup: don't buffer the same text twice.
+        // Dedup against both the pending buffer and the persistent
+        // delivered set.  Prevents re-buffering tips that were already
+        // spoken in a previous loading phase.
         bool duplicate = false;
         for (auto& existing : sBufferedLoadingTips) {
             if (existing == hint.second) { duplicate = true; break; }
+        }
+        if (!duplicate) {
+            for (auto& delivered : sDeliveredTipTexts) {
+                if (delivered == hint.second) {
+                    duplicate = true; break;
+                }
+            }
         }
         if (!duplicate) {
             BG3A_LOG("[BG3Access] Buffered loading tip: %s",
@@ -4743,6 +4845,7 @@ void TickGlobalFocusMonitor()
 
         // SAFE: loading thread is not yet active or already done.
         // The loading screen widget is stable, OK to read tips.
+        case ecl::GameState::LoadMenu:
         case ecl::GameState::StartLoading:
         case ecl::GameState::StopLoading:
         case ecl::GameState::StartServer:

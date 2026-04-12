@@ -184,9 +184,10 @@ static void PushFocusEventTable(lua_State* L, FocusEventData const& data)
     }
     lua_settable(L, -3);
 
-    // dcProps: flat table with scalar values + nested sub-tables
+    // dcProps: flat table with scalar values + nested sub-tables + collections
     lua_pushstring(L, "dcProps");
-    if (!data.dcScalarProps.empty() || !data.dcObjectProps.empty()) {
+    if (!data.dcScalarProps.empty() || !data.dcObjectProps.empty()
+        || !data.dcCollectionProps.empty()) {
         lua_newtable(L);
 
         // Scalar properties
@@ -212,6 +213,27 @@ static void PushFocusEventTable(lua_State* L, FocusEventData const& data)
             // Set as dcProps[propName]
             lua_pushstring(L, obj.propName.c_str());
             lua_insert(L, -2);  // swap key and nested table
+            lua_settable(L, -3);
+        }
+
+        // Collection properties (arrays of item sub-tables)
+        for (auto const& collectionProp : data.dcCollectionProps) {
+            lua_newtable(L);
+            int luaArrayIndex = 1;
+            for (auto const& collectionItem : collectionProp.items) {
+                lua_newtable(L);
+                lua_pushstring(L, "_type");
+                lua_pushstring(L, collectionItem.typeName.c_str());
+                lua_settable(L, -3);
+                for (auto const& kv : collectionItem.props) {
+                    lua_pushstring(L, kv.first.c_str());
+                    lua_pushstring(L, kv.second.c_str());
+                    lua_settable(L, -3);
+                }
+                lua_rawseti(L, -2, luaArrayIndex++);
+            }
+            lua_pushstring(L, collectionProp.propName.c_str());
+            lua_insert(L, -2);
             lua_settable(L, -3);
         }
     } else {

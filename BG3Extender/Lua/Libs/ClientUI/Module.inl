@@ -329,6 +329,46 @@ static Noesis::INotifyPropertyChanged* SafeDynamicCastINPC_SEH(
     }
 }
 
+// Forward declaration for SEH-safe INPC subscription helpers below.
+// __single_inheritance tells MSVC to use a compact member function pointer
+// (8 bytes) instead of the 16-byte "most general" representation it uses
+// for incomplete types.  Noesis::Delegate's internal buffer is sized for
+// single-inheritance pointers and static_asserts on overflow.
+class __single_inheritance GlobalFocusMonitor;
+
+// SEH-safe INPC subscription.  PropertyChanged().Add() mutates the DC
+// object's internal delegate list.  If the DC VM is partially constructed
+// (e.g., ActiveRoll during widget setup), the delegate list may be in an
+// inconsistent state.  An unguarded Add() can corrupt the heap or trigger
+// a CRT debug assertion (abort), both of which bypass the top-level SEH.
+//
+// Inner function: MakeDelegate creates a temporary with a destructor,
+// preventing __try in the same scope.
+static void SubscribeINPC_Inner(
+    Noesis::INotifyPropertyChanged* notifies,
+    GlobalFocusMonitor* monitor,
+    void (GlobalFocusMonitor::*handler)(Noesis::BaseComponent*,
+        const Noesis::PropertyChangedEventArgs&))
+{
+    notifies->PropertyChanged().Add(
+        Noesis::MakeDelegate(monitor, handler));
+}
+
+static bool SafeSubscribeINPC_SEH(
+    Noesis::INotifyPropertyChanged* notifies,
+    GlobalFocusMonitor* monitor,
+    void (GlobalFocusMonitor::*handler)(Noesis::BaseComponent*,
+        const Noesis::PropertyChangedEventArgs&))
+{
+    __try {
+        SubscribeINPC_Inner(notifies, monitor, handler);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        BG3A_LOG("[BG3Access] INPC subscribe faulted -- DC partially constructed?");
+        return false;
+    }
+}
+
 // TypeProperty::Get() on an object.  Returns raw void* or nullptr on fault.
 static const void* SafeTypePropertyGet_SEH(
     Noesis::TypeProperty const* prop, Noesis::BaseObject const* obj)
@@ -418,6 +458,7 @@ static Noesis::BaseComponent* SafeCollectionGetItem_SEH(
 
 // Forward declarations for post-processors defined after CollectDCProperties.
 static void TryCollectSelectionFlyOutTitle(FocusEventData& out, Noesis::BaseObject* dc);
+static void TryCollectFinalResult(FocusEventData& out, Noesis::BaseObject* dataContext);
 
 // Handler for Selector.SelectionChanged routed events.  Uses the
 // DummyDelegate pattern (same as UIEventHooks): 'this' is a fake pointer
@@ -624,6 +665,41 @@ static const Noesis::DependencyProperty* LookupIsHighlightedDP(
         classType, bg3se::FixedString("IsHighlighted"));
 }
 
+// Inner: looks up FinalResult DP.  FixedString has a destructor so
+// this function cannot contain __try (MSVC C2712).
+static const Noesis::DependencyProperty* LookupFinalResultDP_Inner(
+    Noesis::TypeClass const* classType)
+{
+    return Noesis::TypeHelpers::GetDependencyProperty(
+        classType, bg3se::FixedString("FinalResult"));
+}
+
+// SEH wrapper: classType may be stale.
+static const Noesis::DependencyProperty* LookupFinalResultDP(
+    Noesis::TypeClass const* classType)
+{
+    __try {
+        return LookupFinalResultDP_Inner(classType);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+// Read FinalResult int32 DP from a DCActiveRoll DataContext.
+// Returns -1 on failure (FinalResult is always >= 0 for valid rolls).
+static int32_t ReadFinalResult_SEH(
+    Noesis::DependencyObject const* depObj,
+    Noesis::DependencyProperty const* finalResultDP)
+{
+    __try {
+        auto dpValue = finalResultDP->GetValue(depObj);
+        if (!dpValue) return -1;
+        return *static_cast<int32_t const*>(dpValue);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
 
 // Read a bool DP value.  Returns false on null or fault.
 static bool SafeReadBoolDP_SEH(
@@ -801,21 +877,19 @@ public:
     // calling Noesis virtual functions while the loading thread
     // constructs/destroys UI objects under a Noesis internal mutex.
     //
-    // Grace period: the first ~20 frames after suppress starts are
-    // allowed so the initial widget scan can fire (at frame 10) and
-    // collect loading tips.  Hangs occur later in loading when Noesis
-    // rebuilds the widget tree, not during the initial tip display.
+    // Suppresses from frame 1 -- no grace period.  Loading tips are
+    // read from dcProps.LoadingHints (ObservableCollection) after
+    // loading completes, eliminating the need for Noesis reads during
+    // loading.  The splash screen appears only on initial startup
+    // when no loading thread is active.
     void SetSuppressTick(bool suppress) {
         suppressTick_ = suppress;
-        if (suppress) {
-            initialScanFiredDuringSuppress_ = false;
-        }
     }
 
     void Tick()
     {
         if (!callback_) return;
-        if (suppressTick_ && initialScanFiredDuringSuppress_) return;
+        if (suppressTick_) return;
 
         // Decrement INPC cooldown each tick.
         if (inpcCooldown_ > 0) inpcCooldown_--;
@@ -1445,7 +1519,6 @@ public:
             initialWidgetScanDelay_++;
             if (initialWidgetScanDelay_ == 10) {
                 BG3A_LOG("[BG3Access] Initial widget scan (%u widgets)", widgetCount);
-                if (suppressTick_) initialScanFiredDuringSuppress_ = true;
 
                 for (int i = (int)widgetCount - 1; i >= 0; i--) {
                     if (!widgets[i]) continue;
@@ -2160,6 +2233,7 @@ private:
 
                     CollectDCProperties(data, dataContext);
                     TryCollectSelectionFlyOutTitle(data, dataContext);
+                    TryCollectFinalResult(data, dataContext);
 
                     // NOTE: Actions collection enumeration via DynamicCast<IList*>
                     // crashes the Noesis Indie SDK type registry.  Dialog button
@@ -2199,8 +2273,8 @@ private:
         // Fire-and-forget: subscribe and let Noesis manage the lifetime.
         // The delegate may fire redundantly if we subscribe twice on the
         // same object, but that just sets inpcDirty_ = true again (idempotent).
-        notifies->PropertyChanged().Add(
-            Noesis::MakeDelegate(this, &GlobalFocusMonitor::OnINPCChanged));
+        SafeSubscribeINPC_SEH(notifies, this,
+            &GlobalFocusMonitor::OnINPCChanged);
     }
 
     // UnsubscribeINPC removed -- fire-and-forget pattern means there is
@@ -2237,8 +2311,8 @@ private:
         widgetInpcDCAddr_ = dcAddr;
         widgetInpcWidgetAddr_ = reinterpret_cast<uintptr_t>(widgetElem);
 
-        notifies->PropertyChanged().Add(
-            Noesis::MakeDelegate(this, &GlobalFocusMonitor::OnWidgetINPCChanged));
+        SafeSubscribeINPC_SEH(notifies, this,
+            &GlobalFocusMonitor::OnWidgetINPCChanged);
     }
 
     // UnsubscribeWidgetINPC removed -- fire-and-forget pattern.
@@ -2322,7 +2396,6 @@ private:
     bool postSettle_ = false;           // true on the ONE tick after settle expires
     bool hadFocusBefore_ = false;       // true once any focus/selection was found
     bool suppressTick_ = false;         // skip all Noesis calls during loading
-    bool initialScanFiredDuringSuppress_ = false;  // initial scan ran, safe to stop
     int inpcCooldown_ = 0;              // ticks since last focus/selection dispatch; suppresses stray INPC echoes
     int initialWidgetScanDelay_ = 0;      // stability counter for pre-focus scan
     uint32_t lastScanWidgetCount_ = 0;   // fingerprint: widget count at last scan
@@ -5509,16 +5582,97 @@ static void TryCollectSelectionFlyOutTitle(
     item->Release();
 }
 
+// ---------------------------------------------------------------------------
+// TryCollectFinalResult: reads FinalResult DependencyProperty from
+// DCActiveRoll DataContext.  FinalResult is a DP (used in XAML
+// DataTriggers for crit detection) but NOT a TypeProperty, so
+// CollectDCProperties misses it.  Contains the final rolled number.
+// ---------------------------------------------------------------------------
+static void TryCollectFinalResult_Inner(
+    FocusEventData& out, Noesis::BaseObject* dataContext)
+{
+    if (out.dcType.find("DCActiveRoll") == std::string::npos) return;
+
+    auto dcClassType = SafeGetClassType_SEH(dataContext);
+    if (!dcClassType) return;
+
+    auto finalResultDP = LookupFinalResultDP(dcClassType);
+    if (!finalResultDP) return;
+
+    auto depObj = static_cast<Noesis::DependencyObject const*>(
+        static_cast<Noesis::BaseComponent const*>(dataContext));
+    int32_t finalResult = ReadFinalResult_SEH(depObj, finalResultDP);
+    if (finalResult < 0) return;
+
+    char resultBuffer[16];
+    snprintf(resultBuffer, sizeof(resultBuffer), "%d", finalResult);
+    out.dcScalarProps.emplace_back("FinalResult", std::string(resultBuffer));
+}
+
+static void TryCollectFinalResult(
+    FocusEventData& out, Noesis::BaseObject* dataContext)
+{
+    __try {
+        TryCollectFinalResult_Inner(out, dataContext);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // FinalResult unavailable -- non-fatal.
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TryReadFinalResultDP: Lua-table version of TryCollectFinalResult.
+// Pushes FinalResult into the dcProps table on the Lua stack.
+// Called as post-processing after PushDCProperties.
+// ---------------------------------------------------------------------------
+static void TryReadFinalResultDP_Inner(
+    Noesis::BaseObject* dataContext, lua_State* L, int dcPropsTableIndex)
+{
+    auto dcTypeName = SafeBaseObjectTypeName_SEH(dataContext);
+    if (!dcTypeName || !strstr(dcTypeName, "DCActiveRoll")) return;
+
+    auto dcClassType = SafeGetClassType_SEH(dataContext);
+    if (!dcClassType) return;
+
+    auto finalResultDP = LookupFinalResultDP(dcClassType);
+    if (!finalResultDP) return;
+
+    auto depObj = static_cast<Noesis::DependencyObject const*>(
+        static_cast<Noesis::BaseComponent const*>(dataContext));
+    int32_t finalResult = ReadFinalResult_SEH(depObj, finalResultDP);
+    if (finalResult < 0) return;
+
+    char resultBuffer[16];
+    snprintf(resultBuffer, sizeof(resultBuffer), "%d", finalResult);
+    lua_pushstring(L, "FinalResult");
+    lua_pushstring(L, resultBuffer);
+    lua_settable(L, dcPropsTableIndex);
+}
+
+static void TryReadFinalResultDP(
+    Noesis::BaseObject* dataContext, lua_State* L, int dcPropsTableIndex)
+{
+    __try {
+        TryReadFinalResultDP_Inner(dataContext, L, dcPropsTableIndex);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // FinalResult unavailable -- non-fatal.
+    }
+}
+
 // Lua-table version: pushes SelectedBonusAbility into dcProps table.
 // Called from ExtractElementInfo path (Lua API calls).
 // Read the selected ability name from BonusAbilities[SelectedIndex].
 // Uses TypeProperty::GetComponent to properly unwrap Ptr<> wrappers.
 // No SEH needed -- GetComponent and Count are safe when called on
 // valid TypeProperties from the class cache.
+// Uses SafeGetComponent_SEH and SafeCollectionGetItem_SEH for all
+// collection access (GetComponent returns Ptr<> with destructor,
+// preventing __try in the calling function).
 static void TryReadSelectedBonusAbility(
     Noesis::BaseObject* dc, lua_State* L, int dcPropsIdx)
 {
-    auto const& cls = Noesis::gClassCache.GetClass(dc->GetClassType());
+    auto dcClassType = SafeGetClassType_SEH(dc);
+    if (!dcClassType) return;
+    auto const& cls = Noesis::gClassCache.GetClass(dcClassType);
 
     Noesis::TypeProperty const* bonusProp = nullptr;
     Noesis::TypeProperty const* indexProp = nullptr;
@@ -5539,22 +5693,29 @@ static void TryReadSelectedBonusAbility(
     int32_t selectedIndex = atoi(indexVal.c_str());
     if (selectedIndex < 0) return;
 
-    // Get the collection via GetComponent (handles Ptr<> unwrapping).
-    auto collectionComponent = bonusProp->GetComponent(dc);
-    auto collectionRaw = collectionComponent.GetPtr();
+    // Get the collection via SafeGetComponent_SEH (SEH-guarded).
+    auto collectionRaw = SafeGetComponent_SEH(bonusProp, dc);
     if (!collectionRaw) return;
 
     auto collection = static_cast<Noesis::BaseCollection*>(collectionRaw);
     int count = SafeCollectionCount(collection);
-    if (selectedIndex >= count) return;
+    if (selectedIndex >= count) {
+        collectionRaw->Release();
+        return;
+    }
 
-    // Get the selected item.
-    auto itemPtr = collection->GetComponent((uint32_t)selectedIndex);
-    auto item = itemPtr.GetPtr();
+    // Get the selected item via SafeCollectionGetItem_SEH (SEH-guarded).
+    auto item = SafeCollectionGetItem_SEH(collection, (uint32_t)selectedIndex);
+    collectionRaw->Release();
     if (!item) return;
 
     // Read Ability TypeProperty from the item.
-    auto const& itemCls = Noesis::gClassCache.GetClass(item->GetClassType());
+    auto itemClassType = SafeGetClassType_SEH(item);
+    if (!itemClassType) {
+        item->Release();
+        return;
+    }
+    auto const& itemCls = Noesis::gClassCache.GetClass(itemClassType);
     for (auto& entry : itemCls.Names) {
         if (!entry.Value().Property) continue;
         if (strcmp(entry.Key().GetString(), "Ability") != 0) continue;
@@ -5566,9 +5727,11 @@ static void TryReadSelectedBonusAbility(
             lua_pushstring(L, "SelectedBonusAbility");
             lua_pushstring(L, abilityVal.c_str());
             lua_settable(L, dcPropsIdx);
+            item->Release();
             return;
         }
     }
+    item->Release();
 }
 
 
@@ -5658,14 +5821,88 @@ static void PushDCProperties(lua_State* L, Noesis::BaseObject* dc)
             }
 
             if (subObj) {
-                // Read scalar sub-properties from the sub-object.
-                auto const& subCls = Noesis::gClassCache.GetClass(subObj->GetClassType());
+                auto subClassType = subObj->GetClassType();
+                if (!subClassType) continue;
+
+                // Collection types: enumerate items as an indexed array
+                // of sub-tables.  Each item gets its own table with _type
+                // and scalar properties.
+                if (Noesis::TypeHelpers::IsDescendantOf(
+                        subClassType, classes.BaseCollection.Type)) {
+                    auto collection = static_cast<Noesis::BaseCollection*>(subObj);
+                    int itemCount = SafeCollectionCount(collection);
+                    if (itemCount > 0) {
+                        lua_newtable(L);
+                        int luaArrayIndex = 1;
+                        int itemLimit = (itemCount > 20) ? 20 : itemCount;
+                        for (int itemIndex = 0; itemIndex < itemLimit; itemIndex++) {
+                            auto collectionItem = SafeCollectionGetItem_SEH(
+                                collection, static_cast<uint32_t>(itemIndex));
+                            if (!collectionItem) continue;
+                            auto itemClassType = SafeGetClassType_SEH(collectionItem);
+                            if (!itemClassType) {
+                                collectionItem->Release();
+                                continue;
+                            }
+                            lua_newtable(L);
+                            lua_pushstring(L, "_type");
+                            lua_pushstring(L, itemClassType->GetName());
+                            lua_settable(L, -3);
+                            bool hasItemProps = false;
+                            auto const& itemClass =
+                                Noesis::gClassCache.GetClass(itemClassType);
+                            for (auto& itemEntry : itemClass.Names) {
+                                if (!itemEntry.Value().Property) continue;
+                                auto itemType = UnwrapType(
+                                    itemEntry.Value().Property->GetContentType());
+                                if (!itemType) continue;
+                                if (itemType == types.String.Type
+                                    || itemType == types.CStringPtr.Type
+                                    || itemType == types.LocaString.Type
+                                    || itemType == types.Bool.Type
+                                    || itemType == types.Int32.Type
+                                    || itemType == types.UInt32.Type
+                                    || itemType == types.Single.Type) {
+                                    auto itemValue = ReadTypePropertyAsString(
+                                        static_cast<Noesis::BaseObject*>(
+                                            collectionItem),
+                                        itemEntry.Value().Property);
+                                    if (!itemValue.empty()
+                                        && itemValue.find("[ForceUpdate]") ==
+                                               std::string::npos) {
+                                        lua_pushstring(L,
+                                            itemEntry.Key().GetString());
+                                        lua_pushstring(L, itemValue.c_str());
+                                        lua_settable(L, -3);
+                                        hasItemProps = true;
+                                    }
+                                }
+                            }
+                            collectionItem->Release();
+                            if (hasItemProps) {
+                                lua_rawseti(L, -2, luaArrayIndex++);
+                            } else {
+                                lua_pop(L, 1);
+                            }
+                        }
+                        if (luaArrayIndex > 1) {
+                            lua_pushstring(L, entry.Key().GetString());
+                            lua_insert(L, -2);
+                            lua_settable(L, -3);
+                        } else {
+                            lua_pop(L, 1);
+                        }
+                    }
+                    continue;
+                }
+
+                // Regular sub-object: read scalar sub-properties.
+                auto const& subCls = Noesis::gClassCache.GetClass(subClassType);
                 lua_newtable(L);
                 bool hasAny = false;
 
-                // Add the sub-object's type name.
                 lua_pushstring(L, "_type");
-                lua_pushstring(L, subObj->GetClassType()->GetName());
+                lua_pushstring(L, subClassType->GetName());
                 lua_settable(L, -3);
 
                 for (auto& subEntry : subCls.Names) {
@@ -5689,8 +5926,6 @@ static void PushDCProperties(lua_State* L, Noesis::BaseObject* dc)
                         }
                     }
                 }
-
-
 
                 if (hasAny) {
                     lua_pushstring(L, entry.Key().GetString());
@@ -5950,6 +6185,7 @@ static void ExtractElementInfo_Inner(lua_State* L, Noesis::FrameworkElement* ele
             // BonusAbilities collection isn't handled by the generic sub-object
             // path (its TypeProperty type isn't recognized as a pointer).
             TryReadSelectedBonusAbility(dataContext, L, lua_gettop(L));
+            TryReadFinalResultDP(dataContext, L, lua_gettop(L));
         }
     } else {
         lua_pushnil(L);
@@ -6108,6 +6344,68 @@ static void CollectDCProperties_Inner(FocusEventData& out, Noesis::BaseObject* d
             if (subObj) {
                 auto subClassType = SafeGetClassType_SEH(subObj);
                 if (!subClassType) continue;
+
+                // Collection types: enumerate items instead of reading
+                // the collection object's own TypeProperties.
+                // Produces dcCollectionProps[propName] = array of item
+                // sub-tables, each with their own scalar properties.
+                if (Noesis::TypeHelpers::IsDescendantOf(
+                        subClassType,
+                        Noesis::gStaticSymbols.TypeClasses.BaseCollection.Type)) {
+                    auto collection = static_cast<Noesis::BaseCollection*>(subObj);
+                    int itemCount = SafeCollectionCount(collection);
+                    if (itemCount > 0) {
+                        FocusEventData::CollectionProperty collectionProp;
+                        collectionProp.propName = entry.Key().GetString();
+                        int itemLimit = (itemCount > 20) ? 20 : itemCount;
+                        for (int itemIndex = 0; itemIndex < itemLimit; itemIndex++) {
+                            auto collectionItem = SafeCollectionGetItem_SEH(
+                                collection, static_cast<uint32_t>(itemIndex));
+                            if (!collectionItem) continue;
+                            auto itemClassType = SafeGetClassType_SEH(collectionItem);
+                            if (!itemClassType) {
+                                collectionItem->Release();
+                                continue;
+                            }
+                            FocusEventData::CollectionItem itemData;
+                            itemData.typeName = itemClassType->GetName();
+                            auto const& itemClass = Noesis::gClassCache.GetClass(itemClassType);
+                            for (auto& itemEntry : itemClass.Names) {
+                                if (!itemEntry.Value().Property) continue;
+                                auto itemType = UnwrapType(
+                                    itemEntry.Value().Property->GetContentType());
+                                if (!itemType) continue;
+                                if (itemType == types.String.Type
+                                    || itemType == types.CStringPtr.Type
+                                    || itemType == types.LocaString.Type
+                                    || itemType == types.Bool.Type
+                                    || itemType == types.Int32.Type
+                                    || itemType == types.UInt32.Type
+                                    || itemType == types.Single.Type) {
+                                    auto itemValue = ReadTypePropertyAsString(
+                                        static_cast<Noesis::BaseObject*>(collectionItem),
+                                        itemEntry.Value().Property);
+                                    if (!itemValue.empty()
+                                        && itemValue.find("[ForceUpdate]") == std::string::npos) {
+                                        itemData.props.emplace_back(
+                                            itemEntry.Key().GetString(),
+                                            std::move(itemValue));
+                                    }
+                                }
+                            }
+                            collectionItem->Release();
+                            if (!itemData.props.empty()) {
+                                collectionProp.items.push_back(std::move(itemData));
+                            }
+                        }
+                        if (!collectionProp.items.empty()) {
+                            out.dcCollectionProps.push_back(std::move(collectionProp));
+                        }
+                    }
+                    continue;
+                }
+
+                // Regular sub-object: read scalar sub-properties.
                 auto const& subCls = Noesis::gClassCache.GetClass(subClassType);
                 FocusEventData::SubObject subData;
                 subData.propName = entry.Key().GetString();
@@ -6356,6 +6654,10 @@ static void ExtractElementData_Inner(FocusEventData& out, Noesis::FrameworkEleme
         // Post-process: read ObjectCollectionList[0].Title for
         // DCSelectionFlyOut.  Adds CollectionTitle to dcScalarProps.
         TryCollectSelectionFlyOutTitle(out, dataContext);
+        // Post-process: read FinalResult DP from DCActiveRoll.
+        // FinalResult is a DP, not a TypeProperty, so CollectDCProperties
+        // misses it.  Contains the final rolled number.
+        TryCollectFinalResult(out, dataContext);
     }
 
     // TemplatedParent Tag: in DataTemplate-hosted elements (e.g. Examine
@@ -6534,26 +6836,32 @@ static void ExtractElementData(FocusEventData& out, Noesis::FrameworkElement* el
 // ---------------------------------------------------------------------------
 UserReturn GetFocusedElementInfo(lua_State* L)
 {
-    auto root = GetRoot();
-    if (!root) {
-        lua_pushnil(L);
-        return 1;
-    }
-
-    InitFocusProperties(root);
-
-    // Use the same multi-strategy focus detection as GetFocusedElement.
+    // Find the focused element using all three strategies.
+    // Wrapped in __try because this is a Lua API (MODULE_FUNCTION)
+    // called from outside TickGlobalFocusMonitor's top-level SEH.
     Noesis::UIElement* focused = nullptr;
+    __try {
+        auto root = GetRoot();
+        if (!root) {
+            lua_pushnil(L);
+            return 1;
+        }
 
-    // Strategy 1: FocusManager.FocusedElement
-    focused = TryFocusManager(root, GlobalFocusMonitor::kMaxTreeDepth);
-    if (!focused && (sIsFocusedProp || sLSMoveFocusIsFocusedProp)) {
-        // Strategy 2: IsFocused tree walk
-        focused = FindFocusedInTree(root, GlobalFocusMonitor::kMaxTreeDepth);
-    }
-    if (!focused && sIsSelectedProp && sListBoxItemType) {
-        // Strategy 3: IsSelected tree walk
-        focused = FindSelectedTabInTree(root, GlobalFocusMonitor::kMaxTreeDepth);
+        InitFocusProperties(root);
+
+        // Strategy 1: FocusManager.FocusedElement
+        focused = TryFocusManager(root, GlobalFocusMonitor::kMaxTreeDepth);
+        if (!focused && (sIsFocusedProp || sLSMoveFocusIsFocusedProp)) {
+            // Strategy 2: IsFocused tree walk
+            focused = FindFocusedInTree(root, GlobalFocusMonitor::kMaxTreeDepth);
+        }
+        if (!focused && sIsSelectedProp && sListBoxItemType) {
+            // Strategy 3: IsSelected tree walk
+            focused = FindSelectedTabInTree(root, GlobalFocusMonitor::kMaxTreeDepth);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        BG3A_LOG("[BG3Access] GetFocusedElementInfo: SEH fault in focus detection");
+        focused = nullptr;
     }
 
     if (!focused) {
@@ -6561,7 +6869,8 @@ UserReturn GetFocusedElementInfo(lua_State* L)
         return 1;
     }
 
-    // All visual tree elements are FrameworkElements.
+    // ExtractElementInfo uses std::string internally (inner/outer SEH
+    // inside ExtractElementInfo itself handles faults there).
     auto focusedElem = static_cast<Noesis::FrameworkElement*>(focused);
     ExtractElementInfo(L, focusedElem);
     return 1;

@@ -46,6 +46,21 @@ struct FocusEventData
     };
     std::vector<SubObject> dcObjectProps;
 
+    // DC collection properties: when a TypeProperty points to a
+    // BaseCollection, enumerate its items and read their scalar props.
+    // Produces an indexed array of sub-tables in Lua (dcProps.PropName[1], etc.)
+    struct CollectionItem
+    {
+        std::string typeName;   // item class type name
+        std::vector<std::pair<std::string, std::string>> props;
+    };
+    struct CollectionProperty
+    {
+        std::string propName;   // collection property name on parent DC
+        std::vector<CollectionItem> items;
+    };
+    std::vector<CollectionProperty> dcCollectionProps;
+
     // Element's own text (TextBlock text, Content, ToString)
     std::string elemText;
 

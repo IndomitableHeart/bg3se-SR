@@ -2187,6 +2187,127 @@ private:
         }
     }
 
+    // -----------------------------------------------------------------
+    // CollectLoadingHints: targeted extraction of loading tip text from
+    // the LoadingHints ItemsControl inside an ls.LoadingScreen widget.
+    //
+    // The XAML structure is:
+    //   widget root -> ... -> ItemsControl "LoadingHints"
+    //     -> ItemsPresenter -> Grid -> ContentPresenter -> TextBlock
+    //
+    // Each TextBlock's Inlines contain the resolved translation text
+    // (populated by CtxTransStringRunGeneratorBehavior at template time).
+    // TextBlocks have Opacity=0 after loading but their text persists.
+    //
+    // Uses BFS to find the ItemsControl by Name, then walks its visual
+    // children to find TextBlocks.  All operations use SEH helpers.
+    // -----------------------------------------------------------------
+
+    // Inner: uses std::string from ReadTextBlockText (has destructor).
+    static void CollectLoadingHints_Inner(
+        Noesis::FrameworkElement* widgetRoot,
+        std::vector<std::pair<std::string, std::string>>& outTexts)
+    {
+        // BFS to find "LoadingHints" ItemsControl (within 6 levels).
+        Noesis::Visual* queue[128];
+        int queueFront = 0, queueBack = 0;
+        queue[queueBack++] = widgetRoot;
+
+        Noesis::FrameworkElement* hintsControl = nullptr;
+        int nodesVisited = 0;
+
+        while (queueFront < queueBack && nodesVisited < 128) {
+            auto node = queue[queueFront++];
+            nodesVisited++;
+            if (!node) continue;
+            if (!ProbeUIElement(static_cast<Noesis::UIElement*>(node)))
+                continue;
+
+            // Check Name property for "LoadingHints".
+            auto nodeFramework = static_cast<Noesis::FrameworkElement*>(node);
+            auto nodeName = ReadPropertyAsString(nodeFramework, "Name");
+            if (nodeName == "LoadingHints") {
+                hintsControl = nodeFramework;
+                break;
+            }
+
+            // Enqueue children (bounded depth via node limit).
+            auto childCount = SafeGetVisualChildrenCount_SEH(node);
+            for (uint32_t childIndex = 0;
+                 childIndex < childCount && queueBack < 128;
+                 childIndex++) {
+                auto child = SafeGetVisualChild_SEH(node, childIndex);
+                if (child) queue[queueBack++] = child;
+            }
+        }
+
+        if (!hintsControl) {
+            BG3A_LOG("[BG3Access] CollectLoadingHints: LoadingHints element not found");
+            return;
+        }
+
+        BG3A_LOG("[BG3Access] CollectLoadingHints: found LoadingHints at %p",
+                 hintsControl);
+
+        // Walk the ItemsControl's visual subtree for TextBlocks.
+        // The structure is: ItemsPresenter -> Grid -> ContentPresenter -> TextBlock.
+        // BFS again, bounded to 64 nodes (ItemsControl subtree is small).
+        Noesis::Visual* textQueue[64];
+        int textFront = 0, textBack = 0;
+        textQueue[textBack++] = hintsControl;
+
+        int hintIndex = 0;
+        while (textFront < textBack && hintIndex < 20) {
+            auto textNode = textQueue[textFront++];
+            if (!textNode) continue;
+            if (!ProbeUIElement(static_cast<Noesis::UIElement*>(textNode)))
+                continue;
+
+            auto typeName = SafeBaseObjectTypeName_SEH(textNode);
+            if (typeName && strstr(typeName, "TextBlock")) {
+                auto text = ReadTextBlockText(
+                    static_cast<Noesis::FrameworkElement*>(textNode));
+                if (!text.empty()
+                    && text.find("[ForceUpdate]") == std::string::npos
+                    && text.find("s_HandleUnknown") == std::string::npos) {
+                    hintIndex++;
+                    std::string key = "_loadingHint_"
+                        + std::to_string(hintIndex);
+                    outTexts.push_back(
+                        {std::move(key), std::move(text)});
+                    BG3A_LOG("[BG3Access]   Loading hint %d: %s",
+                             hintIndex,
+                             outTexts.back().second.c_str());
+                }
+                continue;  // Don't recurse into TextBlock children.
+            }
+
+            auto childCount = SafeGetVisualChildrenCount_SEH(textNode);
+            for (uint32_t childIndex = 0;
+                 childIndex < childCount && textBack < 64;
+                 childIndex++) {
+                auto child = SafeGetVisualChild_SEH(textNode, childIndex);
+                if (child) textQueue[textBack++] = child;
+            }
+        }
+
+        BG3A_LOG("[BG3Access] CollectLoadingHints: found %d hints", hintIndex);
+    }
+
+    // SEH wrapper: outTexts reference is a pointer (no destructor in
+    // this frame).  Inner function's std::string locals are abandoned
+    // on fault (minor leak, non-fatal).
+    static void CollectLoadingHints(
+        Noesis::FrameworkElement* widgetRoot,
+        std::vector<std::pair<std::string, std::string>>& outTexts)
+    {
+        __try {
+            CollectLoadingHints_Inner(widgetRoot, outTexts);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            BG3A_LOG("[BG3Access] CollectLoadingHints: SEH fault");
+        }
+    }
+
     // Fire a WIDGET event: extract data from the widget and push as a
     // data table (no Noesis elements cross to Lua).  Phase 3 replacement
     // for the old OnPropertyChanged path.
@@ -2256,6 +2377,16 @@ private:
         // element crashes ReadTextBlockText, we lose NameScope texts for
         // this widget but don't crash the game.
         TryCollectNamedTexts(frameworkElem, data.namedTexts);
+
+        // Loading hints: targeted extraction for ls.LoadingScreen.
+        // The LoadingHints ItemsControl contains TextBlocks whose Inlines
+        // hold the resolved translation text (CtxTransStringRunGenerator
+        // populates them at template instantiation).  TextBlocks persist
+        // with Opacity=0 after loading completes, so their text is
+        // readable even though they're visually invisible.
+        if (data.dcType.find("LoadingScreen") != std::string::npos) {
+            CollectLoadingHints(frameworkElem, data.namedTexts);
+        }
     }
 
     // ----- Auto-INPC subscription (Phase 2) -----

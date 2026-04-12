@@ -172,6 +172,9 @@ static bool PollContextMenu_Unsafe(
 // Text extraction (std::string) happens in the caller, outside SEH.
 static uint32_t GatherWidgets_SEH(Noesis::Visual* container,
     Noesis::Visual** outWidgets, bool* outVisible, uint32_t maxWidgets);
+static void CollectWidgetDCTypes_SEH(
+    Noesis::Visual* const* widgets, bool const* widgetVisible,
+    uint32_t widgetCount, std::vector<std::string>& outDCTypes);
 static uintptr_t ReadDCAddress_SEH(Noesis::UIElement* elem);
 static Noesis::UIElement* FindFocusedElement_SEH(
     Noesis::Visual** widgets, bool* widgetVisible, uint32_t widgetCount,
@@ -1397,6 +1400,16 @@ public:
             }
 
         }
+        // ----- Per-tick widgetDCTypes collection -----
+        // Populate widgetDCTypes with ALL visible widget DC types so
+        // Lua's panel close detection always knows what panels are
+        // present.  Only ExtractWidgetData populated this before, so
+        // on normal ticks (no widget events) it was empty, causing
+        // false panel deactivation.
+        CollectWidgetDCTypes_SEH(
+            widgets, widgetVisible, widgetCount,
+            snapshot->widgetDCTypes);
+
         bool wasPostSettle = postSettle_;
         postSettle_ = false;
 
@@ -3723,6 +3736,51 @@ static uint32_t GatherWidgets_SEH(
             outVisible[i] = false;
         }
         return 0;
+    }
+}
+
+// CollectWidgetDCTypes: reads DC type names from all visible widgets.
+// Populates widgetDCTypes so Lua's panel close detection always knows
+// which panels are present.  Inner/Invoke/SEH pattern because
+// std::vector<std::string> has destructors.
+static void CollectWidgetDCTypes_Inner(
+    Noesis::Visual* const* widgets, bool const* widgetVisible,
+    uint32_t widgetCount, std::vector<std::string>& outDCTypes)
+{
+    for (uint32_t widgetIndex = 0;
+         widgetIndex < widgetCount; widgetIndex++) {
+        if (!widgets[widgetIndex]
+            || !widgetVisible[widgetIndex]) continue;
+        if (!ProbeUIElement(static_cast<Noesis::UIElement*>(
+                const_cast<Noesis::Visual*>(
+                    widgets[widgetIndex])))) continue;
+        auto widgetDC = SafeReadDC_SEH(
+            static_cast<Noesis::DependencyObject const*>(
+                static_cast<Noesis::FrameworkElement*>(
+                    const_cast<Noesis::Visual*>(
+                        widgets[widgetIndex]))));
+        if (!widgetDC) continue;
+        auto widgetDCTypeName =
+            SafeBaseObjectTypeName_SEH(widgetDC);
+        if (widgetDCTypeName) {
+            outDCTypes.push_back(widgetDCTypeName);
+        }
+    }
+}
+static void CollectWidgetDCTypes_Invoke(
+    Noesis::Visual* const* widgets, bool const* widgetVisible,
+    uint32_t widgetCount, std::vector<std::string>* outDCTypes) {
+    CollectWidgetDCTypes_Inner(
+        widgets, widgetVisible, widgetCount, *outDCTypes);
+}
+static void CollectWidgetDCTypes_SEH(
+    Noesis::Visual* const* widgets, bool const* widgetVisible,
+    uint32_t widgetCount, std::vector<std::string>& outDCTypes) {
+    __try {
+        CollectWidgetDCTypes_Invoke(
+            widgets, widgetVisible, widgetCount, &outDCTypes);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        BG3A_LOG("[BG3Access] CollectWidgetDCTypes_SEH: fault");
     }
 }
 

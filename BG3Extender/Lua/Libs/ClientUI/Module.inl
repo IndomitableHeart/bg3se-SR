@@ -145,6 +145,12 @@ static bool IsVisibleDP(Noesis::Visual const* elem);
 static bool IsUIWidgetType(Noesis::Visual const* elem);
 static Noesis::Visual* FindWidgetContainer(Noesis::Visual* root);
 
+// Loading tip buffer: persists across Lua VM resets.  Read during
+// loading states by BufferLoadingTips, delivered on first tick after
+// Lua VM reconnects.  Cleared by SetSuppressTick on each new load.
+static std::vector<std::string> sBufferedLoadingTips;
+static int sLastBufferedHintIndex = -2;  // -2 = uninitialized
+
 // Forward declarations -- defined below, after InitFocusProperties.
 Noesis::UIElement* GetFocusedElement();
 static void TryDiscoverFocusedElementProp(Noesis::Visual* const* widgets, uint32_t count);
@@ -853,6 +859,12 @@ public:
             settleBaselineWidgetVisible_[i] = false;
         }
         settleBaselineWidgetCount_ = 0;
+        // Deliver any buffered loading tips on the first tick.
+        // The buffer persists (not cleared here or in SetSuppressTick)
+        // so BufferLoadingTips dedup works across re-entrant loading
+        // states within the same load sequence.  The buffer only clears
+        // implicitly: old tips are deduped out by BufferLoadingTips_Inner.
+        deliverBufferedTips_ = !sBufferedLoadingTips.empty();
         return true;
     }
 
@@ -868,6 +880,7 @@ public:
     }
 
     bool IsActive() const { return callback_.operator bool(); }
+    bool TipsAlreadyDelivered() const { return tipsAlreadyDelivered_; }
 
     void ForceNextFire() { forceNext_ = true; }
 
@@ -878,12 +891,18 @@ public:
     // constructs/destroys UI objects under a Noesis internal mutex.
     //
     // Suppresses from frame 1 -- no grace period.  Loading tips are
-    // read from dcProps.LoadingHints (ObservableCollection) after
-    // loading completes, eliminating the need for Noesis reads during
-    // loading.  The splash screen appears only on initial startup
-    // when no loading thread is active.
+    // buffered by BufferLoadingTips_SEH (called from TickGlobalFocusMonitor
+    // during loading states) and delivered on the first tick after the
+    // new Lua VM subscribes.
     void SetSuppressTick(bool suppress) {
         suppressTick_ = suppress;
+        if (suppress) {
+            // New loading phase: clear stale buffer and reset delivery flag
+            // so BufferLoadingTips can capture fresh tips.
+            sBufferedLoadingTips.clear();
+            sLastBufferedHintIndex = -2;
+            tipsAlreadyDelivered_ = false;
+        }
     }
 
     void Tick()
@@ -1048,6 +1067,29 @@ public:
         // Per-tick snapshot: heap-allocated to reduce Tick() stack frame.
         auto snapshotPtr = std::make_unique<ecl::lua::TickSnapshot>();
         auto snapshot = snapshotPtr.get();
+
+        // ----- Deliver buffered loading tips (once, on first tick after subscribe) -----
+        if (deliverBufferedTips_ && !sBufferedLoadingTips.empty()) {
+            deliverBufferedTips_ = false;
+            snapshot->widgetAdded = true;
+            snapshot->widgetData.dcType = "ls.LoadingScreen";
+            snapshot->widgetData.eventType = "WidgetAdded";
+            int tipNumber = 0;
+            for (auto& tipText : sBufferedLoadingTips) {
+                tipNumber++;
+                std::string key = "_loadingHint_"
+                    + std::to_string(tipNumber);
+                snapshot->widgetData.namedTexts.push_back(
+                    {std::move(key), tipText});
+            }
+            BG3A_LOG("[BG3Access] Delivering %d buffered loading tips",
+                     tipNumber);
+            sBufferedLoadingTips.clear();
+            sLastBufferedHintIndex = -2;
+            tipsAlreadyDelivered_ = true;
+        } else {
+            deliverBufferedTips_ = false;
+        }
 
         // ----- Lazy FocusedElement property discovery -----
         if (!sFocusedElementProp && widgetCount > 0) {
@@ -2187,6 +2229,7 @@ private:
         }
     }
 
+public:
     // -----------------------------------------------------------------
     // CollectLoadingHints: targeted extraction of loading tip text from
     // the LoadingHints ItemsControl inside an ls.LoadingScreen widget.
@@ -2379,13 +2422,20 @@ private:
         TryCollectNamedTexts(frameworkElem, data.namedTexts);
 
         // Loading hints: targeted extraction for ls.LoadingScreen.
-        // The LoadingHints ItemsControl contains TextBlocks whose Inlines
-        // hold the resolved translation text (CtxTransStringRunGenerator
-        // populates them at template instantiation).  TextBlocks persist
-        // with Opacity=0 after loading completes, so their text is
-        // readable even though they're visually invisible.
+        // Skip if buffered tips were already injected into this snapshot
+        // by the deliverBufferedTips_ path in Tick() -- check for
+        // existing _loadingHint_ keys to avoid duplicate entries.
         if (data.dcType.find("LoadingScreen") != std::string::npos) {
-            CollectLoadingHints(frameworkElem, data.namedTexts);
+            bool alreadyHasBufferedHints = false;
+            for (auto const& namedText : snapshot.widgetData.namedTexts) {
+                if (namedText.first.find("_loadingHint_") == 0) {
+                    alreadyHasBufferedHints = true;
+                    break;
+                }
+            }
+            if (!alreadyHasBufferedHints) {
+                CollectLoadingHints(frameworkElem, data.namedTexts);
+            }
         }
     }
 
@@ -2498,6 +2548,8 @@ private:
     // per frame, eliminating the multi-property-change event storm.
     bool inpcDirty_ = false;
     bool widgetDCDirty_ = false;
+    bool deliverBufferedTips_ = false;  // inject buffered loading tips on first tick
+    bool tipsAlreadyDelivered_ = false; // blocks BufferLoadingTips after delivery until next suppress(true)
 
     // Widget container tracking (Strategy 4).
     // All stored as uintptr_t -- comparison only, never dereferenced.
@@ -4569,6 +4621,100 @@ Noesis::BaseComponent* GetDataContext(Noesis::BaseObject* target)
     }
 }
 
+// ---------------------------------------------------------------------------
+// Loading tip buffering: reads tips DURING loading states when the Lua VM
+// is dead.  The loading screen widget is stable (not rebuilt by the loading
+// thread), so targeted reads on it are safe.
+//
+// The buffer persists across VM resets.  On Subscribe() (new Lua VM), any
+// buffered tips are delivered as a synthetic WidgetAdded snapshot with
+// _loadingHint_N keys in namedTexts.
+// ---------------------------------------------------------------------------
+
+// Inner: find the loading screen widget, read the currently visible hint.
+// Uses std::string (destructor), cannot contain __try.
+static void BufferLoadingTips_Inner()
+{
+    // Skip if tips were already delivered this loading cycle.
+    // tipsAlreadyDelivered_ is reset by SetSuppressTick(true).
+    if (GlobalFocusMonitor::Instance().TipsAlreadyDelivered()) return;
+
+    auto root = GetRoot();
+    if (!root) return;
+
+    // Ensure focus properties are initialized (needed for DC reads).
+    InitFocusProperties(root);
+
+    // Find widget container (same as Tick()).
+    auto container = FindWidgetContainer(root);
+    if (!container) return;
+
+    auto widgetCount = SafeGetVisualChildrenCount_SEH(container);
+
+    // Find the loading screen widget by DC type.
+    Noesis::FrameworkElement* loadingWidget = nullptr;
+    for (int widgetIndex = (int)widgetCount - 1; widgetIndex >= 0; widgetIndex--) {
+        auto widget = SafeGetVisualChild_SEH(container, widgetIndex);
+        if (!widget) continue;
+        if (!ProbeUIElement(static_cast<Noesis::UIElement*>(widget))) continue;
+
+        auto widgetDC = SafeReadDC_SEH(
+            static_cast<Noesis::DependencyObject const*>(widget));
+        if (!widgetDC) continue;
+        auto dcTypeName = SafeBaseObjectTypeName_SEH(widgetDC);
+        if (dcTypeName && strstr(dcTypeName, "LoadingScreen")) {
+            loadingWidget = static_cast<Noesis::FrameworkElement*>(widget);
+
+            // Read VisibileHintIndex from DC to detect tip changes.
+            auto dcClassType = SafeGetClassType_SEH(widgetDC);
+            if (!dcClassType) break;
+            auto const& cls = Noesis::gClassCache.GetClass(dcClassType);
+            bg3se::FixedString fsHintIndex("VisibileHintIndex");
+            auto hintIndexProp = cls.Names.try_get(fsHintIndex);
+            if (hintIndexProp && hintIndexProp->Property) {
+                auto indexStr = ReadTypePropertyAsString(
+                    widgetDC, hintIndexProp->Property);
+                int hintIndex = indexStr.empty() ? -1 : atoi(indexStr.c_str());
+                if (hintIndex < 0 || hintIndex == sLastBufferedHintIndex) {
+                    // No change or no visible hint.
+                    return;
+                }
+                sLastBufferedHintIndex = hintIndex;
+            }
+            break;
+        }
+    }
+
+    if (!loadingWidget) return;
+
+    // Read the current hint text from the LoadingHints ItemsControl.
+    std::vector<std::pair<std::string, std::string>> hintTexts;
+    GlobalFocusMonitor::CollectLoadingHints(loadingWidget, hintTexts);
+
+    for (auto& hint : hintTexts) {
+        // Dedup: don't buffer the same text twice.
+        bool duplicate = false;
+        for (auto& existing : sBufferedLoadingTips) {
+            if (existing == hint.second) { duplicate = true; break; }
+        }
+        if (!duplicate) {
+            BG3A_LOG("[BG3Access] Buffered loading tip: %s",
+                     hint.second.c_str());
+            sBufferedLoadingTips.push_back(std::move(hint.second));
+        }
+    }
+}
+
+// SEH wrapper.
+static void BufferLoadingTips_SEH()
+{
+    __try {
+        BufferLoadingTips_Inner();
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        BG3A_LOG("[BG3Access] BufferLoadingTips: SEH fault");
+    }
+}
+
 // Free functions wrapping GlobalFocusMonitor singleton -- called from
 // LuaClient.cpp which is a different translation unit.
 void TickGlobalFocusMonitor()
@@ -4577,9 +4723,15 @@ void TickGlobalFocusMonitor()
     // torn down and rebuilt during loads; walking stale element pointers can
     // hang the thread (pointer lands on memory the loader is paging in, so
     // SEH never triggers -- it's a deadlock, not a fault).
+    //
+    // EXCEPTION: the loading screen widget itself is stable (not rebuilt
+    // by the loading thread).  BufferLoadingTips reads ONLY from this
+    // widget to capture tip text during the VM-dead period.
     auto clientState = GetStaticSymbols().GetClientState();
     if (clientState) {
         switch (*clientState) {
+        // DANGEROUS: loading thread actively modifies Noesis objects.
+        // Any virtual call can deadlock against the loader's mutex.
         case ecl::GameState::SwapLevel:
         case ecl::GameState::LoadLevel:
         case ecl::GameState::LoadModule:
@@ -4587,9 +4739,14 @@ void TickGlobalFocusMonitor()
         case ecl::GameState::UnloadLevel:
         case ecl::GameState::UnloadModule:
         case ecl::GameState::UnloadSession:
+            return;
+
+        // SAFE: loading thread is not yet active or already done.
+        // The loading screen widget is stable, OK to read tips.
         case ecl::GameState::StartLoading:
         case ecl::GameState::StopLoading:
         case ecl::GameState::StartServer:
+            BufferLoadingTips_SEH();
             return;
         default:
             break;

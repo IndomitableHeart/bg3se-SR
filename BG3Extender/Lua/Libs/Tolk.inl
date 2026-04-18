@@ -4,6 +4,7 @@
 #include <lauxlib.h>
 
 #include <CoreLib/base/BaseUtilities.h>
+#include <CoreLib/Base/BaseString.h>
 #include <Lua/Shared/LuaModule.h>
 #include <Lua/Libs/LibraryRegistrationHelpers.h>
 #include <Lua/Shared/LuaMethodCallHelpers.h> // For UserReturn
@@ -77,13 +78,8 @@ namespace {
         size_t len = 0;
         const char* utf8Str = luaL_checklstring(L, index, &len);
         if (!utf8Str || len == 0) return L"";
-        int wideLen = MultiByteToWideChar(CP_UTF8, 0, utf8Str, (int)len, NULL, 0);
-        if (wideLen == 0) luaL_error(L, "Tolk: Failed to calculate wide char buffer size");
-        std::wstring wideStr;
-        wideStr.resize(wideLen);
-        int result = MultiByteToWideChar(CP_UTF8, 0, utf8Str, (int)len, &wideStr[0], wideLen);
-        if (result == 0) luaL_error(L, "Tolk: Failed to convert UTF-8 to wide char");
-        return wideStr;
+        auto wide = bg3se::FromUTF8(bg3se::StringView(utf8Str, len));
+        return std::wstring(wide.data(), wide.size());
     }
 
     void WCharStringToLua(lua_State* L, const wchar_t* wideStr) {
@@ -91,13 +87,8 @@ namespace {
             lua_pushstring(L, "");
             return;
         }
-        int wideLen = -1;
-        int utf8Len = WideCharToMultiByte(CP_UTF8, 0, wideStr, wideLen, NULL, 0, NULL, NULL);
-        if (utf8Len == 0) luaL_error(L, "Tolk: Failed to calculate UTF-8 buffer size");
-        std::vector<char> utf8Buffer(utf8Len);
-        int result = WideCharToMultiByte(CP_UTF8, 0, wideStr, wideLen, utf8Buffer.data(), utf8Len, NULL, NULL);
-        if (result == 0) luaL_error(L, "Tolk: Failed to convert wide char to UTF-8");
-        lua_pushlstring(L, utf8Buffer.data(), utf8Len - 1);
+        auto utf8 = bg3se::ToUTF8(bg3se::WStringView(wideStr));
+        lua_pushlstring(L, utf8.data(), utf8.size());
     }
 } // end anonymous namespace
 

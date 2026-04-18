@@ -344,6 +344,7 @@ void DeferredUIEvents::PostUpdate()
     std::swap(focusChanges, focusChanges_);
     std::swap(tickSnapshots, tickSnapshots_);
 
+
     auto L = state_.GetState();
     for (auto const& command : commands) {
         LuaDelegate<void(Noesis::BaseCommand*, Noesis::BaseComponent*)> handler(L, command.Handler.ToRef(L));
@@ -475,16 +476,32 @@ static void PushTickSnapshotTable(lua_State* L, TickSnapshot const& snapshot)
         lua_settable(L, -3);
     }
 
-    // Widget data (nested table, only if widgetAdded)
-    if (snapshot.widgetAdded) {
-        lua_pushstring(L, "widgetData");
-        PushFocusEventTable(L, snapshot.widgetData);
+    // Widget events: array of tables, one per new/changed widget this tick.
+    // Each entry is a complete FocusEventData with dcType, elemName, etc.
+    if (!snapshot.widgetEvents.empty()) {
+        lua_pushstring(L, "widgetEvents");
+        lua_createtable(L, static_cast<int>(snapshot.widgetEvents.size()), 0);
+        for (size_t eventIndex = 0; eventIndex < snapshot.widgetEvents.size(); eventIndex++) {
+            PushFocusEventTable(L, snapshot.widgetEvents[eventIndex]);
+            lua_rawseti(L, -2, static_cast<int>(eventIndex) + 1);
+        }
         lua_settable(L, -3);
     }
 
-    // All widget DC types seen this tick (array of strings).
-    // Lets Lua check ALL widget types for routing, not just the last
-    // one in widgetData.dcType (which gets overwritten each callback).
+    // Widget removal data (only if widgetRemoved)
+    lua_pushstring(L, "widgetRemoved");
+    lua_pushboolean(L, snapshot.widgetRemoved);
+    lua_settable(L, -3);
+
+    if (snapshot.widgetRemoved) {
+        lua_pushstring(L, "removedWidgetData");
+        PushFocusEventTable(L, snapshot.removedWidgetData);
+        lua_settable(L, -3);
+    }
+
+    // All visible widget DC types this tick (from cached scan).
+    // Includes ALL visible widgets, not just new/changed ones.
+    // Lua uses this for presence checks (e.g., "is a menu still open?").
     if (!snapshot.widgetDCTypes.empty()) {
         lua_pushstring(L, "widgetDCTypes");
         lua_createtable(L, static_cast<int>(snapshot.widgetDCTypes.size()), 0);

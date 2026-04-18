@@ -152,6 +152,7 @@ struct TickSnapshot
     bool widgetAdded = false;           // New dialog/overlay widget appeared
     bool radialSlotChanged = false;     // Radial (RT/RB) slot focus changed via LocalFocus
     bool contextMenuChanged = false;    // Context menu highlight changed (d-pad in popup)
+    bool widgetRemoved = false;         // A previously-visible widget became invisible
 
     // Current focused element state (full picture, not just changes).
     FocusEventData focusedElement;
@@ -165,14 +166,19 @@ struct TickSnapshot
     // section labels (VMSelectableRace -> "Race", etc.).
     FocusEventData selectedElementData;
 
-    // Widget added data (dialog/overlay detection).
-    // Only populated when widgetAdded == true.
-    FocusEventData widgetData;
+    // Widget events: one entry per new/newly-visible widget this tick.
+    // Each entry is a complete FocusEventData with dcType, elemName,
+    // dcProps, namedTexts, etc.  Replaces the old single widgetData
+    // field (which suffered from last-wins overwrite when multiple
+    // widgets fired on the same tick).  Lua iterates all entries to
+    // find handler-relevant widgets.
+    std::vector<FocusEventData> widgetEvents;
 
-    // All widget DC types seen this tick.  When multiple widgets fire
-    // in one tick, widgetData only carries the last one.  This array
-    // lets Lua check ALL widget DC types for routing decisions (e.g.,
-    // finding gui::DCCharacterPanels even when ls.Widget fires last).
+    // All visible widget DC types this tick (cached scan, refreshed
+    // only when the widget set changes).  Distinct from widgetEvents:
+    // includes ALL visible widgets, not just new/changed ones.  Lua
+    // uses this for presence checks (e.g. "is the menu still open?",
+    // "is a discovery-only handler's widget still around?").
     std::vector<std::string> widgetDCTypes;
 
     // Radial slot data (RT shortcuts radial, RB action radial).
@@ -195,6 +201,12 @@ struct TickSnapshot
     // Context menu data (WorldContextMenu popup).
     // Only populated when contextMenuChanged == true.
     std::string contextMenuItemText;    // Display text of highlighted item
+
+    // Widget removal data (menu close detection).
+    // Only populated when widgetRemoved == true.
+    // Contains the DC type and element name of the widget that became
+    // invisible.  Lua uses this to deactivate the matching handler.
+    FocusEventData removedWidgetData;
 
     // Tooltip data (Examine panel, stat tooltips).
     // Only populated when tooltipChanged == true.

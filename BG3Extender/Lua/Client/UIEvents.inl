@@ -158,6 +158,11 @@ static void PushFocusEventTable(lua_State* L, FocusEventData const& data)
     lua_pushstring(L, data.elemId.c_str());
     lua_settable(L, -3);
 
+    // elemAddr
+    lua_pushstring(L, "elemAddr");
+    lua_pushstring(L, data.elemAddr.c_str());
+    lua_settable(L, -3);
+
     // isTab
     lua_pushstring(L, "isTab");
     lua_pushboolean(L, data.isTab);
@@ -464,6 +469,13 @@ static void PushTickSnapshotTable(lua_State* L, TickSnapshot const& snapshot)
     }
     lua_settable(L, -3);
 
+    // Inline carousel color hex (for skin/hair/eye color descriptions)
+    if (!snapshot.inlineCarouselColorHex.empty()) {
+        lua_pushstring(L, "inlineCarouselColorHex");
+        lua_pushstring(L, snapshot.inlineCarouselColorHex.c_str());
+        lua_settable(L, -3);
+    }
+
     // Focused element data (nested table using existing builder)
     lua_pushstring(L, "focusedElement");
     PushFocusEventTable(L, snapshot.focusedElement);
@@ -573,6 +585,13 @@ static void PushTickSnapshotTable(lua_State* L, TickSnapshot const& snapshot)
         lua_settable(L, -3);
     }
 
+    // CC visible page title
+    if (!snapshot.activePageTitle.empty()) {
+        lua_pushstring(L, "activePageTitle");
+        lua_pushstring(L, snapshot.activePageTitle.c_str());
+        lua_settable(L, -3);
+    }
+
     // Tooltip data (only if tooltipChanged)
     lua_pushstring(L, "tooltipChanged");
     lua_pushboolean(L, snapshot.tooltipChanged);
@@ -582,7 +601,39 @@ static void PushTickSnapshotTable(lua_State* L, TickSnapshot const& snapshot)
         lua_pushstring(L, "tooltipTexts");
         lua_newtable(L);
         for (size_t i = 0; i < snapshot.tooltipTexts.size(); i++) {
-            lua_pushstring(L, snapshot.tooltipTexts[i].c_str());
+            auto const& entry = snapshot.tooltipTexts[i];
+            lua_newtable(L);
+
+            lua_pushstring(L, "role");
+            if (!entry.role.empty()) {
+                lua_pushstring(L, entry.role.c_str());
+            } else {
+                lua_pushnil(L);
+            }
+            lua_settable(L, -3);
+
+            lua_pushstring(L, "text");
+            lua_pushstring(L, entry.text.c_str());
+            lua_settable(L, -3);
+
+            lua_pushstring(L, "parentRole");
+            if (!entry.parentRole.empty()) {
+                lua_pushstring(L, entry.parentRole.c_str());
+            } else {
+                lua_pushnil(L);
+            }
+            lua_settable(L, -3);
+
+            lua_pushstring(L, "fontSize");
+            lua_pushnumber(L, entry.fontSize);
+            lua_settable(L, -3);
+
+            if (!entry.typeId.empty()) {
+                lua_pushstring(L, "typeId");
+                lua_pushstring(L, entry.typeId.c_str());
+                lua_settable(L, -3);
+            }
+
             lua_rawseti(L, -2, (int)(i + 1));
         }
         lua_settable(L, -3);

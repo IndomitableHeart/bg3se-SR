@@ -103,6 +103,7 @@ static const Noesis::DependencyProperty* sDataContextProp = nullptr;
 static const Noesis::DependencyProperty* sIsVisibleProp = nullptr;
 static const Noesis::DependencyProperty* sVisibilityProp = nullptr;
 static const Noesis::DependencyProperty* sIsHitTestVisibleProp = nullptr;
+static const Noesis::DependencyProperty* sFontSizeProp = nullptr;
 // Larian's custom controller focus system (ls:MoveFocus.IsFocused attached property).
 // Used by all controller menus -- d-pad navigation, state-machine transitions,
 // overlay popups (CrossplayDisabledWarning, InviteCode, Filters, etc.).
@@ -189,6 +190,21 @@ static uintptr_t sClassSelectionDCAddr = 0;
 // Options open, where many nested ListBoxes fire their initial selections).
 static bool sInlineCarouselDirty = false;
 static char sInlineCarouselText[128] = {0};
+// UIColor hex from the SelectedItem (e.g. "#FFFFF0E6" for skin/hair/eye
+// color swatches).  Captured alongside the display name so Lua can
+// convert hex to a spoken color description via HSL binning.
+static char sInlineCarouselColorHex[16] = {0};
+// Tooltip fingerprint reset: set when focus changes so PollTooltip
+// re-enters the stabilization path instead of firing immediate deltas
+// while tooltip bindings are still resolving for the new element.
+static bool sTooltipFingerprintReset = false;
+
+// Source ListBox for deferred hex retry.  Brush bindings may not
+// resolve on the tick SelectionChanged fires; Tick() re-reads
+// SelectedItem from this ListBox on the next frame.  Storing the
+// ListBox (a visual tree element) is safe across ticks; storing
+// the SelectedItem (a VM object) would not be.
+static Noesis::FrameworkElement* sInlineCarouselSourceListBox = nullptr;
 
 // ToolTip presence flag (event-driven gate for PollTooltip).
 //
@@ -313,6 +329,7 @@ static bool DetectWidgetRemoval_SEH(
 static int SafeReadExpanderState_SEH(Noesis::Visual* elem);
 static int SafeReadToggleIsChecked_SEH(Noesis::FrameworkElement* elem);
 static void ReadElementName_SEH(Noesis::FrameworkElement* elem, char* buf, size_t bufSize);
+static float SafeGetFontSize_SEH(Noesis::FrameworkElement* elem);
 
 // Forward declarations for data extraction (defined after ExtractElementInfo).
 static void ExtractElementData(FocusEventData& out, Noesis::FrameworkElement* elem);
@@ -509,6 +526,35 @@ static const void* SafeTypePropertyGet_SEH(
     }
 }
 
+// DependencyProperty::GetValue() on a DependencyObject.  Returns raw
+// const void* or nullptr on fault.
+static const void* SafeDepPropertyGetValue_SEH(
+    Noesis::DependencyProperty const* dp,
+    Noesis::DependencyObject const* obj)
+{
+    __try {
+        return dp->GetValue(obj);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+// Read DataContext via class cache DP lookup (Indie SDK exports
+// neither GetDataContext() nor DataContextProperty).
+static Noesis::BaseObject* SafeGetDataContext_SEH(
+    Noesis::FrameworkElement* elem)
+{
+    auto classType = SafeGetClassType_SEH(elem);
+    if (!classType) return nullptr;
+    static auto sDataContextKey = FixedString("DataContext");
+    auto const& cls = Noesis::gClassCache.GetClass(classType);
+    auto dcProp = cls.Names.try_get(sDataContextKey);
+    if (!dcProp || !dcProp->DepProperty) return nullptr;
+    auto val = SafeDepPropertyGetValue_SEH(dcProp->DepProperty, elem);
+    if (!val) return nullptr;
+    return *reinterpret_cast<Noesis::BaseObject* const*>(val);
+}
+
 // TypeProperty::GetCopy() for pointer types.  Writes to outPtr, returns
 // true on success.  Returns false on fault.
 static bool SafeTypePropertyGetCopy_SEH(
@@ -518,18 +564,6 @@ static bool SafeTypePropertyGetCopy_SEH(
     __try {
         prop->GetCopy(obj, outPtr);
         return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-// Check if a Noesis::Type's class type is descended from TypeEnum.
-// Safe to call on potentially stale type pointers.
-static bool SafeIsEnumType_SEH(Noesis::Type const* typeOfType)
-{
-    __try {
-        return Noesis::TypeHelpers::IsDescendantOf(
-            typeOfType, Noesis::gStaticSymbols.TypeClasses.TypeEnum.Type);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
@@ -623,6 +657,147 @@ static Noesis::Visual* FindContainingUIWidget_SEH(
 // CaptureInlineCarouselName_Inner: reads the new SelectedItem's Name,
 // ColorName, or Title from a SelectionChanged event's addedItem and stores
 // it in sInlineCarouselText.  Called by ClassSelectionDelegate when the
+// Forward declaration: SafeToString_SEH is defined later in the file
+// but needed here for Brush color extraction.
+static bool SafeToString_SEH(Noesis::BaseObject* obj, char* outBuf, size_t bufSize);
+
+// TryCaptureCarouselColorHex: read the Brush property from a carousel
+// SelectedItem and store the hex in sInlineCarouselColorHex.  Shared by
+// CaptureInlineCarouselName_Inner (at event time) and Tick() (deferred
+// retry when the brush binding hadn't resolved at event time).
+// Uses FixedString (destructor) -- must be called through a __try caller.
+static void TryCaptureCarouselColorHex(Noesis::BaseObject* item)
+{
+    sInlineCarouselColorHex[0] = 0;
+    if (!item) return;
+    auto itemClassType = SafeGetClassType_SEH(item);
+    if (!itemClassType) return;
+    auto const& itemClass = Noesis::gClassCache.GetClass(itemClassType);
+    const char* brushPropNames[] = {"Colour", "Color", "UIColor"};
+    for (auto brushPropName : brushPropNames) {
+        auto brushPropKey = FixedString(brushPropName);
+        auto brushPropInfo = itemClass.Names.try_get(brushPropKey);
+        if (!brushPropInfo || !brushPropInfo->Property) continue;
+        BG3A_LOG("[BG3Access] COLOR: found prop '%s'", brushPropName);
+        auto brushRaw = SafeGetComponent_SEH(
+            brushPropInfo->Property, item);
+        if (!brushRaw) {
+            BG3A_LOG("[BG3Access] COLOR: GetComponent returned null");
+            continue;
+        }
+        auto brushTypeName = SafeBaseObjectTypeName_SEH(brushRaw);
+        BG3A_LOG("[BG3Access] COLOR: obj type=%s",
+                 brushTypeName ? brushTypeName : "(null)");
+        if (brushTypeName
+            && strstr(brushTypeName, "SolidColorBrush")) {
+            char colorBuf[32];
+            if (SafeToString_SEH(brushRaw, colorBuf, sizeof(colorBuf))) {
+                BG3A_LOG("[BG3Access] COLOR: ToString=%s", colorBuf);
+                if (colorBuf[0] == '#') {
+                    strncpy_s(sInlineCarouselColorHex, colorBuf,
+                              _TRUNCATE);
+                }
+            }
+        }
+        brushRaw->Release();
+        break;
+    }
+}
+
+// Forward declaration (defined after FixedString init section).
+static Noesis::BaseObject* GetListBoxSelectedItem(Noesis::FrameworkElement* listBox);
+
+// RetryCarouselColorHex: SEH-wrapped deferred hex capture.  Reads the
+// live SelectedItem from the source ListBox and retries the brush read.
+// Three-layer SEH: Inner uses FixedString (destructor via
+// GetListBoxSelectedItem) and std::string (via TryCaptureCarouselColorHex).
+static void RetryCarouselColorHex_Inner(Noesis::FrameworkElement* listBox)
+{
+    auto liveItem = GetListBoxSelectedItem(listBox);
+    if (liveItem) {
+        TryCaptureCarouselColorHex(liveItem);
+    }
+}
+static void RetryCarouselColorHex_Invoke(Noesis::FrameworkElement* listBox)
+{
+    RetryCarouselColorHex_Inner(listBox);
+}
+static void RetryCarouselColorHex_SEH(Noesis::FrameworkElement* listBox)
+{
+    __try { RetryCarouselColorHex_Invoke(listBox); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        sInlineCarouselColorHex[0] = 0;
+    }
+}
+
+// Forward declaration (defined after FixedString init section).
+static std::string TryReadInlineCarouselText(Noesis::FrameworkElement* listBox);
+
+// ReadInlineCarouselState: read carousel text + color hex on first
+// arrival at a carousel row.  Extracts from ListBox SelectedItem
+// (primary) or selectionName TextBlock (fallback).
+// Three-layer SEH: Inner uses std::string (TryReadInlineCarouselText,
+// ReadTextBlockText) and FixedString (GetListBoxSelectedItem).
+static void ReadInlineCarouselState_Inner(
+    Noesis::FrameworkElement* listBox,
+    Noesis::FrameworkElement* selectionNameTextBlock,
+    std::string& lastCarouselText,
+    std::string& lastCarouselColorHex)
+{
+    std::string carouselText;
+    if (listBox) {
+        carouselText.assign(TryReadInlineCarouselText(listBox));
+    }
+    if (carouselText.empty() && selectionNameTextBlock) {
+        carouselText.assign(ReadTextBlockText(selectionNameTextBlock));
+    }
+
+    if (!carouselText.empty()) {
+        if (carouselText != lastCarouselText) {
+            lastCarouselText.assign(carouselText);
+            if (listBox) {
+                auto selectedItem = GetListBoxSelectedItem(listBox);
+                if (selectedItem) {
+                    TryCaptureCarouselColorHex(selectedItem);
+                    lastCarouselColorHex.assign(
+                        sInlineCarouselColorHex);
+                }
+            }
+            BG3A_LOG("[BG3Access]   -> Inline carousel changed: %s",
+                carouselText.c_str());
+        }
+    } else {
+        if (!lastCarouselText.empty()) {
+            lastCarouselText.clear();
+        }
+    }
+}
+static void ReadInlineCarouselState_Invoke(
+    Noesis::FrameworkElement* listBox,
+    Noesis::FrameworkElement* selectionNameTextBlock,
+    std::string* lastCarouselText,
+    std::string* lastCarouselColorHex)
+{
+    ReadInlineCarouselState_Inner(
+        listBox, selectionNameTextBlock,
+        *lastCarouselText, *lastCarouselColorHex);
+}
+static void ReadInlineCarouselState_SEH(
+    Noesis::FrameworkElement* listBox,
+    Noesis::FrameworkElement* selectionNameTextBlock,
+    std::string& lastCarouselText,
+    std::string& lastCarouselColorHex)
+{
+    auto textPtr = &lastCarouselText;
+    auto hexPtr = &lastCarouselColorHex;
+    __try {
+        ReadInlineCarouselState_Invoke(
+            listBox, selectionNameTextBlock, textPtr, hexPtr);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        BG3A_LOG("[BG3Access] ReadInlineCarouselState_SEH: fault");
+    }
+}
+
 // selection is NOT a ListBoxItem (i.e., it's an inline-carousel selection
 // like a Face head, Skin Colour swatch, Eye Colour, Tattoo, etc.).
 //
@@ -642,13 +817,14 @@ static void CaptureInlineCarouselName_Inner(Noesis::BaseComponent* item)
         if (propInfo && propInfo->Property) {
             auto text = ReadTypePropertyAsString(item, propInfo->Property);
             if (!text.empty()) {
-                // 3-arg template overload: array size deduced from sInlineCarouselText.
                 strncpy_s(sInlineCarouselText, text.c_str(), _TRUNCATE);
                 sInlineCarouselDirty = true;
-                return;
+                break;
             }
         }
     }
+    // Capture color hex from Brush property.
+    TryCaptureCarouselColorHex(item);
 }
 
 // Class-level handler for SelectionChanged with invokeHandledEvents=true.
@@ -713,6 +889,11 @@ struct ClassSelectionDelegate
                     }
                     if (focusedInSource) {
                         CaptureInlineCarouselName_Inner(addedItem);
+                        // Store source ListBox for deferred hex retry
+                        // (brush may not have resolved yet).
+                        sInlineCarouselSourceListBox =
+                            static_cast<Noesis::FrameworkElement*>(
+                                static_cast<Noesis::UIElement*>(source));
                     }
                 }
                 return;
@@ -804,8 +985,10 @@ struct ToolTipOpenedDelegate
 {
     void Handler(Noesis::BaseComponent* source, const Noesis::EventArgs& args)
     {
-        if (sSuppressCallbacks) return;
-        sToolTipIsOpen = true;
+        __try {
+            if (sSuppressCallbacks) return;
+            sToolTipIsOpen = true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
 };
 
@@ -816,8 +999,10 @@ struct ToolTipClosedDelegate
 {
     void Handler(Noesis::BaseComponent* source, const Noesis::EventArgs& args)
     {
-        if (sSuppressCallbacks) return;
-        sToolTipIsOpen = false;
+        __try {
+            if (sSuppressCallbacks) return;
+            sToolTipIsOpen = false;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
 };
 
@@ -961,13 +1146,32 @@ static Noesis::BaseObject* GetListBoxSelectedItem(Noesis::FrameworkElement* list
 
     auto const& listBoxClass = Noesis::gClassCache.GetClass(listBoxClassType);
     auto selectedItemProp = listBoxClass.Names.try_get(sSelectedItemKey);
-    if (!selectedItemProp || !selectedItemProp->Property) return nullptr;
+    if (!selectedItemProp) return nullptr;
 
-    auto selectedItemRaw = SafeTypePropertyGet_SEH(
-        selectedItemProp->Property, listBox);
-    if (!selectedItemRaw) return nullptr;
+    // Try TypeProperty first (direct getter).
+    if (selectedItemProp->Property) {
+        auto selectedItemRaw = SafeTypePropertyGet_SEH(
+            selectedItemProp->Property, listBox);
+        if (selectedItemRaw) {
+            return *reinterpret_cast<Noesis::BaseObject* const*>(
+                selectedItemRaw);
+        }
+    }
 
-    return *reinterpret_cast<Noesis::BaseObject* const*>(selectedItemRaw);
+    // Fallback: DependencyProperty::GetValue.  The Indie SDK does not
+    // register SelectedItem as a TypeProperty on ListBox -- only as a
+    // DependencyProperty.  Without this fallback, GetListBoxSelectedItem
+    // returns null for all ListBox instances.
+    if (selectedItemProp->DepProperty) {
+        auto depVal = SafeDepPropertyGetValue_SEH(
+            selectedItemProp->DepProperty, listBox);
+        if (depVal) {
+            return *reinterpret_cast<Noesis::BaseObject* const*>(
+                depVal);
+        }
+    }
+
+    return nullptr;
 }
 
 // Outer function: reads Name/ColorName/Title from the SelectedItem.
@@ -1068,28 +1272,57 @@ static bool SafeReadBoolDP_SEH(
     }
 }
 
-// Walk a visual subtree (breadth-first) to find elements of a given type.
-// Returns count of found elements (up to maxOut). SEH-safe (no destructors).
-static uint32_t FindElementsByType_SEH(
+// ---------------------------------------------------------------------------
+// BFS_CollectByType_SEH: generic BFS that collects elements matching a type
+// name substring.  Consolidates FindElementsByType_SEH and
+// BFS_CollectTextBlocks_SEH into one function.
+//
+// Parameters:
+//   root:               starting element for the BFS.
+//   typeName:           substring to match against element class type name
+//                       (e.g. "TextBlock", "ContextMenuItem").
+//   outElements:        output buffer for matched element pointers.
+//   startIndex:         index in outElements to start writing at.
+//   maxOut:             maximum total entries in outElements.
+//   checkVisibility:    if true, skip invisible branches (IsVisibleDP).
+//   skipMatchedChildren: if true, don't recurse into matched elements
+//                        (e.g. TextBlock children are Inlines, not useful).
+//
+// SEH-safe (no C++ objects with destructors).
+// Returns the number of matched elements written (starting at startIndex).
+// ---------------------------------------------------------------------------
+static uint32_t BFS_CollectByType_SEH(
     Noesis::Visual* root, const char* typeName,
-    Noesis::FrameworkElement** outElements, uint32_t maxOut)
+    Noesis::FrameworkElement** outElements, uint32_t startIndex,
+    uint32_t maxOut, bool checkVisibility = false,
+    bool skipMatchedChildren = false)
 {
-    uint32_t found = 0;
+    uint32_t found = startIndex;
     __try {
-        Noesis::Visual* queue[128];
+        Noesis::Visual* queue[512];
         int head = 0, tail = 0;
         queue[tail++] = root;
         while (head < tail && found < maxOut) {
             auto node = queue[head++];
+            if (!node) continue;
             if (!ProbeUIElement(static_cast<Noesis::UIElement*>(node)))
                 continue;
-            auto ct = static_cast<Noesis::UIElement*>(node)->GetClassType();
-            if (ct && strstr(ct->GetName(), typeName)) {
-                outElements[found++] = static_cast<Noesis::FrameworkElement*>(
-                    node);
+            if (checkVisibility && !IsVisibleDP(node)) continue;
+
+            auto classType = static_cast<Noesis::UIElement*>(
+                node)->GetClassType();
+            if (classType && strstr(classType->GetName(), typeName)) {
+                outElements[found++] = static_cast<
+                    Noesis::FrameworkElement*>(node);
+                if (skipMatchedChildren) continue;
             }
+
+            if (!ProbeVisualChildren(
+                    static_cast<Noesis::UIElement*>(node)))
+                continue;
             auto childCount = node->GetVisualChildrenCount();
-            for (uint32_t i = 0; i < childCount && tail < 120; i++) {
+            for (uint32_t i = 0; i < childCount
+                 && tail < 510; i++) {
                 auto child = node->GetVisualChild(i);
                 if (child) queue[tail++] = child;
             }
@@ -2406,6 +2639,24 @@ public:
             Noesis::FrameworkElement* foundSelectionName = nullptr;
             Noesis::FrameworkElement* foundListBox = nullptr;
 
+            // Walk UP first: the focused ContentControl ("base") is
+            // a template child of the ListBox.  The downward BFS won't
+            // find the ListBox because it's an ancestor, not a descendant.
+            {
+                auto ancestor = SafeGetVisualParent_SEH(focusedElement);
+                for (int upDepth = 0; upDepth < 5 && ancestor; upDepth++) {
+                    auto ancestorTypeName = SafeBaseObjectTypeName_SEH(ancestor);
+                    if (ancestorTypeName
+                        && strstr(ancestorTypeName, "ListBox")
+                        && !strstr(ancestorTypeName, "ListBoxItem")) {
+                        foundListBox = static_cast<Noesis::FrameworkElement*>(
+                            ancestor);
+                        break;
+                    }
+                    ancestor = SafeGetVisualParent_SEH(ancestor);
+                }
+            }
+
             while (searchHead < searchTail && searchHead < 64) {
                 auto currentNode = searchQueue[searchHead++];
                 if (!currentNode) continue;
@@ -2459,30 +2710,9 @@ public:
             // Tattoo Style/Colour, Genitals) would report the same
             // value across consecutive d-pad presses because the
             // TextBlock binding hadn't caught up yet.
-            std::string carouselText;
-            if (foundListBox) {
-                carouselText = TryReadInlineCarouselText(foundListBox);
-            }
-            // Fallback: read the TextBlock text when the ListBox
-            // path returned nothing (no SelectedItem, or its class
-            // has no Name/ColorName/Title property).
-            if (carouselText.empty() && foundSelectionName) {
-                carouselText = ReadTextBlockText(foundSelectionName);
-            }
-
-            if (!carouselText.empty()) {
-
-                if (!carouselText.empty() && carouselText != lastInlineCarouselText_) {
-                    lastInlineCarouselText_ = carouselText;
-                    BG3A_LOG("[BG3Access]   -> Inline carousel changed: %s", carouselText.c_str());
-                    // No legacy dispatch -- snapshot builder reads
-                    // lastInlineCarouselText_ at end of Tick().
-                }
-            } else {
-                if (!lastInlineCarouselText_.empty()) {
-                    lastInlineCarouselText_.clear();
-                }
-            }
+            ReadInlineCarouselState_SEH(
+                foundListBox, foundSelectionName,
+                lastInlineCarouselText_, lastInlineCarouselColorHex_);
         }
 
         // (Focus-change clear moved above carousel scan so the value
@@ -2552,6 +2782,9 @@ public:
         // Net: per-tick BFS only during the brief window a tooltip is
         // actually on screen.  Eliminates wasteful walks during normal
         // navigation.
+        if (focusChanged) {
+            sTooltipFingerprintReset = true;
+        }
         if (sToolTipIsOpen
             && hadFocusBefore_ && cachedTrueRoot_ && cachedContentChild_) {
             PollTooltip(cachedTrueRoot_, cachedContentChild_, snapshot);
@@ -2731,12 +2964,33 @@ public:
             // sees the fresh value.  Cleared after consumption.
             if (sInlineCarouselDirty) {
                 lastInlineCarouselText_ = sInlineCarouselText;
+                lastInlineCarouselColorHex_ = sInlineCarouselColorHex;
                 sInlineCarouselDirty = false;
+                // Don't set valueChanged here -- INPC fires on the
+                // next tick for the same change and sets it naturally.
+                // Setting it here causes a double-fire (two value
+                // snapshots per press).  The carousel text and hex are
+                // ready for when the INPC tick arrives.
+            } else if (lastInlineCarouselColorHex_.empty()
+                       && sInlineCarouselSourceListBox
+                       && !lastInlineCarouselText_.empty()) {
+                // Deferred hex retry: brush binding hadn't resolved at
+                // event time.  Re-read SelectedItem from the source
+                // ListBox (live pointer, safe across ticks) and retry
+                // the brush capture.  Own SEH so a fault here doesn't
+                // kill the entire tick.
+                RetryCarouselColorHex_SEH(sInlineCarouselSourceListBox);
+                if (sInlineCarouselColorHex[0]) {
+                    lastInlineCarouselColorHex_ =
+                        sInlineCarouselColorHex;
+                }
+                sInlineCarouselSourceListBox = nullptr;
             }
 
-            // Inline carousel value (set above on focus change, or by
-            // the event-driven dirty-flag consumption immediately above).
+            // Inline carousel value: always available (current carousel
+            // state) regardless of whether it changed this tick.
             snapshot->inlineCarouselValue = lastInlineCarouselText_;
+            snapshot->inlineCarouselColorHex = lastInlineCarouselColorHex_;
             snapshot->inlineCarouselChanged =
                 !lastInlineCarouselText_.empty() &&
                 lastInlineCarouselText_ != previousSnapshotCarousel_;
@@ -3298,6 +3552,7 @@ public:
     uintptr_t lastFocusedDCAddr_ = 0;   // DataContext address for focused-element DC-swap detection
     std::string lastSelectedElemText_;  // tab name text for carousel text-change detection
     std::string lastInlineCarouselText_;  // Name/ColorName from inline carousel SelectedItem
+    std::string lastInlineCarouselColorHex_;  // UIColor hex from color swatch items
 
     // Radial wheel tracking (DCHotBar widget Tag polling).
     // The XAML sets ActionRadials.Tag = LocalFocus.DataContext on every
@@ -3501,6 +3756,27 @@ void InitFocusProperties(Noesis::FrameworkElement* root)
     auto lbiType = Noesis::Reflection::GetType(Noesis::Symbol("ListBoxItem"));
     if (lbiType) {
         sListBoxItemType = static_cast<Noesis::TypeClass const*>(lbiType);
+    }
+
+    // FontSize DP on TextElement (inherited by TextBlock).  Used by
+    // PollTooltip to distinguish title from description text when
+    // tooltip templates lack x:Names.
+    auto textElementType = Noesis::Reflection::GetType(
+        Noesis::Symbol("TextElement"));
+    if (textElementType) {
+        sFontSizeProp = Noesis::TypeHelpers::GetDependencyProperty(
+            static_cast<Noesis::TypeClass const*>(textElementType),
+            bg3se::FixedString("FontSize"));
+    }
+    if (!sFontSizeProp) {
+        // Fallback: try TextBlock directly.
+        auto textBlockType = Noesis::Reflection::GetType(
+            Noesis::Symbol("TextBlock"));
+        if (textBlockType) {
+            sFontSizeProp = Noesis::TypeHelpers::GetDependencyProperty(
+                static_cast<Noesis::TypeClass const*>(textBlockType),
+                bg3se::FixedString("FontSize"));
+        }
     }
 
     // UIWidget type -- for dynamic widget container discovery.
@@ -4214,8 +4490,8 @@ static bool FindHighlightedContextMenuItem(
         if (SafeReadBoolDP_SEH(sCtxMenuIsHighlightedProp, itemDepObj)) {
             *outHighlightedItem = menuItems[mi];
             Noesis::FrameworkElement* textBlocks[4];
-            auto tbCount = FindElementsByType_SEH(
-                menuItems[mi], "TextBlock", textBlocks, 4);
+            auto tbCount = BFS_CollectByType_SEH(
+                menuItems[mi], "TextBlock", textBlocks, 0, 4);
             if (tbCount > 0) {
                 *outTextBlock = textBlocks[0];
             }
@@ -4288,8 +4564,8 @@ static bool CheckContextMenuOnElement(
     auto cmElem = reinterpret_cast<Noesis::Visual*>(
         reinterpret_cast<Noesis::UIElement*>(cmObj));
     Noesis::FrameworkElement* menuItems[16];
-    auto itemCount = FindElementsByType_SEH(
-        cmElem, "ContextMenuItem", menuItems, 16);
+    auto itemCount = BFS_CollectByType_SEH(
+        cmElem, "ContextMenuItem", menuItems, 0, 16);
     return FindHighlightedContextMenuItem(
         menuItems, itemCount, outHighlightedItem, outTextBlock);
 
@@ -4388,8 +4664,8 @@ static bool PollContextMenu_Unsafe(
         trueRoot, contentChild, popupRoots, 8);
     for (uint32_t pi = 0; pi < popupCount; pi++) {
         Noesis::FrameworkElement* popupMenuItems[16];
-        auto popupItemCount = FindElementsByType_SEH(
-            popupRoots[pi], "ContextMenuItem", popupMenuItems, 16);
+        auto popupItemCount = BFS_CollectByType_SEH(
+            popupRoots[pi], "ContextMenuItem", popupMenuItems, 0, 16);
         if (FindHighlightedContextMenuItem(
                 popupMenuItems, popupItemCount,
                 outHighlightedItem, outTextBlock)) {
@@ -4454,54 +4730,6 @@ static void PollContextMenu(
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
-// BFS_CollectTextBlocks_SEH: shared SEH-guarded BFS that collects visible
-// TextBlock elements from any visual subtree.  Used by both the tooltip
-// poller (popup roots) and the on-demand widget text reader (Lua API).
-// No C++ objects with destructors.
-// Returns the number of TextBlock pointers written starting at
-// outTextBlocks[startIndex].
-// ---------------------------------------------------------------------------
-static uint32_t BFS_CollectTextBlocks_SEH(
-    Noesis::Visual* root,
-    Noesis::FrameworkElement** outTextBlocks, uint32_t startIndex,
-    uint32_t maxOut)
-{
-    uint32_t found = startIndex;
-  __try {
-    // 512 nodes: popup tooltips need ~200, full widget trees (e.g.
-    // PinnedTooltips_c inspect panel) can be much larger.
-    Noesis::Visual* queue[512];
-    int queueFront = 0, queueBack = 0;
-    queue[queueBack++] = root;
-
-    while (queueFront < queueBack && found < maxOut) {
-        auto node = queue[queueFront++];
-        if (!node) continue;
-        if (!ProbeUIElement(static_cast<Noesis::UIElement*>(node)))
-            continue;
-        if (!IsVisibleDP(node)) continue;
-
-        auto typeName = node->GetClassType()->GetName();
-        if (typeName && strstr(typeName, "TextBlock")) {
-            outTextBlocks[found++] = static_cast<Noesis::FrameworkElement*>(node);
-            // Don't recurse into TextBlock children (they are Inlines).
-            continue;
-        }
-
-        if (!ProbeVisualChildren(static_cast<Noesis::UIElement*>(node)))
-            continue;
-        auto childCount = node->GetVisualChildrenCount();
-        for (uint32_t ci = 0; ci < childCount && queueBack < 512; ci++) {
-            auto child = node->GetVisualChild(ci);
-            if (child) queue[queueBack++] = child;
-        }
-    }
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
-    BG3A_LOG("[BG3Access] BFS_CollectTextBlocks_SEH: fault");
-  }
-    return found;
-}
-
 // ---------------------------------------------------------------------------
 // FindTooltipTextBlocks_SEH: scans popup roots for TextBlock elements.
 // Skips popup roots that contain ContextMenuItems (those are context menus).
@@ -4522,11 +4750,12 @@ static uint32_t FindTooltipTextBlocks_SEH(
         if (!popupRoot) continue;
 
         Noesis::FrameworkElement* cmCheck[1];
-        if (FindElementsByType_SEH(popupRoot, "ContextMenuItem", cmCheck, 1) > 0)
+        if (BFS_CollectByType_SEH(popupRoot, "ContextMenuItem", cmCheck, 0, 1) > 0)
             continue;
 
         auto prevFound = found;
-        found = BFS_CollectTextBlocks_SEH(popupRoot, outTextBlocks, found, maxOut);
+        found = BFS_CollectByType_SEH(popupRoot, "TextBlock",
+            outTextBlocks, found, maxOut, true, true);
 
         // If we found TextBlocks in this popup, stop (first tooltip wins).
         if (found > prevFound) break;
@@ -4560,9 +4789,22 @@ static void PollTooltip(
     // popup may briefly show stale TextBlocks from a previous tooltip.
     // After reopen, require the fingerprint to be stable for one tick
     // before firing.  This adds exactly one tick of delay on reopen only.
+    // Also triggered on focus change: tooltip stays open but content
+    // swaps to the new element's tooltip, resolving across multiple ticks.
     static bool sWaitingForStable = false;
     static std::string sPendingFingerprint;
-    static std::vector<std::string> sPendingTexts;
+    static std::vector<ecl::lua::TickSnapshot::TooltipEntry> sPendingTexts;
+
+    // Focus changed: clear fingerprint so the tooltip content for the
+    // new element goes through stabilization instead of firing as
+    // immediate deltas while bindings resolve.
+    if (sTooltipFingerprintReset) {
+        sLastTooltipFingerprint.clear();
+        sWaitingForStable = false;
+        sPendingFingerprint.clear();
+        sPendingTexts.clear();
+        sTooltipFingerprintReset = false;
+    }
 
     // Phase 1: find TextBlocks in tooltip popups (SEH-guarded, no C++ objects).
     Noesis::FrameworkElement* textBlocks[32];
@@ -4580,44 +4822,92 @@ static void PollTooltip(
         return;
     }
 
-    // Phase 2: extract text from found TextBlocks (outside SEH).
-    std::vector<std::string> texts;
+    // Phase 2: extract ALL useful data from each TextBlock in one pass.
+    // Collects role (x:Name), parentRole, text, and fontSize so Lua
+    // has everything it needs without round-tripping back to C++.
+    std::vector<ecl::lua::TickSnapshot::TooltipEntry> texts;
     std::string fingerprint;
     for (uint32_t i = 0; i < textBlockCount; i++) {
         auto text = ReadTextBlockText(textBlocks[i]);
         if (text.empty()) continue;
         if (text.find("[ForceUpdate]") != std::string::npos) continue;
         if (text.find("s_HandleUnknown") != std::string::npos) continue;
-        // Diagnostic: log x:Name for each TextBlock to verify
-        // structured tooltip data is available from the XAML.
+
+        ecl::lua::TickSnapshot::TooltipEntry entry;
+        entry.text = std::move(text);
+
+        // x:Name of the TextBlock itself.
         {
-            static char sNameBuf[128];
-            static char sParentBuf[128];
-            sNameBuf[0] = 0;
-            sParentBuf[0] = 0;
-            ReadElementName_SEH(textBlocks[i], sNameBuf, sizeof(sNameBuf));
-            if (textBlocks[i]->mVisualParent) {
-                ReadElementName_SEH(
-                    static_cast<Noesis::FrameworkElement*>(
-                        textBlocks[i]->mVisualParent),
-                    sParentBuf, sizeof(sParentBuf));
-            }
-            BG3A_LOG("[BG3Access]   TT_STRUCT: name=%s parent=%s text=%.60s",
-                sNameBuf[0] ? sNameBuf : "(none)",
-                sParentBuf[0] ? sParentBuf : "(none)",
-                text.c_str());
+            static char nameBuf[128];
+            nameBuf[0] = 0;
+            ReadElementName_SEH(textBlocks[i], nameBuf, sizeof(nameBuf));
+            if (nameBuf[0]) entry.role = nameBuf;
         }
+
+        // Parent element x:Name (fallback context).
+        if (textBlocks[i]->mVisualParent) {
+            static char parentBuf[128];
+            parentBuf[0] = 0;
+            ReadElementName_SEH(
+                static_cast<Noesis::FrameworkElement*>(
+                    textBlocks[i]->mVisualParent),
+                parentBuf, sizeof(parentBuf));
+            if (parentBuf[0]) entry.parentRole = parentBuf;
+        }
+
+        // If element has no x:Name, promote parent to role
+        // (preserves existing behavior).
+        if (entry.role.empty() && !entry.parentRole.empty()) {
+            entry.role = entry.parentRole;
+        }
+
+        // FontSize: distinguishes title from body text when
+        // the template has no x:Names (e.g. NameAndDescTooltipContent).
+        entry.fontSize = SafeGetFontSize_SEH(textBlocks[i]);
+
+        // TypeId: read from parent container's DataContext for
+        // PropertyText entries (distinguishes Range vs ZoneRadius
+        // vs other property types).  The parent StackPanel
+        // (PropertyContainer) has a DC with TypeId/SubtypeId.
+        if (entry.role == "PropertyText"
+            && textBlocks[i]->mVisualParent) {
+            auto parentElem = static_cast<Noesis::FrameworkElement*>(
+                textBlocks[i]->mVisualParent);
+            auto parentDC = SafeGetDataContext_SEH(parentElem);
+            if (parentDC) {
+                auto parentDCType = SafeGetClassType_SEH(parentDC);
+                if (parentDCType) {
+                    auto const& parentDCClass =
+                        Noesis::gClassCache.GetClass(parentDCType);
+                    static auto sTypeIdKey = FixedString("TypeId");
+                    auto typeIdProp =
+                        parentDCClass.Names.try_get(sTypeIdKey);
+                    if (typeIdProp && typeIdProp->Property) {
+                        auto typeIdStr = ReadTypePropertyAsString(
+                            parentDC, typeIdProp->Property);
+                        if (!typeIdStr.empty()) {
+                            entry.typeId = std::move(typeIdStr);
+                        }
+                    }
+                }
+            }
+        }
+
         if (!fingerprint.empty()) fingerprint += '|';
-        fingerprint += text;
-        texts.push_back(std::move(text));
+        fingerprint += entry.text;
+        texts.emplace_back(std::move(entry));
     }
 
     if (texts.empty()) return;
 
-    // Reopen detection: fingerprint was empty (tooltip was closed), now
-    // we have content.  Enter stabilization: store but don't fire.
+    // Reopen detection: fingerprint was empty (tooltip was closed or
+    // focus changed), now we have content.  Enter stabilization: store
+    // but don't fire.  Wait for 2 consecutive stable ticks to ensure
+    // all popup content (spell info + warning overlays) has resolved.
+    static int sStableTickCount = 0;
     if (sLastTooltipFingerprint.empty()) {
         sWaitingForStable = true;
+        sStableTickCount = 0;
         sPendingFingerprint = fingerprint;
         sPendingTexts = std::move(texts);
         sLastTooltipFingerprint = fingerprint;
@@ -4627,10 +4917,19 @@ static void PollTooltip(
     }
 
     // Stabilization: waiting for fingerprint to settle after reopen.
+    // Require 2 consecutive matching ticks: spell tooltips with warning
+    // overlays resolve across multiple ticks (spell info first, then
+    // warning popup appears one tick later).
     if (sWaitingForStable) {
         if (fingerprint == sPendingFingerprint) {
-            // Same as last tick -- stable.  Fire the pending data.
+            sStableTickCount++;
+            if (sStableTickCount < 2) {
+                // Not yet stable enough -- wait another tick.
+                return;
+            }
+            // Stable for 2 ticks.  Fire the pending data.
             sWaitingForStable = false;
+            sStableTickCount = 0;
             BG3A_LOG("[BG3Access] TOOLTIP: stable after reopen (%d texts)",
                      (int)sPendingTexts.size());
             // Fall through to normal dispatch with pending data.
@@ -4640,14 +4939,18 @@ static void PollTooltip(
             sPendingFingerprint.clear();
             sPendingTexts.clear();
 
-            BG3A_LOG("[BG3Access] TOOLTIP: %d texts", (int)snapshot->tooltipTexts.size());
-            for (auto const& text : snapshot->tooltipTexts) {
-                BG3A_LOG("[BG3Access]   TT: %s", text.c_str());
+            BG3A_LOG("[BG3Access] TOOLTIP: %d entries", (int)snapshot->tooltipTexts.size());
+            for (auto const& entry : snapshot->tooltipTexts) {
+                BG3A_LOG("[BG3Access]   TT: [%s] %s (%.0f)",
+                         entry.role.empty() ? "?" : entry.role.c_str(),
+                         entry.text.c_str(), entry.fontSize);
             }
             return;
         } else {
             // Fingerprint changed -- bindings still resolving.  Update
-            // pending and wait another tick.
+            // pending, reset stable count, and wait for a fresh run of
+            // consecutive stable ticks.
+            sStableTickCount = 0;
             sPendingFingerprint = fingerprint;
             sPendingTexts = std::move(texts);
             sLastTooltipFingerprint = fingerprint;
@@ -4664,9 +4967,11 @@ static void PollTooltip(
     snapshot->tooltipChanged = true;
     snapshot->tooltipTexts = std::move(texts);
 
-    BG3A_LOG("[BG3Access] TOOLTIP: %d texts", (int)snapshot->tooltipTexts.size());
-    for (auto const& text : snapshot->tooltipTexts) {
-        BG3A_LOG("[BG3Access]   TT: %s", text.c_str());
+    BG3A_LOG("[BG3Access] TOOLTIP: %d entries", (int)snapshot->tooltipTexts.size());
+    for (auto const& entry : snapshot->tooltipTexts) {
+        BG3A_LOG("[BG3Access]   TT: [%s] %s (%.0f)",
+                 entry.role.empty() ? "?" : entry.role.c_str(),
+                 entry.text.c_str(), entry.fontSize);
     }
 }
 
@@ -4940,6 +5245,43 @@ static Noesis::UIElement* ReadFocusManagerDP_SEH(
     }
 }
 
+// ---------------------------------------------------------------------------
+// DescendFirstChildAndFindName: shared 5-level first-child descent for
+// NameScope lookup.  Walks the first-child chain from a widget root,
+// calling FindNodeName at each level.  O(1) hash lookup per level.
+// Returns the found FrameworkElement or nullptr.
+//
+// No SEH block -- callers (FindNameInWidgets_SEH, FindNameInWidget)
+// provide their own __try/__except.
+// ---------------------------------------------------------------------------
+static Noesis::FrameworkElement* DescendFirstChildAndFindName(
+    Noesis::Visual* widgetRoot, const char* name)
+{
+    // Return type is a raw pointer (no destructor), so __try is safe here.
+    __try {
+        Noesis::Visual* current = widgetRoot;
+        for (int depth = 0; depth < 5; depth++) {
+            auto childCount = current->GetVisualChildrenCount();
+            if (childCount == 0) break;
+            auto child = current->GetVisualChild(0);
+            if (!child) break;
+            if (!ProbeUIElement(static_cast<Noesis::UIElement*>(child)))
+                break;
+            auto childFrameworkElement =
+                static_cast<Noesis::FrameworkElement*>(child);
+            auto found = Noesis::FrameworkElementHelpers::FindNodeName(
+                childFrameworkElement, name);
+            if (found) {
+                return static_cast<Noesis::FrameworkElement*>(found);
+            }
+            current = child;
+        }
+        return nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
 // FindNameInWidgets_SEH: like FindNameInWidget but uses a pre-gathered
 // widgets array instead of re-discovering the container.  Avoids the
 // GetVisualChildrenCount/GetVisualChild calls on the container.
@@ -4955,23 +5297,9 @@ static Noesis::FrameworkElement* FindNameInWidgets_SEH(
             if (!ProbeUIElement(static_cast<Noesis::UIElement*>(
                     widgets[widgetIndex]))) continue;
 
-            Noesis::Visual* current = widgets[widgetIndex];
-            for (int depth = 0; depth < 5; depth++) {
-                auto childCount = current->GetVisualChildrenCount();
-                if (childCount == 0) break;
-                auto child = current->GetVisualChild(0);
-                if (!child) break;
-                if (!ProbeUIElement(static_cast<Noesis::UIElement*>(child)))
-                    break;
-                auto childFrameworkElement = static_cast<Noesis::FrameworkElement*>(
-                    child);
-                auto found = Noesis::FrameworkElementHelpers::FindNodeName(
-                    childFrameworkElement, name);
-                if (found) {
-                    return static_cast<Noesis::FrameworkElement*>(found);
-                }
-                current = child;
-            }
+            auto found = DescendFirstChildAndFindName(
+                widgets[widgetIndex], name);
+            if (found) return found;
         }
         return nullptr;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -5376,23 +5704,8 @@ Noesis::FrameworkElement* FindNameInWidget(char const* name)
             if (!IsUIWidgetType(widget) || !IsVisibleDP(widget))
                 continue;
 
-            Noesis::Visual* cur = widget;
-            for (int depth = 0; depth < 5; depth++) {
-                auto childCount = cur->GetVisualChildrenCount();
-                if (childCount == 0) break;
-
-                auto child = cur->GetVisualChild(0);
-                if (!child) break;
-                if (!ProbeUIElement(static_cast<Noesis::UIElement*>(child))) break;
-
-                auto childFE = static_cast<Noesis::FrameworkElement*>(child);
-                auto found = Noesis::FrameworkElementHelpers::FindNodeName(childFE, name);
-                if (found) {
-                    return static_cast<Noesis::FrameworkElement*>(found);
-                }
-
-                cur = child;
-            }
+            auto found = DescendFirstChildAndFindName(widget, name);
+            if (found) return found;
         }
 
         return nullptr;
@@ -5400,6 +5713,128 @@ Noesis::FrameworkElement* FindNameInWidget(char const* name)
         BG3A_LOG("[BG3Access] FindNameInWidget: SEH fault for '%s'", name ? name : "(null)");
         return nullptr;
     }
+}
+
+// ---------------------------------------------------------------------------
+// QueryNamedElement: find a named element and return ALL useful data as
+// a Lua table.  Generic -- no CC or menu knowledge.  Lua passes the
+// x:Name, C++ returns dcType, elemType, elemText, isVisible, elemAddr.
+// Returns nil if element not found.
+// ---------------------------------------------------------------------------
+// QueryNamedElement_Inner: extracts all useful data from a named element.
+// Uses std::string (ReadTextBlockText, ReadPropertyAsString) -- must NOT
+// be inside __try (MSVC C2712).
+static void QueryNamedElement_Inner(lua_State* L,
+    Noesis::FrameworkElement* elem, int propsTableIndex)
+{
+    lua_newtable(L);
+
+    // elemType
+    auto elemTypeName = SafeBaseObjectTypeName_SEH(elem);
+    if (elemTypeName) {
+        lua_pushstring(L, "elemType");
+        lua_pushstring(L, elemTypeName);
+        lua_settable(L, -3);
+    }
+
+    // elemAddr
+    {
+        char addrBuf[20];
+        snprintf(addrBuf, sizeof(addrBuf), "%p", elem);
+        lua_pushstring(L, "elemAddr");
+        lua_pushstring(L, addrBuf);
+        lua_settable(L, -3);
+    }
+
+    // dcType
+    auto dc = SafeReadDC_SEH(
+        static_cast<Noesis::DependencyObject const*>(elem));
+    if (dc) {
+        auto dcTypeStr = SafeBaseObjectTypeName_SEH(dc);
+        if (dcTypeStr) {
+            lua_pushstring(L, "dcType");
+            lua_pushstring(L, dcTypeStr);
+            lua_settable(L, -3);
+        }
+    }
+
+    // isVisible
+    lua_pushstring(L, "isVisible");
+    lua_pushboolean(L, IsVisibleDP(elem));
+    lua_settable(L, -3);
+
+    // elemText (for TextBlocks)
+    auto text = ReadTextBlockText(elem);
+    if (!text.empty()
+        && text.find("[ForceUpdate]") == std::string::npos) {
+        lua_pushstring(L, "elemText");
+        lua_pushstring(L, text.c_str());
+        lua_settable(L, -3);
+    }
+
+    // Optional property reads: if Lua passed a table of property
+    // names as arg 2, read each via ReadPropertyAsString and
+    // include directly on the result table.
+    if (propsTableIndex > 0 && lua_istable(L, propsTableIndex)) {
+        int propsLen = (int)lua_rawlen(L, propsTableIndex);
+        for (int pi = 1; pi <= propsLen; pi++) {
+            lua_rawgeti(L, propsTableIndex, pi);
+            if (lua_isstring(L, -1)) {
+                const char* propName = lua_tostring(L, -1);
+                auto propVal = ReadPropertyAsString(elem, propName);
+                if (!propVal.empty()) {
+                    lua_pushstring(L, propName);
+                    lua_pushstring(L, propVal.c_str());
+                    lua_settable(L, -4);  // result table
+                }
+            }
+            lua_pop(L, 1);  // pop the property name from rawgeti
+        }
+    }
+}
+
+// QueryNamedElement_Invoke: no destructors, SEH-compatible.
+static void QueryNamedElement_Invoke(lua_State* L,
+    Noesis::FrameworkElement* elem, int propsTableIndex)
+{
+    QueryNamedElement_Inner(L, elem, propsTableIndex);
+}
+
+// QueryNamedElement(name [, propsTable]): find a named element across
+// visible widgets and return a table with all useful data.
+// Generic -- no CC or menu knowledge.
+//   name: x:Name string to find
+//   propsTable: optional array of property name strings to read
+// Returns table {elemType, elemAddr, dcType, isVisible, elemText,
+//   props={propName=value, ...}} or nil if not found.
+UserReturn QueryNamedElement(lua_State* L)
+{
+    auto name = luaL_checkstring(L, 1);
+    if (!name || !name[0]) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    int propsTableIndex = lua_istable(L, 2) ? 2 : 0;
+
+    auto elem = FindNameInWidget(name);
+    if (!elem) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    // Record stack top before the call.  If _Invoke faults
+    // partway through (table partially built), restore the
+    // stack to its pre-call state and push nil instead.
+    int stackTop = lua_gettop(L);
+
+    __try {
+        QueryNamedElement_Invoke(L, elem, propsTableIndex);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        lua_settop(L, stackTop);
+        lua_pushnil(L);
+    }
+    return 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -6044,6 +6479,159 @@ static Noesis::Type const* UnwrapType(Noesis::Type const* type)
     return type;
 }
 
+// ---------------------------------------------------------------------------
+// ConvertRawValueToString: shared value-to-string conversion for all
+// Noesis scalar types.  Given a raw pointer to stored data and the
+// unwrapped Noesis type, returns the string representation.
+//
+// Handles: String, CStringPtr, LocaString, Bool, Int32, UInt32, Int64,
+// Single, Double, Enum.  Returns empty for unrecognized types (Ptr, object).
+//
+// Pointer semantics (same for TypeProperty::Get and StoredValue):
+//   rawVal points to where the data lives:
+//   - String: rawVal is Noesis::String const*
+//   - CStringPtr: rawVal is char const* const* (pointer to the char pointer)
+//   - LocaString: rawVal is TranslatedString const*
+//   - Bool/Int/Float: rawVal points to the scalar value
+//   - Enum: rawVal points to the enum integer (read as int64_t)
+//
+// Float/Double use %g (matches TypeProperty behavior).
+// Enum values are resolved to symbolic names via TypeEnum::mValues.
+// Unregistered enum values are logged once per (type, value) pair.
+// ---------------------------------------------------------------------------
+// _Inner: dereferences raw Noesis data pointers that could be stale.
+// Uses std::string (destructor) -- cannot live inside __try.
+static std::string ConvertRawValueToString_Inner(void const* rawVal,
+                                                  Noesis::Type const* type)
+{
+    if (!rawVal || !type) return {};
+    auto& types = Noesis::gStaticSymbols.Types;
+
+    if (type == types.String.Type) {
+        auto str = reinterpret_cast<Noesis::String const*>(rawVal);
+        if (str && str->Size() > 0) return str->Str();
+    } else if (type == types.CStringPtr.Type) {
+        auto charPtrStorage = reinterpret_cast<char const* const*>(rawVal);
+        if (charPtrStorage) {
+            auto charPtr = *charPtrStorage;
+            if (charPtr && charPtr[0] != '\0') return charPtr;
+        }
+    } else if (type == types.LocaString.Type) {
+        auto translatedString = reinterpret_cast<TranslatedString const*>(rawVal);
+        if (translatedString) {
+            auto resolved = translatedString->Get();
+            if (resolved && !resolved->empty()
+                && resolved->find("s_HandleUnknown") == std::string::npos) {
+                return std::string(resolved->data(), resolved->size());
+            }
+        }
+    } else if (type == types.Bool.Type) {
+        return *static_cast<bool const*>(rawVal) ? "On" : "Off";
+    } else if (type == types.Int32.Type) {
+        return std::to_string(*static_cast<int32_t const*>(rawVal));
+    } else if (type == types.UInt32.Type) {
+        return std::to_string(*static_cast<uint32_t const*>(rawVal));
+    } else if (type == types.Int64.Type) {
+        return std::to_string(*static_cast<int64_t const*>(rawVal));
+    } else if (type == types.Single.Type) {
+        char buffer[32];
+        snprintf(buffer, sizeof(buffer), "%g",
+                 *static_cast<float const*>(rawVal));
+        return buffer;
+    } else if (type == types.Double.Type) {
+        char buffer[32];
+        snprintf(buffer, sizeof(buffer), "%g",
+                 *static_cast<double const*>(rawVal));
+        return buffer;
+    } else if (Noesis::TypeHelpers::IsDescendantOf(
+                   type->GetClassType(),
+                   Noesis::gStaticSymbols.TypeClasses.TypeEnum.Type)) {
+        auto enumValue = *static_cast<int64_t const*>(rawVal);
+        auto enumType = static_cast<Noesis::TypeEnum const*>(type);
+        for (auto const& entry : enumType->mValues) {
+            if (entry.second == enumValue) {
+                return std::string(entry.first.Str());
+            }
+        }
+        // Enum value not registered in Noesis.  Larian's enum registrations
+        // are incomplete -- they only register values used in XAML triggers.
+        // Log once per (type, value) pair to avoid per-tick spam.
+        auto enumTypeName = enumType->GetName();
+        {
+            struct EnumGapEntry { const char* typeName; int64_t value; };
+            static EnumGapEntry sLoggedGaps[32];
+            static uint32_t sLoggedGapCount = 0;
+            bool alreadyLogged = false;
+            for (uint32_t gapIndex = 0; gapIndex < sLoggedGapCount; gapIndex++) {
+                if (sLoggedGaps[gapIndex].value == enumValue
+                    && sLoggedGaps[gapIndex].typeName == enumTypeName) {
+                    alreadyLogged = true;
+                    break;
+                }
+            }
+            if (!alreadyLogged && sLoggedGapCount < 32) {
+                sLoggedGaps[sLoggedGapCount++] = { enumTypeName, enumValue };
+                BG3A_LOG("[BG3Access] Unresolved enum: type=%s value=%lld",
+                         enumTypeName ? enumTypeName : "?",
+                         (long long)enumValue);
+            }
+        }
+        return std::to_string(enumValue);
+    }
+    return {};
+}
+
+// _Invoke: no destructors, SEH-compatible.
+static void ConvertRawValueToString_Invoke(void const* rawVal,
+    Noesis::Type const* type, std::string* outStr)
+{
+    *outStr = ConvertRawValueToString_Inner(rawVal, type);
+}
+// SEH wrapper: no C++ objects with destructors in this frame.
+static bool SafeConvertRawValueToString_SEH(void const* rawVal,
+    Noesis::Type const* type, std::string* outStr)
+{
+    __try {
+        ConvertRawValueToString_Invoke(rawVal, type, outStr);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+// Public API: owns the std::string, calls SEH wrapper.
+static std::string ConvertRawValueToString(void const* rawVal,
+                                            Noesis::Type const* type)
+{
+    std::string result;
+    if (!SafeConvertRawValueToString_SEH(rawVal, type, &result))
+        result.clear();
+    return result;
+}
+
+// IsScalarValueType: returns true if the type is a scalar that
+// ConvertRawValueToString can handle.  Used by DC property enumeration
+// to decide whether to read a property as a string vs. recurse into
+// sub-objects.
+static bool IsScalarValueType(Noesis::Type const* type)
+{
+    if (!type) return false;
+    auto& types = Noesis::gStaticSymbols.Types;
+    if (type == types.String.Type
+        || type == types.CStringPtr.Type
+        || type == types.LocaString.Type
+        || type == types.Bool.Type
+        || type == types.Int32.Type
+        || type == types.UInt32.Type
+        || type == types.Int64.Type
+        || type == types.Single.Type
+        || type == types.Double.Type) {
+        return true;
+    }
+    return Noesis::TypeHelpers::IsDescendantOf(
+        type->GetClassType(),
+        Noesis::gStaticSymbols.TypeClasses.TypeEnum.Type);
+}
+
 // Read a named TypeProperty as std::string.  Handles String, CStringPtr,
 // LocaString (TranslatedString), bool, int, float.  Returns empty for
 // unrecognised or object types.
@@ -6106,39 +6694,10 @@ static std::string ReadTypePropertyAsString_Inner(Noesis::BaseObject const* obj,
                    type->GetClassType(),
                    Noesis::gStaticSymbols.TypeClasses.TypeEnum.Type)) {
         // Enum properties (e.g. Ability=Strength, Skill=Deception).
-        // Read the underlying integer and look up the symbolic name.
+        // Read the underlying integer, then delegate to shared resolver.
         int64_t enumValue = 0;
         if (!SafeTypePropertyGetCopy_SEH(prop, obj, &enumValue)) return {};
-        auto enumType = static_cast<Noesis::TypeEnum const*>(type);
-        for (auto const& entry : enumType->mValues) {
-            if (entry.second == enumValue) {
-                return std::string(entry.first.Str());
-            }
-        }
-        // Enum value not registered in Noesis.  Larian's enum registrations
-        // are incomplete -- they only register values used in XAML triggers.
-        // Log once per (type, value) pair to avoid per-tick spam.
-        auto enumTypeName = enumType->GetName();
-        {
-            struct EnumGapEntry { const char* typeName; int64_t value; };
-            static EnumGapEntry sLoggedGaps[32];
-            static uint32_t sLoggedGapCount = 0;
-            bool alreadyLogged = false;
-            for (uint32_t gi = 0; gi < sLoggedGapCount; gi++) {
-                if (sLoggedGaps[gi].value == enumValue
-                    && sLoggedGaps[gi].typeName == enumTypeName) {
-                    alreadyLogged = true;
-                    break;
-                }
-            }
-            if (!alreadyLogged && sLoggedGapCount < 32) {
-                sLoggedGaps[sLoggedGapCount++] = { enumTypeName, enumValue };
-                BG3A_LOG("[BG3Access] Unresolved enum: type=%s value=%lld",
-                         enumTypeName ? enumTypeName : "?", (long long)enumValue);
-            }
-        }
-
-        return std::to_string(enumValue);
+        return ConvertRawValueToString(&enumValue, type);
     }
     // Pointer / Ptr / object types -- not convertible to string here.
     return {};
@@ -6192,25 +6751,17 @@ static std::string ReadDepPropertyAsString_Inner(Noesis::DependencyObject const*
             }
 
             if (rawVal) {
-                // Scalar types: read directly from the raw value
-                if (type == types.String.Type) {
-                    auto str = reinterpret_cast<Noesis::String*>(rawVal);
-                    if (str && str->Size() > 0) return str->Str();
-                } else if (type == types.Bool.Type) {
-                    return *static_cast<bool*>(rawVal) ? "On" : "Off";
-                } else if (type == types.Int32.Type) {
-                    return std::to_string(*static_cast<int32_t*>(rawVal));
-                } else if (type == types.Single.Type) {
-                    char buf[32];
-                    snprintf(buf, sizeof(buf), "%.0f", *static_cast<float*>(rawVal));
-                    return buf;
-                }
+                // Scalar + enum types via shared converter (handles all
+                // types including CStringPtr, LocaString, UInt32, Int64,
+                // Double, Enum that were previously missing from this path).
+                auto scalarResult = ConvertRawValueToString(rawVal, type);
+                if (!scalarResult.empty()) return scalarResult;
 
                 // Object-typed DP (Content, etc.): rawVal IS the object pointer.
                 // The binding converter cached its result as the base value.
                 // Only attempt ToString if the DP type actually descends from
                 // BaseObject -- otherwise rawVal is a raw data pointer for an
-                // unhandled value type (enum, struct, Thickness, etc.) and
+                // unhandled value type (struct, Thickness, etc.) and
                 // reinterpret_casting it as BaseObject* would crash.
                 auto& classes = Noesis::gStaticSymbols.TypeClasses;
                 if (Noesis::TypeHelpers::IsDescendantOf(type, classes.BaseObject.Type)) {
@@ -6235,20 +6786,8 @@ static std::string ReadDepPropertyAsString_Inner(Noesis::DependencyObject const*
     auto val = dp->GetValue(depObj);
     if (!val) return {};
 
-    if (type == types.String.Type) {
-        auto str = reinterpret_cast<Noesis::String const*>(val);
-        if (str && str->Size() > 0) return str->Str();
-    } else if (type == types.Bool.Type) {
-        return *static_cast<const bool*>(val) ? "On" : "Off";
-    } else if (type == types.Int32.Type) {
-        return std::to_string(*static_cast<const int32_t*>(val));
-    } else if (type == types.Single.Type) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%.0f", *static_cast<const float*>(val));
-        return buf;
-    }
-
-    return {};
+    // Shared converter handles all scalar + enum types.
+    return ConvertRawValueToString(val, type);
 }
 
 static void ReadDepPropertyAsString_Invoke(Noesis::DependencyObject const* depObj,
@@ -6294,18 +6833,9 @@ static std::string ReadDPFromMValues_Inner(Noesis::DependencyObject const* depOb
 
         auto& types = Noesis::gStaticSymbols.Types;
 
-        if (dpType == types.String.Type) {
-            auto str = reinterpret_cast<Noesis::String*>(rawVal);
-            if (str && str->Size() > 0) return str->Str();
-        } else if (dpType == types.Bool.Type) {
-            return *static_cast<bool*>(rawVal) ? "On" : "Off";
-        } else if (dpType == types.Int32.Type) {
-            return std::to_string(*static_cast<int32_t*>(rawVal));
-        } else if (dpType == types.Single.Type) {
-            char buf[32];
-            snprintf(buf, sizeof(buf), "%.0f", *static_cast<float*>(rawVal));
-            return buf;
-        }
+        // Scalar + enum types via shared converter.
+        auto scalarResult = ConvertRawValueToString(rawVal, dpType);
+        if (!scalarResult.empty()) return scalarResult;
 
         // Object-typed DP: rawVal is the cached binding result.
         // Only attempt ToString if the DP type descends from BaseObject.
@@ -6499,6 +7029,22 @@ static void ReadElementName_SEH(Noesis::FrameworkElement* elem,
 {
     __try { ReadElementName_Invoke(elem, buf, bufSize); }
     __except (EXCEPTION_EXECUTE_HANDLER) { buf[0] = 0; }
+}
+
+// SafeGetFontSize: read FontSize via the cached sFontSizeProp DP using
+// GetValue() which resolves the full provider chain (including Style
+// values).  No C++ objects with destructors -- SEH-safe directly.
+static float SafeGetFontSize_SEH(Noesis::FrameworkElement* elem)
+{
+    __try {
+        if (!sFontSizeProp) return 0.0f;
+        auto val = sFontSizeProp->GetValue(
+            static_cast<Noesis::DependencyObject const*>(elem));
+        if (!val) return 0.0f;
+        return *static_cast<float const*>(val);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0.0f;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6803,32 +7349,38 @@ static void TryCollectNamedTexts(
 }
 
 // ---------------------------------------------------------------------------
-// GatherVisibleTextBlocks: BFS walk of the visual tree to find TextBlocks
-// with readable text.  Used as a fallback when NameScope iteration finds
-// nothing (e.g., splash screen text inside ControlTemplates), and by the
-// event-driven tooltip dispatch to extract TextBlocks from a ToolTip's
-// content tree.
+// BFS_VisitTextBlocks: shared BFS core for walking visual subtrees and
+// visiting each TextBlock found.  Replaces three separate BFS functions
+// (GatherVisibleTextBlocks, ShallowChildTextScan, ReadWidgetTexts) that
+// had identical detection/reading/filtering logic.
 //
-// Three-layer SEH-safe pattern (matches ReadTextBlockText):
-// - _Inner: contains C++ destructors (queue vector, std::string returned
-//   from ReadTextBlockText).  Cannot live inside __try (MSVC C2712).
-// - _Invoke: SEH-safe shim with no destructors.  Forwards to _Inner.
-// - public wrapper: __try/__except around _Invoke.  Catches stale-pointer
-//   faults that escape the inner ProbeUIElement / SafeGetVisualChild
-//   guards.  Logs and returns gracefully on fault.
+// Parameters:
+//   root: starting element for the BFS.
+//   maxDepth: maximum tree depth to explore (0 = unlimited).
+//   maxNodes: maximum nodes to process (queue capacity).
+//   skipUIWidgets: skip child UIWidget elements (they have their own scope).
+//   visitor: called for each TextBlock with valid text.
+//            Receives the TextBlock element, its text (moved), and context.
+//            Return true to continue, false to stop.
+//   context: opaque pointer forwarded to visitor.
 //
-// Safety guards inside _Inner:
-// - Only called on fresh pointers from the current tick
-// - IsVisibleDP pruning skips collapsed branches
-// - Depth and node count caps prevent runaway walks
-// - Does not recurse into child UIWidgets (separate scope)
-// - ReadTextBlockText is proven safe (used throughout the codebase)
+// Safety: ProbeUIElement + IsVisibleDP on every node.  ReadTextBlockText
+// is proven safe.  No Noesis pointers escape this function.
+// This is an _Inner function (uses C++ objects with destructors: vector,
+// string from ReadTextBlockText).  Must NOT live inside __try.
 // ---------------------------------------------------------------------------
-static void GatherVisibleTextBlocks_Inner(
-    Noesis::FrameworkElement* root,
-    std::vector<std::string>& outTexts,
+typedef bool (*TextBlockVisitorFn)(Noesis::FrameworkElement* textBlock,
+                                    std::string&& text, void* context);
+
+// _Inner: uses std::vector and std::string (destructors) -- cannot
+// live inside __try (MSVC C2712).
+static void BFS_VisitTextBlocks_Inner(
+    Noesis::Visual* root,
     int maxDepth,
-    int maxNodes)
+    int maxNodes,
+    bool skipUIWidgets,
+    TextBlockVisitorFn visitor,
+    void* context)
 {
     if (!root) return;
 
@@ -6836,34 +7388,42 @@ static void GatherVisibleTextBlocks_Inner(
         Noesis::Visual* node;
         int depth;
     };
-    // Stack-allocated queue with fixed capacity.
     std::vector<QueueEntry> queue;
-    queue.reserve(maxNodes);
+    queue.reserve(maxNodes > 0 ? maxNodes : 512);
     queue.push_back({root, 0});
     int processed = 0;
+    int nodeLimit = maxNodes > 0 ? maxNodes : 512;
 
-    while (processed < (int)queue.size() && processed < maxNodes) {
+    while (processed < (int)queue.size() && processed < nodeLimit) {
         auto entry = queue[processed++];
-        if (!entry.node || entry.depth > maxDepth) continue;
-        // Validate before virtual calls -- element may be stale.
-        if (!ProbeUIElement(static_cast<Noesis::UIElement*>(entry.node))) continue;
+        if (!entry.node) continue;
+        if (maxDepth > 0 && entry.depth > maxDepth) continue;
+        if (!ProbeUIElement(static_cast<Noesis::UIElement*>(entry.node)))
+            continue;
         if (!IsVisibleDP(entry.node)) continue;
 
-        // Do not recurse into child UIWidgets -- they have their own scope.
-        if (entry.node != root && SafeIsUIWidgetType_SEH(entry.node)) continue;
+        // Skip child UIWidgets -- they have their own scope.
+        if (skipUIWidgets && entry.node != root
+            && SafeIsUIWidgetType_SEH(entry.node)) continue;
 
         auto typeName = SafeBaseObjectTypeName_SEH(entry.node);
         if (!typeName) continue;
 
-        // Found a TextBlock: read its text and stop recursing into it
-        // (children are Inline objects handled by ReadTextBlockText).
+        // Found a TextBlock: read text immediately (before finding more
+        // TextBlocks, so binding evaluation can't destabilize unfound nodes).
+        // Don't recurse into TextBlock children (Inline objects handled by
+        // ReadTextBlockText).
         if (strstr(typeName, "TextBlock")) {
             auto text = ReadTextBlockText(
                 static_cast<Noesis::FrameworkElement*>(entry.node));
             if (!text.empty()
                 && text.find("[ForceUpdate]") == std::string::npos
                 && text.find("s_HandleUnknown") == std::string::npos) {
-                outTexts.push_back(std::move(text));
+                if (!visitor(
+                        static_cast<Noesis::FrameworkElement*>(entry.node),
+                        std::move(text), context)) {
+                    return;  // Visitor says stop
+                }
             }
             continue;
         }
@@ -6871,16 +7431,90 @@ static void GatherVisibleTextBlocks_Inner(
         // Enqueue visible children for BFS -- SEH-guarded.
         auto childCount = SafeGetVisualChildrenCount_SEH(entry.node);
         for (uint32_t i = 0; i < childCount
-             && (int)queue.size() < maxNodes; i++) {
+             && (int)queue.size() < nodeLimit; i++) {
             auto child = SafeGetVisualChild_SEH(entry.node, i);
             if (child) queue.push_back({child, entry.depth + 1});
         }
     }
 }
 
-// _Invoke: no destructors, SEH-compatible.  Pointer to vector instead of
-// reference so the local has no destructor (parameter passing of a
-// reference is destructor-free, but keeping the convention explicit).
+// _Invoke: no destructors, SEH-compatible.  All parameters are POD.
+static void BFS_VisitTextBlocks_Invoke(
+    Noesis::Visual* root, int maxDepth, int maxNodes,
+    bool skipUIWidgets, TextBlockVisitorFn visitor, void* context)
+{
+    BFS_VisitTextBlocks_Inner(root, maxDepth, maxNodes,
+                              skipUIWidgets, visitor, context);
+}
+
+// Public wrapper with SEH guard.
+static void BFS_VisitTextBlocks(
+    Noesis::Visual* root, int maxDepth, int maxNodes,
+    bool skipUIWidgets, TextBlockVisitorFn visitor, void* context)
+{
+    __try {
+        BFS_VisitTextBlocks_Invoke(root, maxDepth, maxNodes,
+                                   skipUIWidgets, visitor, context);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        BG3A_LOG("[BG3Access] BFS_VisitTextBlocks: SEH fault");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BFS visitor callbacks
+// ---------------------------------------------------------------------------
+
+// Collects all TextBlock texts into a vector (no limit).
+static bool CollectAllTextsVisitor(Noesis::FrameworkElement*,
+                                    std::string&& text, void* context)
+{
+    auto outTexts = static_cast<std::vector<std::string>*>(context);
+    outTexts->push_back(std::move(text));
+    return true;
+}
+
+// Collects TextBlock texts up to a maximum count.
+struct BoundedCollectContext {
+    std::vector<std::string>& texts;
+    size_t maxTexts;
+};
+static bool BoundedCollectVisitor(Noesis::FrameworkElement*,
+                                   std::string&& text, void* context)
+{
+    auto ctx = static_cast<BoundedCollectContext*>(context);
+    ctx->texts.push_back(std::move(text));
+    return ctx->texts.size() < ctx->maxTexts;
+}
+
+// Takes the first TextBlock text and stops.
+struct FirstTextContext {
+    std::string result;
+};
+static bool FirstTextVisitor(Noesis::FrameworkElement*,
+                              std::string&& text, void* context)
+{
+    auto ctx = static_cast<FirstTextContext*>(context);
+    ctx->result = std::move(text);
+    return false;  // Stop after first
+}
+
+// ---------------------------------------------------------------------------
+// GatherVisibleTextBlocks: collects all visible TextBlock texts from a
+// visual subtree.  Skips child UIWidgets (separate scope).  Bounded by
+// maxDepth and maxNodes.
+//
+// Three-layer SEH pattern: _Inner -> _Invoke -> public wrapper.
+// ---------------------------------------------------------------------------
+static void GatherVisibleTextBlocks_Inner(
+    Noesis::FrameworkElement* root,
+    std::vector<std::string>& outTexts,
+    int maxDepth,
+    int maxNodes)
+{
+    BFS_VisitTextBlocks(root, maxDepth, maxNodes, true,
+                        CollectAllTextsVisitor, &outTexts);
+}
+
 static void GatherVisibleTextBlocks_Invoke(
     Noesis::FrameworkElement* root,
     std::vector<std::string>* outTexts,
@@ -6890,8 +7524,6 @@ static void GatherVisibleTextBlocks_Invoke(
     GatherVisibleTextBlocks_Inner(root, *outTexts, maxDepth, maxNodes);
 }
 
-// Public wrapper with SEH guard.  Logs on fault.  Callers see the same
-// signature they always saw -- preserves all existing call sites.
 static void GatherVisibleTextBlocks(
     Noesis::FrameworkElement* root,
     std::vector<std::string>& outTexts,
@@ -6906,43 +7538,15 @@ static void GatherVisibleTextBlocks(
 }
 
 // ---------------------------------------------------------------------------
-// ShallowChildTextScan: bounded BFS through visual children to find
-// TextBlock text.  Used by ExtractElementData for ContentControl/Control
-// elements whose displayed text is in template-generated children.
+// ShallowChildTextScan: returns the FIRST TextBlock text found within
+// 5 levels and 64 nodes.  Used by ExtractElementData for ContentControl/
+// Control elements whose displayed text is in template-generated children.
 // ---------------------------------------------------------------------------
 static std::string ShallowChildTextScan(Noesis::FrameworkElement* elem)
 {
-    if (!elem) return {};
-    std::vector<Noesis::Visual*> childQueue(64);
-    int childFront = 0, childBack = 0;
-    auto seedCount = SafeGetVisualChildrenCount_SEH(elem);
-    for (uint32_t i = 0; i < seedCount && childBack < 64; i++) {
-        auto child = SafeGetVisualChild_SEH(elem, i);
-        if (child) childQueue[childBack++] = child;
-    }
-    for (int level = 0; level < 5 && childFront < childBack; level++) {
-        int levelEnd = childBack;
-        while (childFront < levelEnd) {
-            auto cur = childQueue[childFront++];
-            auto curTypeName = SafeBaseObjectTypeName_SEH(cur);
-            if (!curTypeName) continue;
-            if (strstr(curTypeName, "TextBlock")) {
-                auto tbText = ReadTextBlockText(
-                    static_cast<Noesis::FrameworkElement*>(cur));
-                if (!tbText.empty()
-                    && tbText.find("[ForceUpdate]") == std::string::npos
-                    && tbText.find("s_HandleUnknown") == std::string::npos) {
-                    return tbText;
-                }
-            }
-            auto childChildCount = SafeGetVisualChildrenCount_SEH(cur);
-            for (uint32_t i = 0; i < childChildCount && childBack < 64; i++) {
-                auto child = SafeGetVisualChild_SEH(cur, i);
-                if (child) childQueue[childBack++] = child;
-            }
-        }
-    }
-    return {};
+    FirstTextContext context;
+    BFS_VisitTextBlocks(elem, 5, 64, false, FirstTextVisitor, &context);
+    return std::move(context.result);
 }
 
 // Guarded wrapper: probes the element before scanning.  The BFS
@@ -7430,6 +8034,10 @@ static bool SafePushDCProperties_SEH(lua_State* L, Noesis::BaseObject* dc,
     }
 }
 
+// PushDCProperties: delegates to CollectDCProperties_Inner (single source
+// of truth for DC property enumeration) and converts the result to Lua.
+// Fixes the SEH gap in the old implementation: all property reads now go
+// through SafeTypePropertyGet_SEH via CollectDCProperties_Inner.
 static void PushDCProperties(lua_State* L, Noesis::BaseObject* dc)
 {
     if (!dc) {
@@ -7437,179 +8045,54 @@ static void PushDCProperties(lua_State* L, Noesis::BaseObject* dc)
         return;
     }
 
-    auto const& cls = Noesis::gClassCache.GetClass(dc->GetClassType());
-    auto& types = Noesis::gStaticSymbols.Types;
-    auto& classes = Noesis::gStaticSymbols.TypeClasses;
+    // Collect all properties into a FocusEventData struct.
+    FocusEventData tempData;
+    CollectDCProperties_Inner(tempData, dc);
 
+    // Convert to Lua table: scalars as flat key=value pairs.
     lua_newtable(L);
 
-    for (auto& entry : cls.Names) {
-        auto propInfo = &entry.Value();
-        if (!propInfo->Property) continue;
+    for (auto const& scalar : tempData.dcScalarProps) {
+        lua_pushstring(L, scalar.first.c_str());
+        lua_pushstring(L, scalar.second.c_str());
+        lua_settable(L, -3);
+    }
 
-        auto type = UnwrapType(propInfo->Property->GetContentType());
-        if (!type) continue;
+    // Sub-objects as nested tables with _type field.
+    for (auto const& subObj : tempData.dcObjectProps) {
+        lua_newtable(L);
+        lua_pushstring(L, "_type");
+        lua_pushstring(L, subObj.typeName.c_str());
+        lua_settable(L, -3);
+        for (auto const& prop : subObj.props) {
+            lua_pushstring(L, prop.first.c_str());
+            lua_pushstring(L, prop.second.c_str());
+            lua_settable(L, -3);
+        }
+        lua_pushstring(L, subObj.propName.c_str());
+        lua_insert(L, -2);
+        lua_settable(L, -3);
+    }
 
-        auto typeOfType = type->GetClassType();
-
-        // Scalar types (including enums): read as string and add to table.
-        bool isEnum = SafeIsEnumType_SEH(typeOfType);
-        if (type == types.String.Type
-            || type == types.CStringPtr.Type
-            || type == types.LocaString.Type
-            || type == types.Bool.Type
-            || type == types.Int32.Type
-            || type == types.UInt32.Type
-            || type == types.Int64.Type
-            || type == types.Single.Type
-            || type == types.Double.Type
-            || isEnum) {
-
-            auto val = ReadTypePropertyAsString(dc, propInfo->Property);
-            if (!val.empty()
-                && val.find("[ForceUpdate]") == std::string::npos) {
-                lua_pushstring(L, entry.Key().GetString());
-                lua_pushstring(L, val.c_str());
+    // Collections as indexed arrays of sub-tables.
+    for (auto const& coll : tempData.dcCollectionProps) {
+        lua_newtable(L);
+        int luaArrayIndex = 1;
+        for (auto const& item : coll.items) {
+            lua_newtable(L);
+            lua_pushstring(L, "_type");
+            lua_pushstring(L, item.typeName.c_str());
+            lua_settable(L, -3);
+            for (auto const& prop : item.props) {
+                lua_pushstring(L, prop.first.c_str());
+                lua_pushstring(L, prop.second.c_str());
                 lua_settable(L, -3);
             }
-            continue;
+            lua_rawseti(L, -2, luaArrayIndex++);
         }
-
-        // Object types (Ptr<T>, T*): try to read scalar sub-properties
-        // as a nested table.  Covers SelectedItem, etc.
-        bool isPtr = (typeOfType == types.TypePtr.Type)
-                  || (typeOfType == types.TypePointer.Type)
-                  || Noesis::TypeHelpers::IsDescendantOf(
-                         type, classes.BaseObject.Type);
-        if (isPtr) {
-            Noesis::BaseObject* subObj = nullptr;
-            if (typeOfType == types.TypePtr.Type) {
-                auto ptrVal = reinterpret_cast<Noesis::Ptr<Noesis::BaseRefCounted>*>(
-                    const_cast<void*>(propInfo->Property->Get(dc)));
-                if (ptrVal) subObj = static_cast<Noesis::BaseObject*>(ptrVal->GetPtr());
-            } else if (typeOfType == types.TypePointer.Type) {
-                propInfo->Property->GetCopy(dc, &subObj);
-            } else {
-                subObj = reinterpret_cast<Noesis::BaseObject*>(
-                    const_cast<void*>(propInfo->Property->Get(dc)));
-            }
-
-            if (subObj) {
-                auto subClassType = subObj->GetClassType();
-                if (!subClassType) continue;
-
-                // Collection types: enumerate items as an indexed array
-                // of sub-tables.  Each item gets its own table with _type
-                // and scalar properties.
-                if (Noesis::TypeHelpers::IsDescendantOf(
-                        subClassType, classes.BaseCollection.Type)) {
-                    auto collection = static_cast<Noesis::BaseCollection*>(subObj);
-                    int itemCount = SafeCollectionCount(collection);
-                    if (itemCount > 0) {
-                        lua_newtable(L);
-                        int luaArrayIndex = 1;
-                        int itemLimit = (itemCount > 20) ? 20 : itemCount;
-                        for (int itemIndex = 0; itemIndex < itemLimit; itemIndex++) {
-                            auto collectionItem = SafeCollectionGetItem_SEH(
-                                collection, static_cast<uint32_t>(itemIndex));
-                            if (!collectionItem) continue;
-                            auto itemClassType = SafeGetClassType_SEH(collectionItem);
-                            if (!itemClassType) {
-                                collectionItem->Release();
-                                continue;
-                            }
-                            lua_newtable(L);
-                            lua_pushstring(L, "_type");
-                            lua_pushstring(L, itemClassType->GetName());
-                            lua_settable(L, -3);
-                            bool hasItemProps = false;
-                            auto const& itemClass =
-                                Noesis::gClassCache.GetClass(itemClassType);
-                            for (auto& itemEntry : itemClass.Names) {
-                                if (!itemEntry.Value().Property) continue;
-                                auto itemType = UnwrapType(
-                                    itemEntry.Value().Property->GetContentType());
-                                if (!itemType) continue;
-                                if (itemType == types.String.Type
-                                    || itemType == types.CStringPtr.Type
-                                    || itemType == types.LocaString.Type
-                                    || itemType == types.Bool.Type
-                                    || itemType == types.Int32.Type
-                                    || itemType == types.UInt32.Type
-                                    || itemType == types.Single.Type) {
-                                    auto itemValue = ReadTypePropertyAsString(
-                                        static_cast<Noesis::BaseObject*>(
-                                            collectionItem),
-                                        itemEntry.Value().Property);
-                                    if (!itemValue.empty()
-                                        && itemValue.find("[ForceUpdate]") ==
-                                               std::string::npos) {
-                                        lua_pushstring(L,
-                                            itemEntry.Key().GetString());
-                                        lua_pushstring(L, itemValue.c_str());
-                                        lua_settable(L, -3);
-                                        hasItemProps = true;
-                                    }
-                                }
-                            }
-                            collectionItem->Release();
-                            if (hasItemProps) {
-                                lua_rawseti(L, -2, luaArrayIndex++);
-                            } else {
-                                lua_pop(L, 1);
-                            }
-                        }
-                        if (luaArrayIndex > 1) {
-                            lua_pushstring(L, entry.Key().GetString());
-                            lua_insert(L, -2);
-                            lua_settable(L, -3);
-                        } else {
-                            lua_pop(L, 1);
-                        }
-                    }
-                    continue;
-                }
-
-                // Regular sub-object: read scalar sub-properties.
-                auto const& subCls = Noesis::gClassCache.GetClass(subClassType);
-                lua_newtable(L);
-                bool hasAny = false;
-
-                lua_pushstring(L, "_type");
-                lua_pushstring(L, subClassType->GetName());
-                lua_settable(L, -3);
-
-                for (auto& subEntry : subCls.Names) {
-                    if (!subEntry.Value().Property) continue;
-                    auto subType = UnwrapType(subEntry.Value().Property->GetContentType());
-                    if (!subType) continue;
-                    if (subType == types.String.Type
-                        || subType == types.CStringPtr.Type
-                        || subType == types.LocaString.Type
-                        || subType == types.Bool.Type
-                        || subType == types.Int32.Type
-                        || subType == types.UInt32.Type
-                        || subType == types.Single.Type) {
-                        auto subVal = ReadTypePropertyAsString(subObj, subEntry.Value().Property);
-                        if (!subVal.empty()
-                            && subVal.find("[ForceUpdate]") == std::string::npos) {
-                            lua_pushstring(L, subEntry.Key().GetString());
-                            lua_pushstring(L, subVal.c_str());
-                            lua_settable(L, -3);
-                            hasAny = true;
-                        }
-                    }
-                }
-
-                if (hasAny) {
-                    lua_pushstring(L, entry.Key().GetString());
-                    lua_insert(L, -2);  // swap key and table
-                    lua_settable(L, -3);
-                } else {
-                    lua_pop(L, 1);  // discard empty sub-table
-                }
-            }
-        }
+        lua_pushstring(L, coll.propName.c_str());
+        lua_insert(L, -2);
+        lua_settable(L, -3);
     }
 }
 
@@ -7770,6 +8253,54 @@ static std::string ExtractTabName(Noesis::FrameworkElement* elem) {
 }
 
 // ---------------------------------------------------------------------------
+// FindWidgetRootId: walks the visual parent chain (max 64 hops) to find
+// the nearest UIWidget ancestor.  Returns a hex pointer string for use
+// as a stable widget identity token.  Returns empty if no UIWidget found.
+// SEH-guarded: SafeGetVisualParent_SEH / SafeIsUIWidgetType_SEH handle
+// stale pointers during UI rebuilds.
+// ---------------------------------------------------------------------------
+// _Inner: uses std::string (destructor), cannot live inside __try.
+static std::string FindWidgetRootId_Inner(Noesis::Visual* startElement)
+{
+    Noesis::Visual* current = startElement;
+    for (int hop = 0; hop < 64 && current; hop++) {
+        if (SafeIsUIWidgetType_SEH(current)) {
+            char buffer[32];
+            snprintf(buffer, sizeof(buffer), "%p",
+                     static_cast<void*>(current));
+            return std::string(buffer);
+        }
+        current = SafeGetVisualParent_SEH(current);
+    }
+    return {};
+}
+// _Invoke: no destructors, SEH-compatible.
+static void FindWidgetRootId_Invoke(Noesis::Visual* startElement,
+                                     std::string* outResult)
+{
+    *outResult = FindWidgetRootId_Inner(startElement);
+}
+// SEH wrapper: no C++ objects with destructors in this frame.
+static bool SafeFindWidgetRootId_SEH(Noesis::Visual* startElement,
+                                      std::string* outResult)
+{
+    __try {
+        FindWidgetRootId_Invoke(startElement, outResult);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+// Public API: owns the std::string, calls SEH wrapper.
+static std::string FindWidgetRootId(Noesis::Visual* startElement)
+{
+    std::string result;
+    if (!SafeFindWidgetRootId_SEH(startElement, &result))
+        result.clear();
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // ExtractElementInfo: builds a Lua table with all fields from a focused
 // element.  Called during Tick() when the element is alive.
 //
@@ -7910,23 +8441,12 @@ static void ExtractElementInfo_Inner(lua_State* L, Noesis::FrameworkElement* ele
     }
     lua_settable(L, -3);
 
-    // widgetRootId: walk parent chain to UIWidget, stringify pointer.
-    // SEH-guarded: parent chain may contain stale pointers during rebuild.
+    // widgetRootId: shared parent walk to nearest UIWidget ancestor.
     lua_pushstring(L, "widgetRootId");
     {
-        Noesis::Visual* cur = elem;
-        Noesis::Visual* widgetRoot = nullptr;
-        for (int i = 0; i < 64 && cur; i++) {
-            if (SafeIsUIWidgetType_SEH(cur)) {
-                widgetRoot = cur;
-                break;
-            }
-            cur = SafeGetVisualParent_SEH(cur);
-        }
-        if (widgetRoot) {
-            char buf[32];
-            snprintf(buf, sizeof(buf), "%p", static_cast<void*>(widgetRoot));
-            lua_pushstring(L, buf);
+        auto widgetRootId = FindWidgetRootId(elem);
+        if (!widgetRootId.empty()) {
+            lua_pushstring(L, widgetRootId.c_str());
         } else {
             lua_pushnil(L);
         }
@@ -7953,7 +8473,13 @@ static void ExtractElementInfo_Inner(lua_State* L, Noesis::FrameworkElement* ele
 // ---------------------------------------------------------------------------
 // CollectDCProperties: fills FocusEventData's dcScalarProps and dcObjectProps
 // from a DataContext object.  Pure C++ -- no Lua stack interaction.
-// Mirrors PushDCProperties but stores into vectors instead of Lua tables.
+//
+// This is the SINGLE source of truth for DC property enumeration.
+// PushDCProperties (Lua output) delegates to this function.
+//
+// Uses IsScalarValueType for consistent type handling at all levels
+// (top-level, sub-object, collection item).
+// Uses SafeTypePropertyGet_SEH for all pointer dereferences.
 // ---------------------------------------------------------------------------
 static void CollectDCProperties_Inner(FocusEventData& out, Noesis::BaseObject* dc)
 {
@@ -7974,19 +8500,7 @@ static void CollectDCProperties_Inner(FocusEventData& out, Noesis::BaseObject* d
         auto typeOfType = type->GetClassType();
 
         // Scalar types (including enums): read as string
-        bool isEnum = Noesis::TypeHelpers::IsDescendantOf(
-            typeOfType, Noesis::gStaticSymbols.TypeClasses.TypeEnum.Type);
-        if (type == types.String.Type
-            || type == types.CStringPtr.Type
-            || type == types.LocaString.Type
-            || type == types.Bool.Type
-            || type == types.Int32.Type
-            || type == types.UInt32.Type
-            || type == types.Int64.Type
-            || type == types.Single.Type
-            || type == types.Double.Type
-            || isEnum) {
-
+        if (IsScalarValueType(type)) {
             auto val = ReadTypePropertyAsString(dc, propInfo->Property);
             if (!val.empty()
                 && val.find("[ForceUpdate]") == std::string::npos) {
@@ -8048,23 +8562,15 @@ static void CollectDCProperties_Inner(FocusEventData& out, Noesis::BaseObject* d
                                 if (!itemEntry.Value().Property) continue;
                                 auto itemType = UnwrapType(
                                     itemEntry.Value().Property->GetContentType());
-                                if (!itemType) continue;
-                                if (itemType == types.String.Type
-                                    || itemType == types.CStringPtr.Type
-                                    || itemType == types.LocaString.Type
-                                    || itemType == types.Bool.Type
-                                    || itemType == types.Int32.Type
-                                    || itemType == types.UInt32.Type
-                                    || itemType == types.Single.Type) {
-                                    auto itemValue = ReadTypePropertyAsString(
-                                        static_cast<Noesis::BaseObject*>(collectionItem),
-                                        itemEntry.Value().Property);
-                                    if (!itemValue.empty()
-                                        && itemValue.find("[ForceUpdate]") == std::string::npos) {
-                                        itemData.props.emplace_back(
-                                            itemEntry.Key().GetString(),
-                                            std::move(itemValue));
-                                    }
+                                if (!IsScalarValueType(itemType)) continue;
+                                auto itemValue = ReadTypePropertyAsString(
+                                    static_cast<Noesis::BaseObject*>(collectionItem),
+                                    itemEntry.Value().Property);
+                                if (!itemValue.empty()
+                                    && itemValue.find("[ForceUpdate]") == std::string::npos) {
+                                    itemData.props.emplace_back(
+                                        itemEntry.Key().GetString(),
+                                        std::move(itemValue));
                                 }
                             }
                             collectionItem->Release();
@@ -8088,20 +8594,12 @@ static void CollectDCProperties_Inner(FocusEventData& out, Noesis::BaseObject* d
                 for (auto& subEntry : subCls.Names) {
                     if (!subEntry.Value().Property) continue;
                     auto subType = UnwrapType(subEntry.Value().Property->GetContentType());
-                    if (!subType) continue;
-                    if (subType == types.String.Type
-                        || subType == types.CStringPtr.Type
-                        || subType == types.LocaString.Type
-                        || subType == types.Bool.Type
-                        || subType == types.Int32.Type
-                        || subType == types.UInt32.Type
-                        || subType == types.Single.Type) {
-                        auto subVal = ReadTypePropertyAsString(subObj, subEntry.Value().Property);
-                        if (!subVal.empty()
-                            && subVal.find("[ForceUpdate]") == std::string::npos) {
-                            subData.props.emplace_back(
-                                subEntry.Key().GetString(), std::move(subVal));
-                        }
+                    if (!IsScalarValueType(subType)) continue;
+                    auto subVal = ReadTypePropertyAsString(subObj, subEntry.Value().Property);
+                    if (!subVal.empty()
+                        && subVal.find("[ForceUpdate]") == std::string::npos) {
+                        subData.props.emplace_back(
+                            subEntry.Key().GetString(), std::move(subVal));
                     }
                 }
 
@@ -8286,6 +8784,13 @@ static void ExtractElementData_Inner(FocusEventData& out, Noesis::FrameworkEleme
     if (!elemClassTypeName) return;
     out.elemType = elemClassTypeName;
 
+    // elemAddr: stable element pointer (survives text/DC changes)
+    {
+        char addrBuf[20];
+        snprintf(addrBuf, sizeof(addrBuf), "%p", elem);
+        out.elemAddr = addrBuf;
+    }
+
     // elemName
     out.elemName = ReadPropertyAsString(elem, "Name");
 
@@ -8434,23 +8939,8 @@ static void ExtractElementData_Inner(FocusEventData& out, Noesis::FrameworkEleme
         out.tabName = ExtractTabName(elem);
     }
 
-    // widgetRootId -- SEH-guarded parent chain walk.
-    {
-        Noesis::Visual* cur = elem;
-        Noesis::Visual* widgetRoot = nullptr;
-        for (int i = 0; i < 64 && cur; i++) {
-            if (SafeIsUIWidgetType_SEH(cur)) {
-                widgetRoot = cur;
-                break;
-            }
-            cur = SafeGetVisualParent_SEH(cur);
-        }
-        if (widgetRoot) {
-            char buf[32];
-            snprintf(buf, sizeof(buf), "%p", static_cast<void*>(widgetRoot));
-            out.widgetRootId = buf;
-        }
-    }
+    // widgetRootId -- shared parent walk to nearest UIWidget ancestor.
+    out.widgetRootId = FindWidgetRootId(elem);
 
     // ancestorContext: walk a few parents looking for x:Name containing
     // "Melee" or "Ranged".  Qualifies stats like "Attack Bonus" so Lua
@@ -8626,47 +9116,17 @@ static Noesis::Visual* FindWidgetByName_SEH(const char* widgetName)
     }
 }
 
-// Inner: BFS a visual subtree, reading TextBlock text AS each node is
-// found (not after collecting pointers).  This avoids the stale-pointer
-// problem: reading one TextBlock's bound properties (ToString, Inlines)
-// can trigger Noesis layout/binding cascades that destroy sibling
-// elements in LSElementCopy cloned trees.
+// ReadWidgetTexts_Inner: BFS a visual subtree collecting TextBlock texts.
+// Uses the shared BFS_VisitTextBlocks core.  Reads text AS each node is
+// found (not after collecting pointers) to avoid the stale-pointer problem
+// where reading one TextBlock's bindings destabilizes siblings.
 // Uses std::string (destructor) so it CANNOT live inside __try.
 static void ReadWidgetTexts_Inner(
     Noesis::Visual* root, std::vector<std::string>& outTexts)
 {
-    Noesis::Visual* queue[512];
-    int queueFront = 0, queueBack = 0;
-    queue[queueBack++] = root;
-
-    while (queueFront < queueBack && outTexts.size() < 64) {
-        auto node = queue[queueFront++];
-        if (!node) continue;
-        if (!ProbeUIElement(static_cast<Noesis::UIElement*>(node)))
-            continue;
-        if (!IsVisibleDP(node)) continue;
-
-        auto typeName = SafeBaseObjectTypeName_SEH(node);
-        if (!typeName) continue;
-        if (strstr(typeName, "TextBlock")) {
-            // Read text immediately -- before finding more TextBlocks,
-            // so binding evaluation can't destabilize unfound nodes.
-            auto text = ReadTextBlockText(
-                static_cast<Noesis::FrameworkElement*>(node));
-            if (!text.empty()
-                && text.find("[ForceUpdate]") == std::string::npos
-                && text.find("s_HandleUnknown") == std::string::npos) {
-                outTexts.push_back(std::move(text));
-            }
-            continue;  // Don't recurse into TextBlock children.
-        }
-
-        auto childCount = SafeGetVisualChildrenCount_SEH(node);
-        for (uint32_t ci = 0; ci < childCount && queueBack < 512; ci++) {
-            auto child = SafeGetVisualChild_SEH(node, ci);
-            if (child) queue[queueBack++] = child;
-        }
-    }
+    BoundedCollectContext context{outTexts, 64};
+    BFS_VisitTextBlocks(root, 0, 512, false,
+                        BoundedCollectVisitor, &context);
 }
 
 // SEH wrapper for ReadWidgetTexts_Inner.  The outTexts reference is a
@@ -8921,6 +9381,7 @@ void RegisterUILib()
     MODULE_FUNCTION(GetTopmostWidget)
     MODULE_FUNCTION(FindNameInWidget)
     MODULE_FUNCTION(FindNameInWidgetScoped)
+    MODULE_FUNCTION(QueryNamedElement)
     // Phase 1 refactor: C++ data extraction test API
     MODULE_FUNCTION(GetFocusedElementInfo)
     // Widget/element text readers (on-demand BFS for TextBlocks)

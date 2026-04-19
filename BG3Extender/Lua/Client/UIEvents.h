@@ -25,6 +25,9 @@ struct FocusEventData
     std::string elemType;       // GetClassType()->GetName()
     std::string elemName;       // x:Name or empty
     std::string elemId;         // "Type::Name::DCText" composite identifier
+    std::string elemAddr;       // Element pointer as hex string (stable
+                                // across ticks for the same element even
+                                // when text/DC changes)
 
     // Element classification
     bool isTab = false;         // IsListBoxItemType
@@ -161,6 +164,11 @@ struct TickSnapshot
     // Non-empty only when an inline carousel exists under the focused element.
     std::string inlineCarouselValue;
 
+    // UIColor hex from the carousel SelectedItem (e.g. "#FFFFF0E6").
+    // Present only for color swatch carousels (skin, hair, eye).
+    // Lua converts to a spoken color description via HSL binning.
+    std::string inlineCarouselColorHex;
+
     // Selected element data (from Strategy 3 ListBoxItem when it differs
     // from the focused element).  Carries the VM DC type needed for CC
     // section labels (VMSelectableRace -> "Race", etc.).
@@ -211,7 +219,31 @@ struct TickSnapshot
     // Tooltip data (Examine panel, stat tooltips).
     // Only populated when tooltipChanged == true.
     bool tooltipChanged = false;        // Tooltip text changed (new popup or text delta)
-    std::vector<std::string> tooltipTexts;  // Individual TextBlock texts from tooltip popup
+
+    // CC visible page title: the first large-font TextBlock text
+    // inside gameplaySubPanel (e.g. "High Elf Cantrip", "Skill
+    // Proficiency", "Abilities").  Reliable across tab changes
+    // AND sub-panel transitions within the same tab.
+    std::string activePageTitle;
+
+    // Structured tooltip entries.  Each entry carries all data C++
+    // can extract from a tooltip TextBlock in one pass -- role,
+    // text, font size, parent role -- so Lua never needs to ask
+    // C++ for more information about a tooltip element.
+    struct TooltipEntry {
+        std::string role;       // TextBlock x:Name (e.g. "TitleName",
+                                // "Description").  Empty when the
+                                // template has no x:Name.
+        std::string text;       // Rendered text content.
+        std::string parentRole; // Parent element x:Name (fallback
+                                // context when role is empty).
+        float fontSize;         // TextBlock FontSize (distinguishes
+                                // title from body text).
+        std::string typeId;     // TypeId from parent container's DC
+                                // (e.g. "Range", "ZoneRadius").
+                                // Only set for PropertyText entries.
+    };
+    std::vector<TooltipEntry> tooltipTexts;
 };
 
 class DeferredUIEvents

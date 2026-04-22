@@ -17,6 +17,14 @@
 
 BEGIN_NS(lua)
 
+// Runtime trace-logging flag declared extern in stdafx.h and gated by
+// BG3A_TRACE macro.  Toggled from Lua via Ext.UI.SetTraceLogging(bool),
+// which is called by Logger.lua's CycleLogLevel so L3+R3 (in-game) or
+// `bg3a_log` (SE console) flips both Lua and C++ trace output together.
+#ifdef BG3ACCESS_VERBOSE
+bool sBG3A_TraceEnabled = false;
+#endif
+
 #define FOR_NOESIS_TYPE(T) if (typeName == Noesis::StaticSymbol<T>()) { \
     MakeDirectObjectRef(L, static_cast<T*>(obj), lifetime); return; \
 }
@@ -298,7 +306,8 @@ static uint32_t GatherWidgets_SEH(Noesis::Visual* container,
     Noesis::Visual** outWidgets, bool* outVisible, uint32_t maxWidgets);
 static void CollectWidgetDCTypes_SEH(
     Noesis::Visual* const* widgets, bool const* widgetVisible,
-    uint32_t widgetCount, std::vector<std::string>& outDCTypes);
+    uint32_t widgetCount, std::vector<std::string>& outDCTypes,
+    std::vector<std::string>& outAddrs);
 static uintptr_t ReadDCAddress_SEH(Noesis::UIElement* elem);
 static Noesis::UIElement* FindFocusedElement_SEH(
     Noesis::Visual** widgets, bool* widgetVisible, uint32_t widgetCount,
@@ -653,7 +662,6 @@ static Noesis::Visual* FindContainingUIWidget_SEH(
     return nullptr;
 }
 
-
 // CaptureInlineCarouselName_Inner: reads the new SelectedItem's Name,
 // ColorName, or Title from a SelectionChanged event's addedItem and stores
 // it in sInlineCarouselText.  Called by ClassSelectionDelegate when the
@@ -678,21 +686,21 @@ static void TryCaptureCarouselColorHex(Noesis::BaseObject* item)
         auto brushPropKey = FixedString(brushPropName);
         auto brushPropInfo = itemClass.Names.try_get(brushPropKey);
         if (!brushPropInfo || !brushPropInfo->Property) continue;
-        BG3A_LOG("[BG3Access] COLOR: found prop '%s'", brushPropName);
+        BG3A_TRACE("[BG3Access] COLOR: found prop '%s'", brushPropName);
         auto brushRaw = SafeGetComponent_SEH(
             brushPropInfo->Property, item);
         if (!brushRaw) {
-            BG3A_LOG("[BG3Access] COLOR: GetComponent returned null");
+            BG3A_TRACE("[BG3Access] COLOR: GetComponent returned null");
             continue;
         }
         auto brushTypeName = SafeBaseObjectTypeName_SEH(brushRaw);
-        BG3A_LOG("[BG3Access] COLOR: obj type=%s",
+        BG3A_TRACE("[BG3Access] COLOR: obj type=%s",
                  brushTypeName ? brushTypeName : "(null)");
         if (brushTypeName
             && strstr(brushTypeName, "SolidColorBrush")) {
             char colorBuf[32];
             if (SafeToString_SEH(brushRaw, colorBuf, sizeof(colorBuf))) {
-                BG3A_LOG("[BG3Access] COLOR: ToString=%s", colorBuf);
+                BG3A_TRACE("[BG3Access] COLOR: ToString=%s", colorBuf);
                 if (colorBuf[0] == '#') {
                     strncpy_s(sInlineCarouselColorHex, colorBuf,
                               _TRUNCATE);
@@ -763,7 +771,7 @@ static void ReadInlineCarouselState_Inner(
                         sInlineCarouselColorHex);
                 }
             }
-            BG3A_LOG("[BG3Access]   -> Inline carousel changed: %s",
+            BG3A_TRACE("[BG3Access]   -> Inline carousel changed: %s",
                 carouselText.c_str());
         }
     } else {
@@ -1424,6 +1432,39 @@ static void PushWidgetDCType_SEH(
     }
 }
 
+// PushWidgetDCTypeAndAddr: mid-tick append of a (DC type, address) pair
+// into the parallel widgetDCTypes/widgetAddrs snapshot vectors.  Unlike
+// PushWidgetDCType, this does NOT dedup by type: two widgets with the
+// same DC are distinct entities at different addresses, so both entries
+// must be preserved for identity-based handler anchoring to work.
+// Inner/Invoke/SEH pattern for the same destructor reasons as above.
+static void PushWidgetDCTypeAndAddr_Inner(
+    std::vector<std::string>& widgetDCTypes,
+    std::vector<std::string>& widgetAddrs,
+    const char* dcTypeName, const char* addrStr)
+{
+    widgetDCTypes.push_back(dcTypeName);
+    widgetAddrs.push_back(addrStr);
+}
+static void PushWidgetDCTypeAndAddr_Invoke(
+    std::vector<std::string>* widgetDCTypes,
+    std::vector<std::string>* widgetAddrs,
+    const char* dcTypeName, const char* addrStr) {
+    PushWidgetDCTypeAndAddr_Inner(
+        *widgetDCTypes, *widgetAddrs, dcTypeName, addrStr);
+}
+static void PushWidgetDCTypeAndAddr_SEH(
+    std::vector<std::string>& widgetDCTypes,
+    std::vector<std::string>& widgetAddrs,
+    const char* dcTypeName, const char* addrStr) {
+    __try {
+        PushWidgetDCTypeAndAddr_Invoke(
+            &widgetDCTypes, &widgetAddrs, dcTypeName, addrStr);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        BG3A_LOG("[BG3Access] PushWidgetDCTypeAndAddr_SEH: fault");
+    }
+}
+
 class GlobalFocusMonitor
 {
 public:
@@ -1435,6 +1476,13 @@ public:
     static constexpr int kMaxTreeDepth = 100;
 
     static GlobalFocusMonitor& Instance() { static GlobalFocusMonitor inst; return inst; }
+
+    // Public read-only accessors for cached tree roots.  Used by the
+    // Lua-facing GetTooltipPopupRoot primitive (which needs to hand
+    // these to GetPopupRoots_SEH).  Both may be nullptr between root
+    // transitions -- callers must null-check.
+    Noesis::Visual* GetTrueRoot() const { return cachedTrueRoot_; }
+    Noesis::Visual* GetContentChild() const { return cachedContentChild_; }
 
     bool Subscribe(lua_State* L, lua::RegistryEntry&& callback)
     {
@@ -1704,7 +1752,7 @@ public:
 
         if (somethingChanged) {
             if (!settling_) {
-                BG3A_LOG("[BG3Access] Settle: started (waiting for stability)");
+                BG3A_TRACE("[BG3Access] Settle: started (waiting for stability)");
                 settling_ = true;
                 settleStableCount_ = 0;
                 settleTotalCount_ = 0;
@@ -1733,7 +1781,7 @@ public:
 
             if (settleStableCount_ >= 5 || settleTotalCount_ >= 30) {
                 // Stable for 5 frames or hard cap reached.
-                BG3A_LOG("[BG3Access] Settle: complete after %u frames (%u stable)",
+                BG3A_TRACE("[BG3Access] Settle: complete after %u frames (%u stable)",
                      settleTotalCount_, settleStableCount_);
                 settling_ = false;
                 settleStableCount_ = 0;
@@ -1767,11 +1815,13 @@ public:
         if (widgetSetJustChanged || cachedWidgetDCTypes_.empty()) {
             // TICK[A] breadcrumb removed -- per-tick logging floods the log.
             cachedWidgetDCTypes_.clear();
+            cachedWidgetAddrs_.clear();
             CollectWidgetDCTypes_SEH(
                 widgets, widgetVisible, widgetCount,
-                cachedWidgetDCTypes_);
+                cachedWidgetDCTypes_, cachedWidgetAddrs_);
         }
         snapshot->widgetDCTypes = cachedWidgetDCTypes_;
+        snapshot->widgetAddrs = cachedWidgetAddrs_;
 
         // ----- Deliver buffered loading tips -----
         // Check the buffer directly every tick instead of using a flag.
@@ -1837,7 +1887,7 @@ public:
                 sGotFocusSourceElement = nullptr;
                 auto focusTypeName = focused
                     ? SafeBaseObjectTypeName_SEH(focused) : "null";
-                BG3A_LOG("[BG3Access] FOCUS_SRC=EVENT elem=%p type=%s",
+                BG3A_TRACE("[BG3Access] FOCUS_SRC=EVENT elem=%p type=%s",
                     focused, focusTypeName ? focusTypeName : "?");
             } else if (forceNext_) {
                 // Post-settle or initial: discover current focus state.
@@ -1850,7 +1900,7 @@ public:
                         widgets, widgetVisible, widgetCount,
                         root, kMaxTreeDepth, &scopeRoot);
                 }
-                BG3A_LOG("[BG3Access] FOCUS_SRC=TREE_WALK (forced) elem=%p", focused);
+                BG3A_TRACE("[BG3Access] FOCUS_SRC=TREE_WALK (forced) elem=%p", focused);
             } else {
                 // No GotFocus event, not forced.
                 // Dialogue choice d-pad changes IsSelected without firing
@@ -1894,7 +1944,7 @@ public:
                     if (selected) {
                         // Only log when the selected element actually changed.
                         if (reinterpret_cast<uintptr_t>(selected) != lastSelectedAddr_) {
-                            BG3A_LOG("[BG3Access] SEL_SRC=DIALOGUE_POLL elem=%p", selected);
+                            BG3A_TRACE("[BG3Access] SEL_SRC=DIALOGUE_POLL elem=%p", selected);
                         }
                         eventDrivenSelectionSkip = false;
                     }
@@ -1956,14 +2006,14 @@ public:
                 selected = static_cast<Noesis::UIElement*>(sClassSelectionItem);
                 sClassSelectionItem = nullptr;
                 sSelectionChangedItemAddr = 0;
-                BG3A_LOG("[BG3Access] SEL_SRC=EVENT elem=%p dc=0x%llx",
+                BG3A_TRACE("[BG3Access] SEL_SRC=EVENT elem=%p dc=0x%llx",
                     selected, (unsigned long long)sClassSelectionDCAddr);
             } else if (forceNext_ && sIsSelectedProp && sListBoxItemType) {
                 // Post-settle or initial: discover current selection.
                 selected = FindSelectedTab_SEH(
                     widgets, widgetVisible, widgetCount,
                     root, scopeRoot, kMaxTreeDepth);
-                BG3A_LOG("[BG3Access] SEL_SRC=TREE_WALK (forced) elem=%p", selected);
+                BG3A_TRACE("[BG3Access] SEL_SRC=TREE_WALK (forced) elem=%p", selected);
             } else if (!selected) {
                 // No selection from event, forced walk, or dialogue poll.
                 eventDrivenSelectionSkip = true;
@@ -1971,7 +2021,7 @@ public:
             }
         } else {
             // ----- Legacy tree-walk mode -----
-            BG3A_LOG("[BG3Access] FOCUS_SRC=LEGACY_WALK");
+            BG3A_TRACE("[BG3Access] FOCUS_SRC=LEGACY_WALK");
             // Strategy 1: FocusManager.FocusedElement.
             focused = FindFocusedElement_SEH(
                 widgets, widgetVisible, widgetCount,
@@ -2162,7 +2212,7 @@ public:
                         && !widgetSetChanged && !focused && !selected;
         if ((focusChanged || selectionChanged || forced || widgetSetChanged)
             && !forcedNoOp) {
-            BG3A_LOG("[BG3Access] Tick: focused=%p scopeRoot=%p selected=%p selDC=0x%llx prevSelDC=0x%llx focDC=0x%llx prevFocDC=0x%llx focChg=%d selChg=%d forced=%d wChg=%d widgets=%u",
+            BG3A_TRACE("[BG3Access] Tick: focused=%p scopeRoot=%p selected=%p selDC=0x%llx prevSelDC=0x%llx focDC=0x%llx prevFocDC=0x%llx focChg=%d selChg=%d forced=%d wChg=%d widgets=%u",
                 focused, scopeRoot, selected,
                 (unsigned long long)selectedDCAddr, (unsigned long long)lastSelectedDCAddr_,
                 (unsigned long long)focusedDCAddr, (unsigned long long)lastFocusedDCAddr_,
@@ -2454,7 +2504,7 @@ public:
                         // so Lua tables don't silently overwrite duplicate keys.
                         int visualIndex = 0;
                         for (auto& visualText : visualTexts) {
-                            BG3A_LOG("[BG3Access]     Visual text: %s", visualText.c_str());
+                            BG3A_TRACE("[BG3Access]     Visual text: %s", visualText.c_str());
                             std::string key = "_visualText_" + std::to_string(++visualIndex);
                             snapshot->focusedElement.namedTexts.push_back(
                                 {std::move(key), std::move(visualText)});
@@ -2601,7 +2651,7 @@ public:
                     static_cast<Noesis::FrameworkElement*>(selected));
                 if (!freshText.empty() && freshText != lastSelectedElemText_) {
                     lastSelectedElemText_ = freshText;
-                    BG3A_LOG("[BG3Access]   -> Carousel text changed: %s", freshText.c_str());
+                    BG3A_TRACE("[BG3Access]   -> Carousel text changed: %s", freshText.c_str());
                 }
             }
             }  // end else (not suppressed by cooldown)
@@ -2790,6 +2840,19 @@ public:
             PollTooltip(cachedTrueRoot_, cachedContentChild_, snapshot);
         }
 
+        // Tooltip-close edge: ToolTip.Closed flipped sToolTipIsOpen to
+        // false since the previous tick.  Emit a single-shot
+        // tooltipChanged event with no texts so Lua can invalidate any
+        // tooltip-derived state (compare stash, inspect cache, etc.).
+        // Content-arrival events are distinguished by non-empty
+        // tooltipTexts.
+        if (lastTooltipOpen_ && !sToolTipIsOpen) {
+            snapshot->tooltipChanged = true;
+            snapshot->tooltipTexts.clear();
+            BG3A_TRACE("[BG3Access] TOOLTIP: close event emitted to Lua");
+        }
+        lastTooltipOpen_ = sToolTipIsOpen;
+
         // ----- HotBar action radial: Tag polling on visible widgets -----
         // The XAML sets ActionRadials.Tag = LocalFocus.DataContext whenever
         // the radial pointer moves to a different slot.  Poll each visible
@@ -2872,7 +2935,7 @@ public:
                             snapshot->radialDescriptionText.clear();
                             snapshot->radialSlotTag = std::move(actionTag);
 
-                            BG3A_LOG("[BG3Access] HOTBAR RADIAL: title=%s tag=%s",
+                            BG3A_TRACE("[BG3Access] HOTBAR RADIAL: title=%s tag=%s",
                                  snapshot->radialTitleText.c_str(),
                                  snapshot->radialSlotTag.c_str());
                         }
@@ -2885,6 +2948,16 @@ public:
             // when LocalFocus goes null (LocalFocusChanged event fires
             // with LocalFocus.DataContext = null on center rest).
             if (foundHotBarWidget && !hotBarHasTag && lastRadialTagAddr_ != 0) {
+                lastRadialTagAddr_ = 0;
+            }
+            // When the HotBar widget is entirely gone (radial closed
+            // and widget removed), reset the tracker so the first
+            // slot on the next open fires a fresh radialSlotChanged
+            // event.  Without this, if the game reuses the same VM
+            // object pointer on reopen, the `tagAddr != lastRadialTagAddr_`
+            // check in the change-detection block above would fail and
+            // the initial slot would be silent.
+            if (!foundHotBarWidget && lastRadialTagAddr_ != 0) {
                 lastRadialTagAddr_ = 0;
             }
         }
@@ -3098,7 +3171,7 @@ public:
                         widgetEvent.namedTexts.size());
                 }
 
-                BG3A_LOG("[BG3Access] SNAPSHOT: focus=%d sel=%d val=%d carousel=%d "
+                BG3A_TRACE("[BG3Access] SNAPSHOT: focus=%d sel=%d val=%d carousel=%d "
                      "widget=%d(%d) postSettle=%d elemId=%s dcType=%s "
                      "focusNT=%d widgetNT=%d carVal=%s",
                      snapshot->focusChanged, snapshot->selectionChanged,
@@ -3114,12 +3187,12 @@ public:
 
                 // Log namedTexts keys+values so we can see what data arrived.
                 for (auto const& pair : snapshot->focusedElement.namedTexts) {
-                    BG3A_LOG("[BG3Access]   focusNT: %s = %s",
+                    BG3A_TRACE("[BG3Access]   focusNT: %s = %s",
                          pair.first.c_str(), pair.second.c_str());
                 }
                 for (auto const& widgetEvent : snapshot->widgetEvents) {
                     for (auto const& pair : widgetEvent.namedTexts) {
-                        BG3A_LOG("[BG3Access]   widgetNT: %s = %s",
+                        BG3A_TRACE("[BG3Access]   widgetNT: %s = %s",
                              pair.first.c_str(), pair.second.c_str());
                     }
                 }
@@ -3183,6 +3256,7 @@ public:
         forcedNullCount_ = 0;
         prevWidgetCount_ = 0;
         hadFocusBefore_ = false;
+        lastTooltipOpen_ = false;
 
         // NOTE: scan tracking fields (initialWidgetScanDelay_,
         // lastScanWidgetCount_, lastScanFirstAddr_) intentionally NOT
@@ -3203,6 +3277,7 @@ public:
         widgetInpcWidgetAddr_ = 0;
         inpcSubscribedDCAddr_ = 0;
         cachedWidgetDCTypes_.clear();
+        cachedWidgetAddrs_.clear();
         pollStableFrames_ = 0;
         settling_ = false;
         settleStableCount_ = 0;
@@ -3228,7 +3303,7 @@ private:
         // re-discovers the focused element and subscribes INPC on a
         // fresh pointer after the UI has settled.
         pendingINPCSubscription_ = true;
-        BG3A_LOG("[BG3Access]   SubscribeElementINPC: deferred (pending re-discovery)");
+        BG3A_TRACE("[BG3Access]   SubscribeElementINPC: deferred (pending re-discovery)");
     }
 
     // Re-discover the focused element and subscribe INPC on it.
@@ -3239,7 +3314,7 @@ private:
         pendingINPCSubscription_ = false;
         if (!freshElement) return;
 
-        BG3A_LOG("[BG3Access]   CommitINPCSubscription: elem=%p", freshElement);
+        BG3A_TRACE("[BG3Access]   CommitINPCSubscription: elem=%p", freshElement);
         auto frameworkElem = static_cast<Noesis::FrameworkElement*>(freshElement);
 
         // No UnsubscribeINPC needed -- fire-and-forget pattern.
@@ -3308,11 +3383,11 @@ public:
         }
 
         if (!hintsControl) {
-            BG3A_LOG("[BG3Access] CollectLoadingHints: LoadingHints element not found");
+            BG3A_TRACE("[BG3Access] CollectLoadingHints: LoadingHints element not found");
             return;
         }
 
-        BG3A_LOG("[BG3Access] CollectLoadingHints: found LoadingHints at %p",
+        BG3A_TRACE("[BG3Access] CollectLoadingHints: found LoadingHints at %p",
                  hintsControl);
 
         // Walk the ItemsControl's visual subtree for TextBlocks.
@@ -3341,7 +3416,7 @@ public:
                         + std::to_string(hintIndex);
                     outTexts.push_back(
                         {std::move(key), std::move(text)});
-                    BG3A_LOG("[BG3Access]   Loading hint %d: %s",
+                    BG3A_TRACE("[BG3Access]   Loading hint %d: %s",
                              hintIndex,
                              outTexts.back().second.c_str());
                 }
@@ -3357,7 +3432,7 @@ public:
             }
         }
 
-        BG3A_LOG("[BG3Access] CollectLoadingHints: found %d hints", hintIndex);
+        BG3A_TRACE("[BG3Access] CollectLoadingHints: found %d hints", hintIndex);
     }
 
     // SEH wrapper: outTexts reference is a pointer (no destructor in
@@ -3391,13 +3466,13 @@ public:
         auto frameworkElem = static_cast<Noesis::FrameworkElement*>(elem);
         auto classType = SafeGetClassType_SEH(frameworkElem);
         if (!classType) {
-            BG3A_LOG("[BG3Access]   FireWidgetCallback: GetClassType returned null for %p, skipping", elem);
+            BG3A_TRACE("[BG3Access]   FireWidgetCallback: GetClassType returned null for %p, skipping", elem);
             return;
         }
         auto elemTypeName = SafeBaseObjectTypeName_SEH(frameworkElem);
         data.elemType = elemTypeName ? elemTypeName : "Unknown";
         data.elemName = ReadPropertyAsString(frameworkElem, "Name");
-        BG3A_LOG("[BG3Access]   FireWidgetCallback: elem=%p type=%s name=%s",
+        BG3A_TRACE("[BG3Access]   FireWidgetCallback: elem=%p type=%s name=%s",
              elem, data.elemType.c_str(), data.elemName.c_str());
 
         // Widget root ID (the widget itself IS the root for widget-added)
@@ -3411,37 +3486,42 @@ public:
                 static_cast<Noesis::DependencyObject const*>(frameworkElem));
             if (dataContext) {
                 auto dcTypeName = SafeBaseObjectTypeName_SEH(dataContext);
-                BG3A_LOG("[BG3Access]   FireWidgetCallback: DC=%s",
+                BG3A_TRACE("[BG3Access]   FireWidgetCallback: DC=%s",
                      dcTypeName ? dcTypeName : "(null)");
                 if (dcTypeName) {
                     data.dcType = dcTypeName;
-                    // Push into widgetDCTypes (all visible DCs).
-                    // The cached scan may have missed this widget if
-                    // it just became visible on this tick.
-                    PushWidgetDCType_SEH(
-                        snapshot.widgetDCTypes, dcTypeName);
+                    // Push into widgetDCTypes/widgetAddrs in lockstep
+                    // via SEH-wrapped helper so a fault here stays
+                    // scoped to the push and does not kill the whole
+                    // Tick frame.  The cached scan may have missed
+                    // this widget if it just became visible on this
+                    // tick.  No dedup -- two widgets with the same DC
+                    // at different addresses are distinct entities.
+                    PushWidgetDCTypeAndAddr_SEH(
+                        snapshot.widgetDCTypes, snapshot.widgetAddrs,
+                        dcTypeName, ptrBuf);
 
-                    BG3A_LOG("[BG3Access]   EWD[1] CollectDCProperties");
+                    BG3A_TRACE("[BG3Access]   EWD[1] CollectDCProperties");
                     CollectDCProperties(data, dataContext);
-                    BG3A_LOG("[BG3Access]   EWD[2] TryCollectSelectionFlyOutTitle");
+                    BG3A_TRACE("[BG3Access]   EWD[2] TryCollectSelectionFlyOutTitle");
                     TryCollectSelectionFlyOutTitle(data, dataContext);
-                    BG3A_LOG("[BG3Access]   EWD[3] TryCollectFinalResult");
+                    BG3A_TRACE("[BG3Access]   EWD[3] TryCollectFinalResult");
                     TryCollectFinalResult(data, dataContext);
 
                     // Subscribe widget DC INPC for property change tracking.
-                    BG3A_LOG("[BG3Access]   EWD[4] SubscribeWidgetINPC");
+                    BG3A_TRACE("[BG3Access]   EWD[4] SubscribeWidgetINPC");
                     SubscribeWidgetINPC(dataContext, frameworkElem);
                 }
             }
         }
 
-        BG3A_LOG("[BG3Access]   EWD[5] ExtractBindingInfo");
+        BG3A_TRACE("[BG3Access]   EWD[5] ExtractBindingInfo");
         ExtractBindingInfo(data, frameworkElem);
 
         // Collect named TextBlock texts from the widget via NameScope lookup.
-        BG3A_LOG("[BG3Access]   EWD[6] TryCollectNamedTexts");
+        BG3A_TRACE("[BG3Access]   EWD[6] TryCollectNamedTexts");
         TryCollectNamedTexts(frameworkElem, data.namedTexts);
-        BG3A_LOG("[BG3Access]   EWD[7] done");
+        BG3A_TRACE("[BG3Access]   EWD[7] done");
 
         // Loading hints are handled exclusively by the buffer path:
         // BufferLoadingTips_SEH (safe-state polling) and
@@ -3616,6 +3696,13 @@ public:
     bool postSettle_ = false;           // true on the ONE tick after settle expires
     bool hadFocusBefore_ = false;       // true once any focus/selection was found
     bool suppressTick_ = false;         // skip all Noesis calls during loading
+    // Previous tick's tooltip-open state.  Used to emit a single-shot
+    // tooltipChanged event on the true->false transition so Lua can
+    // invalidate tooltip-derived state (compare stash, inspect cache)
+    // when a tooltip disappears without new content arriving.  The
+    // per-tick tooltipTexts vector stays empty in this case, which is
+    // how Lua distinguishes close from new-content events.
+    bool lastTooltipOpen_ = false;
     // Event-driven focus mode (default true).  When true, GotFocus and
     // SelectionChanged class handlers provide focused/selected elements
     // directly -- no per-frame tree walks.  When false, falls back to the
@@ -3674,6 +3761,7 @@ public:
     // changes, avoiding per-tick Noesis DP reads that can deadlock
     // against the rendering thread.
     std::vector<std::string> cachedWidgetDCTypes_;
+    std::vector<std::string> cachedWidgetAddrs_;
 
     // Strategy 3 performance counters (diagnostic -- remove before shipping).
     uint32_t strategy3Runs_ = 0;        // total times FindSelectedTabInTree ran
@@ -3869,7 +3957,7 @@ void InitFocusProperties(Noesis::FrameworkElement* root)
             }
         }
     }
-    BG3A_LOG("[BG3Access] SelectionChanged event: selectorType=%p event=%p",
+    BG3A_TRACE("[BG3Access] SelectionChanged event: selectorType=%p event=%p",
         selectorReflType, sSelectionChangedEvent);
 
     // Discover GotFocus event from UIElement type's UIElementData.
@@ -4348,16 +4436,16 @@ static bool PollActiveSearchLocalFocus_Unsafe(
             if (!widgetDCTypeName || !strstr(widgetDCTypeName, "DCActiveSearch")) continue;
 
             foundActiveSearchWidget = true;
-            BG3A_LOG("[BG3Access] ActiveSearch: found widget[%u] DC=%s", widgetIdx, widgetDCTypeName);
+            BG3A_TRACE("[BG3Access] ActiveSearch: found widget[%u] DC=%s", widgetIdx, widgetDCTypeName);
 
             // Found the ActiveSearch widget.  Look up OptionsContainer.
             auto optionsContainer = FindNameInWidgetScoped(
                 "OptionsContainer", widgets[widgetIdx]);
             if (!optionsContainer) {
-                BG3A_LOG("[BG3Access] ActiveSearch: OptionsContainer NOT found in widget");
+                BG3A_TRACE("[BG3Access] ActiveSearch: OptionsContainer NOT found in widget");
                 continue;
             }
-            BG3A_LOG("[BG3Access] ActiveSearch: OptionsContainer found, class=%s",
+            BG3A_TRACE("[BG3Access] ActiveSearch: OptionsContainer found, class=%s",
                      optionsContainer->GetClassType()->GetName());
 
             // LocalFocus DP discovery on the OptionsContainer element.
@@ -4369,7 +4457,7 @@ static bool PollActiveSearchLocalFocus_Unsafe(
                     BG3A_LOG("[BG3Access] ActiveSearch LocalFocus DP found on %s",
                              optionsContainer->GetClassType()->GetName());
                 } else {
-                    BG3A_LOG("[BG3Access] ActiveSearch: LocalFocus DP NOT found on %s",
+                    BG3A_TRACE("[BG3Access] ActiveSearch: LocalFocus DP NOT found on %s",
                              optionsContainer->GetClassType()->GetName());
                 }
             }
@@ -4379,19 +4467,19 @@ static bool PollActiveSearchLocalFocus_Unsafe(
                 static_cast<Noesis::FrameworkElement*>(optionsContainer));
             auto localFocusVal = sActiveSearchLocalFocusProp->GetValue(containerDepObj);
             if (!localFocusVal) {
-                BG3A_LOG("[BG3Access] ActiveSearch: LocalFocus value is null");
+                BG3A_TRACE("[BG3Access] ActiveSearch: LocalFocus value is null");
                 sLastActiveSearchLocalFocusAddr = 0;
                 continue;
             }
             auto localFocusObj = *reinterpret_cast<Noesis::BaseObject* const*>(localFocusVal);
             if (!localFocusObj) {
-                BG3A_LOG("[BG3Access] ActiveSearch: LocalFocus deref is null");
+                BG3A_TRACE("[BG3Access] ActiveSearch: LocalFocus deref is null");
                 sLastActiveSearchLocalFocusAddr = 0;
                 continue;
             }
 
             auto localFocusAddr = reinterpret_cast<uintptr_t>(localFocusObj);
-            BG3A_LOG("[BG3Access] ActiveSearch: LocalFocus addr=0x%llx prev=0x%llx",
+            BG3A_TRACE("[BG3Access] ActiveSearch: LocalFocus addr=0x%llx prev=0x%llx",
                      localFocusAddr, sLastActiveSearchLocalFocusAddr);
             if (localFocusAddr != sLastActiveSearchLocalFocusAddr) {
                 sLastActiveSearchLocalFocusAddr = localFocusAddr;
@@ -4401,7 +4489,7 @@ static bool PollActiveSearchLocalFocus_Unsafe(
                     *outWidgetVisual = widgets[widgetIdx];
                     return true;
                 }
-                BG3A_LOG("[BG3Access] ActiveSearch: LocalFocus element failed ProbeUIElement");
+                BG3A_TRACE("[BG3Access] ActiveSearch: LocalFocus element failed ProbeUIElement");
             }
             break;
         }
@@ -4769,6 +4857,131 @@ static uint32_t FindTooltipTextBlocks_SEH(
   }
 }
 
+// ---------------------------------------------------------------------------
+// CollectTooltipEntries_Inner: extract role + text + parentRole +
+// fontSize + typeId from each TextBlock in the array into TooltipEntry
+// records.
+//
+// Shared by PollTooltip (tooltip popup path) and the Lua-facing
+// ReadElementStructuredTextBlocks primitive -- single source of
+// truth for tooltip role extraction.
+//
+// Uses std::string/std::vector (destructors) so it CANNOT live inside
+// __try directly (MSVC C2712).  Every Noesis-touching operation goes
+// through an SEH-guarded helper:
+//   - ReadTextBlockText     (three-layer inner/invoke/wrapper)
+//   - ReadElementName_SEH   (__try-wrapped)
+//   - SafeGetVisualParent_SEH  (__try-wrapped field access)
+//   - SafeGetFontSize_SEH   (__try-wrapped)
+//   - SafeGetDataContext_SEH   (__try-wrapped)
+//   - SafeGetClassType_SEH     (__try-wrapped)
+//   - ReadTypePropertyAsString (has its own SEH protection)
+// No raw Noesis pointer dereferences.
+//
+// Callers should invoke CollectTooltipEntries_SEH (the outer wrapper
+// below) for defense-in-depth against faults outside the helpers'
+// coverage (e.g. during std::move/vector growth).
+// ---------------------------------------------------------------------------
+static void CollectTooltipEntries_Inner(
+    Noesis::FrameworkElement** textBlocks, uint32_t textBlockCount,
+    std::vector<ecl::lua::TickSnapshot::TooltipEntry>& entries)
+{
+    for (uint32_t i = 0; i < textBlockCount; i++) {
+        auto text = ReadTextBlockText(textBlocks[i]);
+        if (text.empty()) continue;
+        if (text.find("[ForceUpdate]") != std::string::npos) continue;
+        if (text.find("s_HandleUnknown") != std::string::npos) continue;
+
+        ecl::lua::TickSnapshot::TooltipEntry entry;
+        entry.text = std::move(text);
+
+        // x:Name of the TextBlock itself.
+        {
+            static char nameBuf[128];
+            nameBuf[0] = 0;
+            ReadElementName_SEH(textBlocks[i], nameBuf, sizeof(nameBuf));
+            if (nameBuf[0]) entry.role = nameBuf;
+        }
+
+        // Parent element x:Name (fallback context).  Use the SEH-safe
+        // parent accessor instead of raw mVisualParent dereference --
+        // the pointer is same-tick but we still protect every Noesis
+        // access per the mandatory SEH rule.
+        auto visualParent = SafeGetVisualParent_SEH(textBlocks[i]);
+        if (visualParent) {
+            static char parentBuf[128];
+            parentBuf[0] = 0;
+            ReadElementName_SEH(
+                static_cast<Noesis::FrameworkElement*>(visualParent),
+                parentBuf, sizeof(parentBuf));
+            if (parentBuf[0]) entry.parentRole = parentBuf;
+        }
+
+        // If element has no x:Name, promote parent to role
+        // (preserves existing tooltip behavior).
+        if (entry.role.empty() && !entry.parentRole.empty()) {
+            entry.role = entry.parentRole;
+        }
+
+        // FontSize: distinguishes title from body text when the
+        // template has no x:Names (e.g. NameAndDescTooltipContent).
+        entry.fontSize = SafeGetFontSize_SEH(textBlocks[i]);
+
+        // TypeId: read from parent container's DataContext for
+        // PropertyText entries (distinguishes Range vs ZoneRadius
+        // vs other property types).  The parent StackPanel
+        // (PropertyContainer) has a DC with TypeId/SubtypeId.
+        // Reuse visualParent captured above; no second raw access.
+        if (entry.role == "PropertyText" && visualParent) {
+            auto parentElem = static_cast<Noesis::FrameworkElement*>(
+                visualParent);
+            auto parentDC = SafeGetDataContext_SEH(parentElem);
+            if (parentDC) {
+                auto parentDCType = SafeGetClassType_SEH(parentDC);
+                if (parentDCType) {
+                    auto const& parentDCClass =
+                        Noesis::gClassCache.GetClass(parentDCType);
+                    static auto sTypeIdKey = FixedString("TypeId");
+                    auto typeIdProp =
+                        parentDCClass.Names.try_get(sTypeIdKey);
+                    if (typeIdProp && typeIdProp->Property) {
+                        auto typeIdStr = ReadTypePropertyAsString(
+                            parentDC, typeIdProp->Property);
+                        if (!typeIdStr.empty()) {
+                            entry.typeId = std::move(typeIdStr);
+                        }
+                    }
+                }
+            }
+        }
+
+        entries.emplace_back(std::move(entry));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CollectTooltipEntries_SEH: outer __try wrapper for CollectTooltipEntries
+// _Inner.  This function has NO local C++ objects with destructors (the
+// `entries` parameter is a reference -- a pointer at the ABI level -- and
+// has no scope-end unwinding here), so __try is legal per MSVC C2712.
+//
+// Same pattern as ReadWidgetTexts_SEH (line ~9170): wrap the destructor-
+// heavy inner function in a __try to catch faults that escape individual
+// Noesis-helper SEH (e.g. during vector growth or emplace_back).
+// ---------------------------------------------------------------------------
+static void CollectTooltipEntries_SEH(
+    Noesis::FrameworkElement** textBlocks, uint32_t textBlockCount,
+    std::vector<ecl::lua::TickSnapshot::TooltipEntry>& entries)
+{
+    __try {
+        CollectTooltipEntries_Inner(textBlocks, textBlockCount, entries);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        BG3A_LOG(
+            "[BG3Access] CollectTooltipEntries_SEH: fault after %d entries",
+            (int)entries.size());
+    }
+}
+
 // PollTooltip: outer wrapper.  Calls the SEH-guarded finder to get
 // TextBlock pointers, then reads their text outside SEH (ReadTextBlockText
 // uses std::string which has a destructor).  Delta-compares against
@@ -4813,7 +5026,7 @@ static void PollTooltip(
 
     if (textBlockCount == 0) {
         if (!sLastTooltipFingerprint.empty()) {
-            BG3A_LOG("[BG3Access] TOOLTIP: closed (resetting tracker)");
+            BG3A_TRACE("[BG3Access] TOOLTIP: closed (resetting tracker)");
         }
         sLastTooltipFingerprint.clear();
         sWaitingForStable = false;
@@ -4822,80 +5035,18 @@ static void PollTooltip(
         return;
     }
 
-    // Phase 2: extract ALL useful data from each TextBlock in one pass.
-    // Collects role (x:Name), parentRole, text, and fontSize so Lua
-    // has everything it needs without round-tripping back to C++.
+    // Phase 2: extract role + text + parentRole + fontSize + typeId
+    // from each TextBlock via the shared SEH-wrapped helper (same
+    // extraction used by ReadElementStructuredTextBlocks for the
+    // inspect-panel path).
     std::vector<ecl::lua::TickSnapshot::TooltipEntry> texts;
+    CollectTooltipEntries_SEH(textBlocks, textBlockCount, texts);
+
+    // Build fingerprint for delta-compare from the extracted texts.
     std::string fingerprint;
-    for (uint32_t i = 0; i < textBlockCount; i++) {
-        auto text = ReadTextBlockText(textBlocks[i]);
-        if (text.empty()) continue;
-        if (text.find("[ForceUpdate]") != std::string::npos) continue;
-        if (text.find("s_HandleUnknown") != std::string::npos) continue;
-
-        ecl::lua::TickSnapshot::TooltipEntry entry;
-        entry.text = std::move(text);
-
-        // x:Name of the TextBlock itself.
-        {
-            static char nameBuf[128];
-            nameBuf[0] = 0;
-            ReadElementName_SEH(textBlocks[i], nameBuf, sizeof(nameBuf));
-            if (nameBuf[0]) entry.role = nameBuf;
-        }
-
-        // Parent element x:Name (fallback context).
-        if (textBlocks[i]->mVisualParent) {
-            static char parentBuf[128];
-            parentBuf[0] = 0;
-            ReadElementName_SEH(
-                static_cast<Noesis::FrameworkElement*>(
-                    textBlocks[i]->mVisualParent),
-                parentBuf, sizeof(parentBuf));
-            if (parentBuf[0]) entry.parentRole = parentBuf;
-        }
-
-        // If element has no x:Name, promote parent to role
-        // (preserves existing behavior).
-        if (entry.role.empty() && !entry.parentRole.empty()) {
-            entry.role = entry.parentRole;
-        }
-
-        // FontSize: distinguishes title from body text when
-        // the template has no x:Names (e.g. NameAndDescTooltipContent).
-        entry.fontSize = SafeGetFontSize_SEH(textBlocks[i]);
-
-        // TypeId: read from parent container's DataContext for
-        // PropertyText entries (distinguishes Range vs ZoneRadius
-        // vs other property types).  The parent StackPanel
-        // (PropertyContainer) has a DC with TypeId/SubtypeId.
-        if (entry.role == "PropertyText"
-            && textBlocks[i]->mVisualParent) {
-            auto parentElem = static_cast<Noesis::FrameworkElement*>(
-                textBlocks[i]->mVisualParent);
-            auto parentDC = SafeGetDataContext_SEH(parentElem);
-            if (parentDC) {
-                auto parentDCType = SafeGetClassType_SEH(parentDC);
-                if (parentDCType) {
-                    auto const& parentDCClass =
-                        Noesis::gClassCache.GetClass(parentDCType);
-                    static auto sTypeIdKey = FixedString("TypeId");
-                    auto typeIdProp =
-                        parentDCClass.Names.try_get(sTypeIdKey);
-                    if (typeIdProp && typeIdProp->Property) {
-                        auto typeIdStr = ReadTypePropertyAsString(
-                            parentDC, typeIdProp->Property);
-                        if (!typeIdStr.empty()) {
-                            entry.typeId = std::move(typeIdStr);
-                        }
-                    }
-                }
-            }
-        }
-
+    for (auto const& entry : texts) {
         if (!fingerprint.empty()) fingerprint += '|';
         fingerprint += entry.text;
-        texts.emplace_back(std::move(entry));
     }
 
     if (texts.empty()) return;
@@ -4911,7 +5062,7 @@ static void PollTooltip(
         sPendingFingerprint = fingerprint;
         sPendingTexts = std::move(texts);
         sLastTooltipFingerprint = fingerprint;
-        BG3A_LOG("[BG3Access] TOOLTIP: reopen detected, waiting for stable (%d texts)",
+        BG3A_TRACE("[BG3Access] TOOLTIP: reopen detected, waiting for stable (%d texts)",
                  (int)sPendingTexts.size());
         return;
     }
@@ -4930,7 +5081,7 @@ static void PollTooltip(
             // Stable for 2 ticks.  Fire the pending data.
             sWaitingForStable = false;
             sStableTickCount = 0;
-            BG3A_LOG("[BG3Access] TOOLTIP: stable after reopen (%d texts)",
+            BG3A_TRACE("[BG3Access] TOOLTIP: stable after reopen (%d texts)",
                      (int)sPendingTexts.size());
             // Fall through to normal dispatch with pending data.
             // Update sLastTooltipFingerprint (already set).
@@ -4939,9 +5090,9 @@ static void PollTooltip(
             sPendingFingerprint.clear();
             sPendingTexts.clear();
 
-            BG3A_LOG("[BG3Access] TOOLTIP: %d entries", (int)snapshot->tooltipTexts.size());
+            BG3A_TRACE("[BG3Access] TOOLTIP: %d entries", (int)snapshot->tooltipTexts.size());
             for (auto const& entry : snapshot->tooltipTexts) {
-                BG3A_LOG("[BG3Access]   TT: [%s] %s (%.0f)",
+                BG3A_TRACE("[BG3Access]   TT: [%s] %s (%.0f)",
                          entry.role.empty() ? "?" : entry.role.c_str(),
                          entry.text.c_str(), entry.fontSize);
             }
@@ -4954,7 +5105,7 @@ static void PollTooltip(
             sPendingFingerprint = fingerprint;
             sPendingTexts = std::move(texts);
             sLastTooltipFingerprint = fingerprint;
-            BG3A_LOG("[BG3Access] TOOLTIP: still resolving after reopen (%d texts)",
+            BG3A_TRACE("[BG3Access] TOOLTIP: still resolving after reopen (%d texts)",
                      (int)sPendingTexts.size());
             return;
         }
@@ -4967,9 +5118,9 @@ static void PollTooltip(
     snapshot->tooltipChanged = true;
     snapshot->tooltipTexts = std::move(texts);
 
-    BG3A_LOG("[BG3Access] TOOLTIP: %d entries", (int)snapshot->tooltipTexts.size());
+    BG3A_TRACE("[BG3Access] TOOLTIP: %d entries", (int)snapshot->tooltipTexts.size());
     for (auto const& entry : snapshot->tooltipTexts) {
-        BG3A_LOG("[BG3Access]   TT: [%s] %s (%.0f)",
+        BG3A_TRACE("[BG3Access]   TT: [%s] %s (%.0f)",
                  entry.role.empty() ? "?" : entry.role.c_str(),
                  entry.text.c_str(), entry.fontSize);
     }
@@ -5046,7 +5197,7 @@ Noesis::UIElement* TryFocusManager(Noesis::Visual* elem, int depth,
     // obtained from GetVisualChild may have been freed by Noesis between
     // frames, leaving a dangling pointer with a corrupt vtable.
     if (!ProbeUIElement(static_cast<Noesis::UIElement*>(elem))) {
-        BG3A_LOG("[BG3Access] TryFocusManager: stale element pointer %p -- skipping subtree", elem);
+        BG3A_TRACE("[BG3Access] TryFocusManager: stale element pointer %p -- skipping subtree", elem);
         return nullptr;
     }
 
@@ -5063,7 +5214,7 @@ Noesis::UIElement* TryFocusManager(Noesis::Visual* elem, int depth,
                 // hold a dangling pointer.  Dereferencing garbage crashes the
                 // process.  ProbeUIElement catches access violations safely.
                 if (!ProbeUIElement(focused)) {
-                    BG3A_LOG("[BG3Access] TryFocusManager: stale FocusedElement pointer %p -- skipping", focused);
+                    BG3A_TRACE("[BG3Access] TryFocusManager: stale FocusedElement pointer %p -- skipping", focused);
                     return nullptr;
                 }
                 if (outScopeRoot) *outScopeRoot = const_cast<Noesis::DependencyObject*>(depObj);
@@ -5405,14 +5556,14 @@ static bool DetectWidgetRemoval_Inner(
             }
             outRemovedData.elemName = ReadPropertyAsString(
                 frameworkElement, "Name");
-            BG3A_LOG("[BG3Access] Widget removal detected: addr=%p dc=%s name=%s",
+            BG3A_TRACE("[BG3Access] Widget removal detected: addr=%p dc=%s name=%s",
                 freshPointer,
                 outRemovedData.dcType.c_str(),
                 outRemovedData.elemName.c_str());
             return true;
         }
         // Widget completely gone (not in new array).
-        BG3A_LOG("[BG3Access] Widget removal detected: addr=0x%llx (gone, no data)",
+        BG3A_TRACE("[BG3Access] Widget removal detected: addr=0x%llx (gone, no data)",
             (unsigned long long)oldAddrs[oldIndex]);
         outRemovedData.dcType = "Unknown";
         outRemovedData.elemName = "";
@@ -5505,13 +5656,17 @@ static uint32_t GatherWidgets_SEH(
     }
 }
 
-// CollectWidgetDCTypes: reads DC type names from all visible widgets.
-// Populates widgetDCTypes so Lua's panel close detection always knows
-// which panels are present.  Inner/Invoke/SEH pattern because
-// std::vector<std::string> has destructors.
+// CollectWidgetDCTypes: reads DC type names AND widget pointer addresses
+// from all visible widgets.  Populates widgetDCTypes so Lua's panel close
+// detection always knows which panels are present, and widgetAddrs so
+// handlers with generic (ls.Widget) top-level DCs can be anchored by
+// identity rather than by DC type.  The two vectors stay parallel:
+// outDCTypes[i] and outAddrs[i] describe the same widget.  Inner/Invoke/
+// SEH pattern because std::vector<std::string> has destructors.
 static void CollectWidgetDCTypes_Inner(
     Noesis::Visual* const* widgets, bool const* widgetVisible,
-    uint32_t widgetCount, std::vector<std::string>& outDCTypes)
+    uint32_t widgetCount, std::vector<std::string>& outDCTypes,
+    std::vector<std::string>& outAddrs)
 {
     for (uint32_t widgetIndex = 0;
          widgetIndex < widgetCount; widgetIndex++) {
@@ -5530,21 +5685,28 @@ static void CollectWidgetDCTypes_Inner(
             SafeBaseObjectTypeName_SEH(widgetDC);
         if (widgetDCTypeName) {
             outDCTypes.push_back(widgetDCTypeName);
+            char addrBuf[32];
+            snprintf(addrBuf, sizeof(addrBuf), "%p",
+                static_cast<void*>(
+                    const_cast<Noesis::Visual*>(widgets[widgetIndex])));
+            outAddrs.push_back(addrBuf);
         }
     }
 }
 static void CollectWidgetDCTypes_Invoke(
     Noesis::Visual* const* widgets, bool const* widgetVisible,
-    uint32_t widgetCount, std::vector<std::string>* outDCTypes) {
+    uint32_t widgetCount, std::vector<std::string>* outDCTypes,
+    std::vector<std::string>* outAddrs) {
     CollectWidgetDCTypes_Inner(
-        widgets, widgetVisible, widgetCount, *outDCTypes);
+        widgets, widgetVisible, widgetCount, *outDCTypes, *outAddrs);
 }
 static void CollectWidgetDCTypes_SEH(
     Noesis::Visual* const* widgets, bool const* widgetVisible,
-    uint32_t widgetCount, std::vector<std::string>& outDCTypes) {
+    uint32_t widgetCount, std::vector<std::string>& outDCTypes,
+    std::vector<std::string>& outAddrs) {
     __try {
         CollectWidgetDCTypes_Invoke(
-            widgets, widgetVisible, widgetCount, &outDCTypes);
+            widgets, widgetVisible, widgetCount, &outDCTypes, &outAddrs);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         BG3A_LOG("[BG3Access] CollectWidgetDCTypes_SEH: fault");
     }
@@ -6086,6 +6248,23 @@ void SetDialoguePollActive(bool active)
 {
     GlobalFocusMonitor::Instance().dialogPollActive_ = active;
     BG3A_LOG("[BG3Access] SetDialoguePollActive(%s)", active ? "true" : "false");
+}
+
+// SetTraceLogging: runtime toggle for BG3A_TRACE-gated noise
+// (widget enumeration, NameScope reads, tick dumps, etc.).  Lua calls
+// this from Logger.lua's CycleLogLevel so L3+R3 (in-game chord) or
+// `bg3a_log` (SE console command) flips Lua's Log.Debug and C++
+// BG3A_TRACE together.  No-op in release builds where BG3ACCESS_VERBOSE
+// isn't defined (the underlying flag doesn't exist).
+void SetTraceLogging(bool enabled)
+{
+#ifdef BG3ACCESS_VERBOSE
+    sBG3A_TraceEnabled = enabled;
+    BG3A_LOG("[BG3Access] SetTraceLogging(%s)",
+             enabled ? "true" : "false");
+#else
+    (void)enabled;
+#endif
 }
 
 bool HasProperty(Noesis::BaseObject const* o, bg3se::FixedString const& name)
@@ -7344,7 +7523,7 @@ static void TryCollectNamedTexts(
     __try {
         CollectNamedTextsFromWidget(widgetElem, namedTexts);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        BG3A_LOG("[BG3Access]   NameScope: CRASH in CollectNamedTextsFromWidget, skipping");
+        BG3A_TRACE("[BG3Access]   NameScope: CRASH in CollectNamedTextsFromWidget, skipping");
     }
 }
 
@@ -7596,7 +7775,7 @@ static void CollectNamedTextsFromWidget(
         if (dataContext) {
             auto dcTypeName = SafeBaseObjectTypeName_SEH(dataContext);
             if (dcTypeName && IsOverlayDCType(dcTypeName)) {
-                BG3A_LOG("[BG3Access]   NameScope: skipping overlay widget DC=%s", dcTypeName);
+                BG3A_TRACE("[BG3Access]   NameScope: skipping overlay widget DC=%s", dcTypeName);
                 return;
             }
         }
@@ -7665,17 +7844,17 @@ static void CollectNamedTextsFromWidget(
         // constructed elements that crash on property access (e.g. PreviewName
         // in the Options downloads overlay).  Skip if the element is unsafe.
         if (!ProbeTextBlockElement(textBlockElem)) {
-            BG3A_LOG("[BG3Access]     NameScope: UNSAFE element '%s', skipping", elementName);
+            BG3A_TRACE("[BG3Access]     NameScope: UNSAFE element '%s', skipping", elementName);
             continue;
         }
 
-        BG3A_LOG("[BG3Access]     NameScope: reading '%s' (elem=%p)", elementName, textBlockElem);
+        BG3A_TRACE("[BG3Access]     NameScope: reading '%s' (elem=%p)", elementName, textBlockElem);
         auto text = ReadTextBlockText(textBlockElem, true);
         if (text.empty()) continue;
         if (text.find("[ForceUpdate]") != std::string::npos) continue;
         if (text.find("s_HandleUnknown") != std::string::npos) continue;
 
-        BG3A_LOG("[BG3Access]     NameScope: %s = %s", elementName, text.c_str());
+        BG3A_TRACE("[BG3Access]     NameScope: %s = %s", elementName, text.c_str());
         namedTexts.push_back({elementName, text});
     }
 }
@@ -9168,6 +9347,179 @@ UserReturn ReadFocusedTextBlocks(lua_State* L)
     return 1;
 }
 
+// ---------------------------------------------------------------------------
+// PushStructuredTextBlocksToLua_Inner: shared C++ helper behind the
+// Lua-facing ReadElementStructuredTextBlocks primitive.
+//
+// Takes a Visual* root, BFS's its subtree for TextBlocks (SEH-safe),
+// runs CollectTooltipEntries_SEH for role/parentRole/fontSize/typeId
+// extraction, and pushes a Lua array of {role, parentRole, text,
+// fontSize, typeId} tables.  Matches the snapshot.tooltipTexts shape
+// that SpeechData.FromTooltip already consumes.
+//
+// Null root -> empty array (harmless).  Always returns 1 (one table
+// pushed to the Lua stack).
+//
+// Uses std::vector (destructor) -- can't live in __try directly
+// (MSVC C2712).  Every Noesis-touching operation goes through an
+// SEH-guarded helper:
+//   - BFS_CollectByType_SEH    (__try-wrapped)
+//   - CollectTooltipEntries_SEH (three-layer inner/outer)
+// Lua stack ops (lua_createtable, lua_pushstring, etc.) are pure Lua
+// C API, not Noesis.
+//
+// Callers should invoke PushStructuredTextBlocksToLua_SEH (the outer
+// wrapper below) for defense-in-depth against faults that escape
+// individual helpers' coverage.
+// ---------------------------------------------------------------------------
+static int PushStructuredTextBlocksToLua_Inner(
+    lua_State* L, Noesis::Visual* root)
+{
+    if (!root) {
+        lua_createtable(L, 0, 0);
+        return 1;
+    }
+
+    Noesis::FrameworkElement* textBlocks[64];
+    auto textBlockCount = BFS_CollectByType_SEH(
+        root, "TextBlock", textBlocks, 0, 64,
+        /*checkVisibility*/ true,
+        /*skipMatchedChildren*/ true);
+
+    std::vector<ecl::lua::TickSnapshot::TooltipEntry> entries;
+    CollectTooltipEntries_SEH(textBlocks, textBlockCount, entries);
+
+    lua_createtable(L, (int)entries.size(), 0);
+    for (int i = 0; i < (int)entries.size(); i++) {
+        lua_createtable(L, 0, 5);
+
+        lua_pushstring(L, entries[i].role.c_str());
+        lua_setfield(L, -2, "role");
+
+        lua_pushstring(L, entries[i].parentRole.c_str());
+        lua_setfield(L, -2, "parentRole");
+
+        lua_pushstring(L, entries[i].text.c_str());
+        lua_setfield(L, -2, "text");
+
+        lua_pushnumber(L, (double)entries[i].fontSize);
+        lua_setfield(L, -2, "fontSize");
+
+        if (!entries[i].typeId.empty()) {
+            lua_pushstring(L, entries[i].typeId.c_str());
+            lua_setfield(L, -2, "typeId");
+        }
+
+        lua_rawseti(L, -2, i + 1);
+    }
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// PushStructuredTextBlocksToLua_SEH: outer __try wrapper for
+// PushStructuredTextBlocksToLua_Inner.  No local C++ objects with
+// destructors (lua_State*, Visual*, int only), so __try is legal per
+// MSVC C2712.
+//
+// On fault:
+//   - Restore the Lua stack to its pre-call top so no partial table
+//     entries pollute caller state.
+//   - Push a valid empty table so callers always see a table return
+//     (maintains the Lua contract).
+//   - Log the fault.
+// ---------------------------------------------------------------------------
+static int PushStructuredTextBlocksToLua_SEH(
+    lua_State* L, Noesis::Visual* root)
+{
+    int initialStackTop = lua_gettop(L);
+    __try {
+        return PushStructuredTextBlocksToLua_Inner(L, root);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        lua_settop(L, initialStackTop);
+        lua_createtable(L, 0, 0);
+        BG3A_LOG(
+            "[BG3Access] PushStructuredTextBlocksToLua_SEH: fault");
+        return 1;
+    }
+}
+
+// Lua API: read structured TextBlocks from an arbitrary element's
+// subtree.  The only primitive for structured reading -- Lua composes
+// with GetFocusedElement, FindNameInWidget, FindNameInWidgetScoped,
+// or any other element accessor to target any node in the tree
+// without needing more C++ bindings.
+//
+// Mixed lua_State* + typed signature: LuaWrapFunction auto-converts
+// the element userdata from Lua stack arg 1 into the typed Visual*;
+// we use L to push the structured result table.
+UserReturn ReadElementStructuredTextBlocks(
+    lua_State* L, Noesis::FrameworkElement* elem)
+{
+    return PushStructuredTextBlocksToLua_SEH(L,
+        static_cast<Noesis::Visual*>(elem));
+}
+
+// ---------------------------------------------------------------------------
+// GetTooltipPopupRoot: returns the Noesis popup root element for the
+// currently open tooltip, or nullptr when no tooltip is visible.
+//
+// Lua composes this with FindNameInWidgetScoped + ReadElementStructuredTextBlocks
+// to read structured tooltip content from specific template regions
+// (e.g. HoveredItemPanel vs EquippedItemPanel in inventory compare mode).
+// Keeps XAML-template-specific names out of C++ -- C++ exposes the popup
+// entry point, Lua composes the template-aware logic on top.
+//
+// Event-gated by sToolTipIsOpen (set by ToolTip.Opened/Closed routed
+// event handlers).  When no tooltip is open, returns nullptr immediately
+// with no tree walking.
+//
+// When a tooltip is open, traverses the popup roots (non-content children
+// of the true visual root) and returns the first one that:
+//   - does NOT contain a ContextMenuItem (context menus are also popups)
+//   - DOES contain at least one TextBlock (= a real tooltip with content)
+//
+// SEH-protected: any fault during traversal returns nullptr; Lua caller
+// treats it as "no compare data available this tick" and skips cleanly.
+// ---------------------------------------------------------------------------
+Noesis::FrameworkElement* GetTooltipPopupRoot()
+{
+    if (!sToolTipIsOpen) return nullptr;
+
+    __try {
+        auto& monitor = GlobalFocusMonitor::Instance();
+        auto trueRoot = monitor.GetTrueRoot();
+        auto contentChild = monitor.GetContentChild();
+        if (!trueRoot) return nullptr;
+
+        Noesis::Visual* popupRoots[8];
+        auto popupCount = GetPopupRoots_SEH(
+            trueRoot, contentChild, popupRoots, 8);
+        if (popupCount == 0) return nullptr;
+
+        // Same filter as FindTooltipTextBlocks_SEH: skip context-menu
+        // popups, return the first popup root that actually contains
+        // TextBlocks (i.e. a tooltip).
+        for (uint32_t i = 0; i < popupCount; i++) {
+            auto popupRoot = popupRoots[i];
+            if (!popupRoot) continue;
+
+            Noesis::FrameworkElement* cmCheck[1];
+            if (BFS_CollectByType_SEH(popupRoot, "ContextMenuItem",
+                    cmCheck, 0, 1) > 0) continue;
+
+            Noesis::FrameworkElement* tbCheck[1];
+            if (BFS_CollectByType_SEH(popupRoot, "TextBlock",
+                    tbCheck, 0, 1, true, true) > 0) {
+                return static_cast<Noesis::FrameworkElement*>(popupRoot);
+            }
+        }
+        return nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        BG3A_LOG("[BG3Access] GetTooltipPopupRoot: SEH fault");
+        return nullptr;
+    }
+}
+
 UserReturn ReadWidgetTextBlocks(lua_State* L)
 {
     auto widgetName = luaL_checkstring(L, 1);
@@ -9370,6 +9722,7 @@ void RegisterUILib()
     MODULE_FUNCTION(ForceGlobalFocusUpdate)
     MODULE_FUNCTION(SuppressGlobalFocusTick)
     MODULE_FUNCTION(SetDialoguePollActive)
+    MODULE_FUNCTION(SetTraceLogging)
     MODULE_FUNCTION(HasProperty)
     MODULE_FUNCTION(HasLocalValue)
     MODULE_FUNCTION(IsElementVisible)
@@ -9387,6 +9740,10 @@ void RegisterUILib()
     // Widget/element text readers (on-demand BFS for TextBlocks)
     MODULE_FUNCTION(ReadWidgetTextBlocks)
     MODULE_FUNCTION(ReadFocusedTextBlocks)
+    MODULE_FUNCTION(ReadElementStructuredTextBlocks)
+    // Tooltip popup root access (for on-demand Lua-side template-scoped reads
+    // like inventory compare mode HoveredItemPanel / EquippedItemPanel).
+    MODULE_FUNCTION(GetTooltipPopupRoot)
     // HUD info reader (on-demand, called from RS direction handler)
     MODULE_FUNCTION(ReadHUDInfo)
     END_MODULE()

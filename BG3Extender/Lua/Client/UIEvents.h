@@ -189,6 +189,15 @@ struct TickSnapshot
     // "is a discovery-only handler's widget still around?").
     std::vector<std::string> widgetDCTypes;
 
+    // Widget element pointer addresses (hex strings, same format as
+    // FocusEventData::widgetRootId), parallel to widgetDCTypes[i].
+    // Lua uses these to anchor a handler by widget identity when the
+    // widget-level DC is generic (ls.Widget) -- record the address at
+    // activation time, verify the widget is still in this array each
+    // tick.  Immune to DC thrashing on child elements and to transient
+    // focus steals by notification banners.
+    std::vector<std::string> widgetAddrs;
+
     // Radial slot data (RT shortcuts radial, RB action radial).
     // Only populated when radialSlotChanged == true.
     // titleText: display name from ActionTitle TextBlock (localized).

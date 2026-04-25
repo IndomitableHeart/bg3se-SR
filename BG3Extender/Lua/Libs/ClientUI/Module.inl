@@ -5560,6 +5560,16 @@ static bool DetectWidgetRemoval_Inner(
         }
         if (stillVisible) continue;
         // Widget was visible, now invisible or gone.
+        // Always populate widgetRootId with the original pointer
+        // address so Lua can match it against handler-anchor
+        // addresses captured at activation time.  Without this,
+        // panel-close cleanup (RoutePanelSnapshot's widgetRemoved
+        // branch) skips deactivation because removedAddr is "",
+        // leaving stale handlers active across menu transitions.
+        char addrBuf[32];
+        snprintf(addrBuf, sizeof(addrBuf), "%p",
+            reinterpret_cast<void*>(oldAddrs[oldIndex]));
+        outRemovedData.widgetRootId = addrBuf;
         if (freshPointer) {
             if (!ProbeUIElement(static_cast<Noesis::UIElement*>(
                     freshPointer))) continue;

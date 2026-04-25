@@ -198,6 +198,16 @@ struct TickSnapshot
     // focus steals by notification banners.
     std::vector<std::string> widgetAddrs;
 
+    // Widget element x:Name strings (e.g. "JournalCombatLog_c",
+    // "TargetInfo_c"), parallel to widgetDCTypes[i] / widgetAddrs[i].
+    // Lua uses these for widget-name routing when a widget has a
+    // generic ls.Widget DC and DC-type routing alone can't identify
+    // which handler should activate (e.g. JournalCombatLog_c).
+    // Empty string when the widget has no x:Name set.  Reads happen
+    // inside the existing CollectWidgetDCTypes_SEH wrapper -- no
+    // separate SEH path or Noesis call introduced.
+    std::vector<std::string> widgetNames;
+
     // Radial slot data (RT shortcuts radial, RB action radial).
     // Only populated when radialSlotChanged == true.
     // titleText: display name from ActionTitle TextBlock (localized).

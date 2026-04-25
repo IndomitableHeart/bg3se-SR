@@ -538,6 +538,21 @@ static void PushTickSnapshotTable(lua_State* L, TickSnapshot const& snapshot)
         lua_settable(L, -3);
     }
 
+    // Parallel to widgetDCTypes / widgetAddrs: widget x:Name strings.
+    // widgetNames[i] is the x:Name of the widget whose DC type is
+    // widgetDCTypes[i] and whose address is widgetAddrs[i].  Lua
+    // routes generic-DC widgets (ls.Widget) by x:Name when DC-type
+    // routing alone can't identify the right handler.
+    if (!snapshot.widgetNames.empty()) {
+        lua_pushstring(L, "widgetNames");
+        lua_createtable(L, static_cast<int>(snapshot.widgetNames.size()), 0);
+        for (size_t nameIndex = 0; nameIndex < snapshot.widgetNames.size(); nameIndex++) {
+            lua_pushstring(L, snapshot.widgetNames[nameIndex].c_str());
+            lua_rawseti(L, -2, static_cast<int>(nameIndex) + 1);
+        }
+        lua_settable(L, -3);
+    }
+
     // Radial slot data (only if radialSlotChanged)
     lua_pushstring(L, "radialSlotChanged");
     lua_pushboolean(L, snapshot.radialSlotChanged);

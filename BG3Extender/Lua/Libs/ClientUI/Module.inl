@@ -307,7 +307,8 @@ static uint32_t GatherWidgets_SEH(Noesis::Visual* container,
 static void CollectWidgetDCTypes_SEH(
     Noesis::Visual* const* widgets, bool const* widgetVisible,
     uint32_t widgetCount, std::vector<std::string>& outDCTypes,
-    std::vector<std::string>& outAddrs);
+    std::vector<std::string>& outAddrs,
+    std::vector<std::string>& outNames);
 static uintptr_t ReadDCAddress_SEH(Noesis::UIElement* elem);
 static Noesis::UIElement* FindFocusedElement_SEH(
     Noesis::Visual** widgets, bool* widgetVisible, uint32_t widgetCount,
@@ -1432,34 +1433,44 @@ static void PushWidgetDCType_SEH(
     }
 }
 
-// PushWidgetDCTypeAndAddr: mid-tick append of a (DC type, address) pair
-// into the parallel widgetDCTypes/widgetAddrs snapshot vectors.  Unlike
-// PushWidgetDCType, this does NOT dedup by type: two widgets with the
-// same DC are distinct entities at different addresses, so both entries
-// must be preserved for identity-based handler anchoring to work.
-// Inner/Invoke/SEH pattern for the same destructor reasons as above.
+// PushWidgetDCTypeAndAddr: mid-tick append of a (DC type, address,
+// x:Name) triple into the parallel widgetDCTypes / widgetAddrs /
+// widgetNames snapshot vectors.  Unlike PushWidgetDCType, this does
+// NOT dedup by type: two widgets with the same DC are distinct
+// entities at different addresses, so both entries must be preserved
+// for identity-based handler anchoring to work.  Inner/Invoke/SEH
+// pattern for the same destructor reasons as above.
 static void PushWidgetDCTypeAndAddr_Inner(
     std::vector<std::string>& widgetDCTypes,
     std::vector<std::string>& widgetAddrs,
-    const char* dcTypeName, const char* addrStr)
+    std::vector<std::string>& widgetNames,
+    const char* dcTypeName, const char* addrStr,
+    const char* nameStr)
 {
     widgetDCTypes.push_back(dcTypeName);
     widgetAddrs.push_back(addrStr);
+    widgetNames.push_back(nameStr ? nameStr : "");
 }
 static void PushWidgetDCTypeAndAddr_Invoke(
     std::vector<std::string>* widgetDCTypes,
     std::vector<std::string>* widgetAddrs,
-    const char* dcTypeName, const char* addrStr) {
+    std::vector<std::string>* widgetNames,
+    const char* dcTypeName, const char* addrStr,
+    const char* nameStr) {
     PushWidgetDCTypeAndAddr_Inner(
-        *widgetDCTypes, *widgetAddrs, dcTypeName, addrStr);
+        *widgetDCTypes, *widgetAddrs, *widgetNames,
+        dcTypeName, addrStr, nameStr);
 }
 static void PushWidgetDCTypeAndAddr_SEH(
     std::vector<std::string>& widgetDCTypes,
     std::vector<std::string>& widgetAddrs,
-    const char* dcTypeName, const char* addrStr) {
+    std::vector<std::string>& widgetNames,
+    const char* dcTypeName, const char* addrStr,
+    const char* nameStr) {
     __try {
         PushWidgetDCTypeAndAddr_Invoke(
-            &widgetDCTypes, &widgetAddrs, dcTypeName, addrStr);
+            &widgetDCTypes, &widgetAddrs, &widgetNames,
+            dcTypeName, addrStr, nameStr);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         BG3A_LOG("[BG3Access] PushWidgetDCTypeAndAddr_SEH: fault");
     }
@@ -1816,12 +1827,15 @@ public:
             // TICK[A] breadcrumb removed -- per-tick logging floods the log.
             cachedWidgetDCTypes_.clear();
             cachedWidgetAddrs_.clear();
+            cachedWidgetNames_.clear();
             CollectWidgetDCTypes_SEH(
                 widgets, widgetVisible, widgetCount,
-                cachedWidgetDCTypes_, cachedWidgetAddrs_);
+                cachedWidgetDCTypes_, cachedWidgetAddrs_,
+                cachedWidgetNames_);
         }
         snapshot->widgetDCTypes = cachedWidgetDCTypes_;
         snapshot->widgetAddrs = cachedWidgetAddrs_;
+        snapshot->widgetNames = cachedWidgetNames_;
 
         // ----- Deliver buffered loading tips -----
         // Check the buffer directly every tick instead of using a flag.
@@ -3278,6 +3292,7 @@ public:
         inpcSubscribedDCAddr_ = 0;
         cachedWidgetDCTypes_.clear();
         cachedWidgetAddrs_.clear();
+        cachedWidgetNames_.clear();
         pollStableFrames_ = 0;
         settling_ = false;
         settleStableCount_ = 0;
@@ -3490,16 +3505,20 @@ public:
                      dcTypeName ? dcTypeName : "(null)");
                 if (dcTypeName) {
                     data.dcType = dcTypeName;
-                    // Push into widgetDCTypes/widgetAddrs in lockstep
-                    // via SEH-wrapped helper so a fault here stays
-                    // scoped to the push and does not kill the whole
-                    // Tick frame.  The cached scan may have missed
-                    // this widget if it just became visible on this
-                    // tick.  No dedup -- two widgets with the same DC
-                    // at different addresses are distinct entities.
+                    // Push into widgetDCTypes / widgetAddrs /
+                    // widgetNames in lockstep via SEH-wrapped helper
+                    // so a fault here stays scoped to the push and
+                    // does not kill the whole Tick frame.  The
+                    // cached scan may have missed this widget if it
+                    // just became visible on this tick.  No dedup --
+                    // two widgets with the same DC at different
+                    // addresses are distinct entities.  data.elemName
+                    // was populated above (line ~3488) via the
+                    // SEH-wrapped ReadPropertyAsString.
                     PushWidgetDCTypeAndAddr_SEH(
                         snapshot.widgetDCTypes, snapshot.widgetAddrs,
-                        dcTypeName, ptrBuf);
+                        snapshot.widgetNames,
+                        dcTypeName, ptrBuf, data.elemName.c_str());
 
                     BG3A_TRACE("[BG3Access]   EWD[1] CollectDCProperties");
                     CollectDCProperties(data, dataContext);
@@ -3762,6 +3781,7 @@ public:
     // against the rendering thread.
     std::vector<std::string> cachedWidgetDCTypes_;
     std::vector<std::string> cachedWidgetAddrs_;
+    std::vector<std::string> cachedWidgetNames_;
 
     // Strategy 3 performance counters (diagnostic -- remove before shipping).
     uint32_t strategy3Runs_ = 0;        // total times FindSelectedTabInTree ran
@@ -5656,17 +5676,24 @@ static uint32_t GatherWidgets_SEH(
     }
 }
 
-// CollectWidgetDCTypes: reads DC type names AND widget pointer addresses
-// from all visible widgets.  Populates widgetDCTypes so Lua's panel close
-// detection always knows which panels are present, and widgetAddrs so
-// handlers with generic (ls.Widget) top-level DCs can be anchored by
-// identity rather than by DC type.  The two vectors stay parallel:
-// outDCTypes[i] and outAddrs[i] describe the same widget.  Inner/Invoke/
-// SEH pattern because std::vector<std::string> has destructors.
+// CollectWidgetDCTypes: reads DC type names, widget pointer addresses,
+// AND widget x:Names from all visible widgets.  Populates widgetDCTypes
+// so Lua's panel close detection always knows which panels are present,
+// widgetAddrs so handlers with generic (ls.Widget) top-level DCs can be
+// anchored by identity, and widgetNames so generic-DC widgets can be
+// routed by x:Name (e.g. JournalCombatLog_c whose runtime DC is the
+// generic ls.Widget).  All three vectors stay parallel:
+// outDCTypes[i] / outAddrs[i] / outNames[i] describe the same widget.
+// Inner/Invoke/SEH pattern because std::vector<std::string> has
+// destructors; the additional ReadPropertyAsString call has its own
+// internal SEH wrapper (SafeReadPropertyAsString_SEH at line ~7108)
+// so a fault reading a single widget's Name returns empty string and
+// stays scoped to that widget rather than aborting the whole pass.
 static void CollectWidgetDCTypes_Inner(
     Noesis::Visual* const* widgets, bool const* widgetVisible,
     uint32_t widgetCount, std::vector<std::string>& outDCTypes,
-    std::vector<std::string>& outAddrs)
+    std::vector<std::string>& outAddrs,
+    std::vector<std::string>& outNames)
 {
     for (uint32_t widgetIndex = 0;
          widgetIndex < widgetCount; widgetIndex++) {
@@ -5690,23 +5717,36 @@ static void CollectWidgetDCTypes_Inner(
                 static_cast<void*>(
                     const_cast<Noesis::Visual*>(widgets[widgetIndex])));
             outAddrs.push_back(addrBuf);
+            // Read the widget's x:Name on the same probed pointer.
+            // ReadPropertyAsString has its own SEH; on fault it
+            // returns empty, which we still push so the three
+            // parallel vectors stay aligned by index.
+            auto widgetName = ReadPropertyAsString(
+                static_cast<Noesis::FrameworkElement*>(
+                    const_cast<Noesis::Visual*>(widgets[widgetIndex])),
+                "Name");
+            outNames.push_back(widgetName);
         }
     }
 }
 static void CollectWidgetDCTypes_Invoke(
     Noesis::Visual* const* widgets, bool const* widgetVisible,
     uint32_t widgetCount, std::vector<std::string>* outDCTypes,
-    std::vector<std::string>* outAddrs) {
+    std::vector<std::string>* outAddrs,
+    std::vector<std::string>* outNames) {
     CollectWidgetDCTypes_Inner(
-        widgets, widgetVisible, widgetCount, *outDCTypes, *outAddrs);
+        widgets, widgetVisible, widgetCount,
+        *outDCTypes, *outAddrs, *outNames);
 }
 static void CollectWidgetDCTypes_SEH(
     Noesis::Visual* const* widgets, bool const* widgetVisible,
     uint32_t widgetCount, std::vector<std::string>& outDCTypes,
-    std::vector<std::string>& outAddrs) {
+    std::vector<std::string>& outAddrs,
+    std::vector<std::string>& outNames) {
     __try {
         CollectWidgetDCTypes_Invoke(
-            widgets, widgetVisible, widgetCount, &outDCTypes, &outAddrs);
+            widgets, widgetVisible, widgetCount,
+            &outDCTypes, &outAddrs, &outNames);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         BG3A_LOG("[BG3Access] CollectWidgetDCTypes_SEH: fault");
     }

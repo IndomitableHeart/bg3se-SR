@@ -7004,6 +7004,21 @@ static std::string ReadDepPropertyAsString_Inner(Noesis::DependencyObject const*
                                 && str.find("[ForceUpdate]") == std::string::npos) {
                                 return str;
                             }
+                        } else {
+                            // DIAGNOSTIC: SafeToString failed.  Log the
+                            // type name so we can identify which type is
+                            // mis-classified as BaseObject.  The bare-
+                            // pointer warning in ObjectHelpers::ToString
+                            // produces "dead object" lines that look like
+                            // garbage pointers (3A18..., 3BD1..., etc.) --
+                            // those are scalar struct values incorrectly
+                            // passing the BaseObject descendant test.
+                            // Fix the type filter once we know which type.
+                            BG3A_LOG("[BG3Access] DP-CAST FAIL: type=%s "
+                                "rawVal=%p (mis-typed as BaseObject in "
+                                "TypeProperty path)",
+                                type ? type->GetName() : "<null>",
+                                rawVal);
                         }
                     }
                 }
@@ -7080,6 +7095,17 @@ static std::string ReadDPFromMValues_Inner(Noesis::DependencyObject const* depOb
                         && str.find("[ForceUpdate]") == std::string::npos) {
                         return str;
                     }
+                } else {
+                    // DIAGNOSTIC: see matching note in the TypeProperty
+                    // path above.  Logs which DP type produced a failed
+                    // ToString so we can identify mis-classified scalars
+                    // / structs that the IsDescendantOf(BaseObject) test
+                    // is letting through incorrectly.
+                    BG3A_LOG("[BG3Access] DP-CAST FAIL: type=%s rawVal=%p "
+                        "(mis-typed as BaseObject in DependencyProperty "
+                        "mValues path)",
+                        dpType ? dpType->GetName() : "<null>",
+                        rawVal);
                 }
             }
         }

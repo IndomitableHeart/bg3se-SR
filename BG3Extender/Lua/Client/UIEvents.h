@@ -40,28 +40,42 @@ struct FocusEventData
     // DC scalar properties: {name, value} pairs
     std::vector<std::pair<std::string, std::string>> dcScalarProps;
 
-    // DC object properties (e.g. SelectedItem): sub-object with its own props
-    struct SubObject
-    {
-        std::string propName;   // property name on parent DC
-        std::string typeName;   // sub-object class type name
-        std::vector<std::pair<std::string, std::string>> props;
-    };
-    std::vector<SubObject> dcObjectProps;
+    // DC object properties (e.g. SelectedItem): sub-object with its own props.
+    // Forward-declared so CollectionItem can hold a vector of SubObjects.
+    struct SubObject;
 
     // DC collection properties: when a TypeProperty points to a
-    // BaseCollection, enumerate its items and read their scalar props.
-    // Produces an indexed array of sub-tables in Lua (dcProps.PropName[1], etc.)
+    // BaseCollection, enumerate its items and read their scalar props
+    // AND their sub-objects (one level deep).  Produces an indexed
+    // array of sub-tables in Lua (dcProps.PropName[1], etc.).  The
+    // sub-objects path is what makes JournalDialogue.DialogueLines[i].
+    // Speaker.Name reachable -- without it, we'd have line text but no
+    // way to attribute it to a speaker.
     struct CollectionItem
     {
         std::string typeName;   // item class type name
         std::vector<std::pair<std::string, std::string>> props;
+        std::vector<SubObject> subObjects;
     };
     struct CollectionProperty
     {
         std::string propName;   // collection property name on parent DC
         std::vector<CollectionItem> items;
     };
+
+    // SubObject definition.  Holds scalar props and nested collections
+    // one level deep (so SelectedItem.Participants is reachable -- a
+    // JournalDialogue VM exposed as the DC's SelectedItem has a
+    // Participants collection of DialogueParticipant VMs we couldn't
+    // see otherwise).  Same shape as top-level dcCollectionProps.
+    struct SubObject
+    {
+        std::string propName;   // property name on parent DC
+        std::string typeName;   // sub-object class type name
+        std::vector<std::pair<std::string, std::string>> props;
+        std::vector<CollectionProperty> collections;
+    };
+    std::vector<SubObject> dcObjectProps;
     std::vector<CollectionProperty> dcCollectionProps;
 
     // Element's own text (TextBlock text, Content, ToString)
@@ -207,6 +221,27 @@ struct TickSnapshot
     // inside the existing CollectWidgetDCTypes_SEH wrapper -- no
     // separate SEH path or Noesis call introduced.
     std::vector<std::string> widgetNames;
+
+    // All TRACKED widget DC types / Addrs / x:Names this tick,
+    // including widgets whose computed IsVisible is currently false.
+    // Parallel arrays (allWidgetDCTypes[i] / allWidgetAddrs[i] /
+    // allWidgetNames[i] all describe the same widget instance).
+    //
+    // Distinct from widgetDCTypes/Addrs/Names which include only
+    // CURRENTLY-VISIBLE widgets.  Use the all* arrays to answer
+    // "is this widget loaded?" -- the answer is invariant across
+    // animation frames and visibility transitions on ancestors.
+    // Use the visibility-filtered arrays to answer "is this widget
+    // displayed to the user RIGHT THIS FRAME?"  The two questions
+    // are different and conflating them masks transient flicker as
+    // permanent close (e.g., menu navigation through animations).
+    //
+    // sTrackedWidgets is maintained by ls.UIWidget.Loaded/Unloaded
+    // class handlers, so the all* arrays change only when widgets
+    // actually load or unload, not when their visibility flickers.
+    std::vector<std::string> allWidgetDCTypes;
+    std::vector<std::string> allWidgetAddrs;
+    std::vector<std::string> allWidgetNames;
 
     // Radial slot data (RT shortcuts radial, RB action radial).
     // Only populated when radialSlotChanged == true.

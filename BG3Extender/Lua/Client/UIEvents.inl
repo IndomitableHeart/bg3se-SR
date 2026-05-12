@@ -209,10 +209,31 @@ static void PushFocusEventTable(lua_State* L, FocusEventData const& data)
             lua_pushstring(L, "_type");
             lua_pushstring(L, obj.typeName.c_str());
             lua_settable(L, -3);
-            // Sub-properties
+            // Scalar sub-properties
             for (auto const& kv : obj.props) {
                 lua_pushstring(L, kv.first.c_str());
                 lua_pushstring(L, kv.second.c_str());
+                lua_settable(L, -3);
+            }
+            // Nested collections (e.g. SelectedItem.Participants).
+            // Same shape as top-level collection arrays.
+            for (auto const& nestedColl : obj.collections) {
+                lua_newtable(L);
+                int nestedArrayIndex = 1;
+                for (auto const& nestedItem : nestedColl.items) {
+                    lua_newtable(L);
+                    lua_pushstring(L, "_type");
+                    lua_pushstring(L, nestedItem.typeName.c_str());
+                    lua_settable(L, -3);
+                    for (auto const& kv : nestedItem.props) {
+                        lua_pushstring(L, kv.first.c_str());
+                        lua_pushstring(L, kv.second.c_str());
+                        lua_settable(L, -3);
+                    }
+                    lua_rawseti(L, -2, nestedArrayIndex++);
+                }
+                lua_pushstring(L, nestedColl.propName.c_str());
+                lua_insert(L, -2);
                 lua_settable(L, -3);
             }
             // Set as dcProps[propName]
@@ -233,6 +254,23 @@ static void PushFocusEventTable(lua_State* L, FocusEventData const& data)
                 for (auto const& kv : collectionItem.props) {
                     lua_pushstring(L, kv.first.c_str());
                     lua_pushstring(L, kv.second.c_str());
+                    lua_settable(L, -3);
+                }
+                // Sub-objects on the collection item (e.g.
+                // DialogueLines[i].Speaker).  Each becomes a nested
+                // table with _type + scalars.
+                for (auto const& nestedSub : collectionItem.subObjects) {
+                    lua_newtable(L);
+                    lua_pushstring(L, "_type");
+                    lua_pushstring(L, nestedSub.typeName.c_str());
+                    lua_settable(L, -3);
+                    for (auto const& subKv : nestedSub.props) {
+                        lua_pushstring(L, subKv.first.c_str());
+                        lua_pushstring(L, subKv.second.c_str());
+                        lua_settable(L, -3);
+                    }
+                    lua_pushstring(L, nestedSub.propName.c_str());
+                    lua_insert(L, -2);
                     lua_settable(L, -3);
                 }
                 lua_rawseti(L, -2, luaArrayIndex++);
@@ -549,6 +587,38 @@ static void PushTickSnapshotTable(lua_State* L, TickSnapshot const& snapshot)
         for (size_t nameIndex = 0; nameIndex < snapshot.widgetNames.size(); nameIndex++) {
             lua_pushstring(L, snapshot.widgetNames[nameIndex].c_str());
             lua_rawseti(L, -2, static_cast<int>(nameIndex) + 1);
+        }
+        lua_settable(L, -3);
+    }
+
+    // All-tracked widget arrays: same shape as the visibility-filtered
+    // arrays above, but include widgets whose IsVisible is currently
+    // false.  Lua liveness checks use these so animation-frame
+    // visibility flicker doesn't masquerade as a permanent close.
+    if (!snapshot.allWidgetDCTypes.empty()) {
+        lua_pushstring(L, "allWidgetDCTypes");
+        lua_createtable(L, static_cast<int>(snapshot.allWidgetDCTypes.size()), 0);
+        for (size_t i = 0; i < snapshot.allWidgetDCTypes.size(); i++) {
+            lua_pushstring(L, snapshot.allWidgetDCTypes[i].c_str());
+            lua_rawseti(L, -2, static_cast<int>(i) + 1);
+        }
+        lua_settable(L, -3);
+    }
+    if (!snapshot.allWidgetAddrs.empty()) {
+        lua_pushstring(L, "allWidgetAddrs");
+        lua_createtable(L, static_cast<int>(snapshot.allWidgetAddrs.size()), 0);
+        for (size_t i = 0; i < snapshot.allWidgetAddrs.size(); i++) {
+            lua_pushstring(L, snapshot.allWidgetAddrs[i].c_str());
+            lua_rawseti(L, -2, static_cast<int>(i) + 1);
+        }
+        lua_settable(L, -3);
+    }
+    if (!snapshot.allWidgetNames.empty()) {
+        lua_pushstring(L, "allWidgetNames");
+        lua_createtable(L, static_cast<int>(snapshot.allWidgetNames.size()), 0);
+        for (size_t i = 0; i < snapshot.allWidgetNames.size(); i++) {
+            lua_pushstring(L, snapshot.allWidgetNames[i].c_str());
+            lua_rawseti(L, -2, static_cast<int>(i) + 1);
         }
         lua_settable(L, -3);
     }

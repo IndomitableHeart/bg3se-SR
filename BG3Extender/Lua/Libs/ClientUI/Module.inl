@@ -139,6 +139,18 @@ static const Noesis::TypeClass* sDCWidgetType = nullptr;
 // UIElementData metadata (the Indie SDK doesn't export Selector::SelectionChangedEvent).
 // Used for event-driven tab detection (replaces Strategy 3 per-frame tree walk).
 static Noesis::RoutedEvent* sSelectionChangedEvent = nullptr;
+// Expander.Expanded / Expander.Collapsed routed events -- discovered at
+// runtime from Expander's UIElementData.  Class handler fires on EVERY
+// expander toggle regardless of how its content show/hide is implemented.
+// Necessary because some expander templates (Larian's ProficiencyGroup --
+// Simple Weapons / Martial Weapons / Armours) deliberately suppress
+// Visibility changes (using Height=0/IsEnabled=False instead, to prevent
+// focus-stealing on expand), which incidentally suppresses the INPC
+// side-effect that the shared ExpanderButtonTemplate's Visibility="Collapsed"
+// triggers.  Without this class handler, those expander toggles never
+// reach Lua -- the user hears no "expanded" / "collapsed" announcement.
+static Noesis::RoutedEvent* sExpanderExpandedEvent = nullptr;
+static Noesis::RoutedEvent* sExpanderCollapsedEvent = nullptr;
 // GotFocus routed event -- discovered at runtime from UIElement's UIElementData.
 // Class handler fires for controller d-pad navigation (logical focus, not keyboard).
 // GotKeyboardFocus does NOT fire for controller input -- removed.
@@ -180,6 +192,13 @@ static Noesis::BaseComponent* sGotFocusSourceElement = nullptr;
 // SelectionChanged event handler outputs.  Read and cleared in Tick().
 // Single-threaded: Noesis events fire on the main thread, stable during Tick.
 static bool sSelectionDirtyFlag = false;
+// Expander.Expanded / Expander.Collapsed event handler output.  Set by
+// ClassExpanderDelegate when ANY Expander control toggles.  Read by Tick()
+// just before the inpcDirty_ consumption block, where it sets inpcDirty_
+// so the existing INPC pipeline picks up the change (snapshot dispatch
+// with valueChanged=true, focusedElement.isChecked re-extracted, toggle
+// detection at the snapshot-finalize step confirms the change).
+static bool sExpanderToggledDirty = false;
 // Static mirror of suppressTick_ for use by class handler delegates,
 // which are defined before the GlobalFocusMonitor class.
 static bool sSuppressCallbacks = false;
@@ -1040,6 +1059,34 @@ struct ClassSelectionDelegate
 
 static ClassSelectionDelegate* const kClassSelectionPtr =
     reinterpret_cast<ClassSelectionDelegate*>(static_cast<uintptr_t>(0xACC5E2));
+
+// Expander.Expanded / Expander.Collapsed class handler.  Same single
+// delegate handles both events -- the routed event identity isn't
+// inspected; we only care that IsExpanded changed.  Sets the dirty
+// flag and lets Tick() route through the existing INPC pipeline so
+// the focused expander's isChecked is re-extracted and a snapshot
+// dispatches.  Trivially small handler -- no SEH wrap needed (no
+// Noesis API calls beyond the implicit args cast), but the
+// __try/__except is kept for parity with ClassSelectionDelegate and
+// defense against unexpected Noesis state during the event fire.
+struct ClassExpanderDelegate
+{
+    void Handler(Noesis::BaseComponent* source, const Noesis::EventArgs& args)
+    {
+        if (sSuppressCallbacks) return;
+        __try {
+            sExpanderToggledDirty = true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
+};
+
+// Sentinel pointer used to register the delegate.  Address is irrelevant --
+// Noesis stores it as opaque void* and passes it back when invoking the
+// handler.  Distinct from kClassSelectionPtr / kGotFocusPtr to avoid any
+// collision in Noesis's internal handler map.
+static ClassExpanderDelegate* const kClassExpanderPtr =
+    reinterpret_cast<ClassExpanderDelegate*>(static_cast<uintptr_t>(0xACC5E3));
 
 // GotFocus class handler -- fires for logical focus changes (controller d-pad).
 // Replaces per-frame Strategies 1+2 (FocusManager.FocusedElement tree walk
@@ -2943,6 +2990,23 @@ public:
         // callback (SubscribeElementINPC) already carries the full DC data
         // for the newly selected element.  Firing INPC on the same tick
         // would double-speak the exact same text.
+        // Expander toggle: route into inpcDirty_ so the existing INPC
+        // pipeline below handles the snapshot dispatch.  Without this,
+        // some Larian expander templates (ProficiencyGroup -- Simple
+        // Weapons / Martial Weapons / Armours) toggle silently because
+        // their show/hide implementation (Height=0/IsEnabled=False to
+        // prevent focus stealing) doesn't trigger the Visibility-driven
+        // INPC side effect the shared ExpanderButtonTemplate relies on.
+        // ClassExpanderDelegate sets this flag on EVERY Expander
+        // Expanded/Collapsed routed event; consuming it here ensures
+        // valueChanged fires and the snapshot dispatches with the
+        // refreshed focusedElement.isChecked.  See sExpanderToggledDirty
+        // comment near the top of the file for full background.
+        if (sExpanderToggledDirty) {
+            sExpanderToggledDirty = false;
+            inpcDirty_ = true;
+        }
+
         // Element INPC: the ViewModel notified us that a property changed.
         // Trust the notification and set valueChanged in the snapshot.
         // The delta comparison on dcScalarProps misses sub-object changes
@@ -3530,34 +3594,34 @@ public:
             }
 
             // Delta comparison: has anything meaningful changed?
-            bool shouldDispatch = false;
-            if (snapshot->focusChanged) {
-                shouldDispatch = true;
-            }
-            if (snapshot->inlineCarouselChanged) {
-                shouldDispatch = true;
-            }
-            if (snapshot->valueChanged && !snapshot->focusChanged) {
-                shouldDispatch = true;
-            }
-            if (snapshot->selectionChanged) {
-                shouldDispatch = true;
-            }
-            if (snapshot->widgetAdded) {
-                shouldDispatch = true;
-            }
-            if (snapshot->radialSlotChanged) {
-                shouldDispatch = true;
-            }
-            if (snapshot->contextMenuChanged) {
-                shouldDispatch = true;
-            }
-            if (snapshot->tooltipChanged) {
-                shouldDispatch = true;
-            }
-            if (!snapshot->focusedElement.namedTexts.empty()) {
-                shouldDispatch = true;
-            }
+            // widgetRemoved must be a dispatch trigger in its own right:
+            // a closed-without-replacement menu (radial dismiss with no
+            // new widget loading, no focus change because focus stayed
+            // on the underlying HUD) sets widgetRemoved but no other
+            // change flag.  Without it, the Lua-side widget-removal
+            // cleanup and Menus liveness check never see the close --
+            // the active handler stays pinned and gates input forever.
+            //
+            // The valueChanged clause keeps the historical
+            // `&& !focusChanged` guard: this branch reads as "value
+            // changed in a state where focus didn't" and may be load-
+            // bearing for some downstream consumer that distinguishes
+            // value-only changes from focus+value changes.  Short-
+            // circuit means it doesn't affect the dispatch decision
+            // either way (focusChanged would have already won), but
+            // the original intent is preserved in case something
+            // grep-reads this expression.
+            bool shouldDispatch =
+                   snapshot->focusChanged
+                || snapshot->inlineCarouselChanged
+                || (snapshot->valueChanged && !snapshot->focusChanged)
+                || snapshot->selectionChanged
+                || snapshot->widgetAdded
+                || snapshot->widgetRemoved
+                || snapshot->radialSlotChanged
+                || snapshot->contextMenuChanged
+                || snapshot->tooltipChanged
+                || !snapshot->focusedElement.namedTexts.empty();
 
             // After settle, wait for focus to arrive before dispatching.
             // On menus like multiplayer, the tab selection settles first
@@ -4398,6 +4462,67 @@ void InitFocusProperties(Noesis::FrameworkElement* root)
     }
     BG3A_TRACE("[BG3Access] SelectionChanged event: selectorType=%p event=%p",
         selectorReflType, sSelectionChangedEvent);
+
+    // Discover Expander.Expanded and Expander.Collapsed routed events at
+    // runtime, register class handlers for both.  Replaces the dead-code
+    // expander-toggle detection that relied on isChecked re-extraction
+    // (which only ran when INPC fired -- only some templates trigger
+    // INPC as a side effect of their Visibility changes).  With the class
+    // handlers, EVERY Expander toggle reaches Lua regardless of how the
+    // template implements show/hide.  See sExpanderExpandedEvent /
+    // sExpanderCollapsedEvent comments near the top of this file.
+    auto expanderReflType = Noesis::Reflection::GetType(
+        Noesis::Symbol("Expander"));
+    if (expanderReflType) {
+        auto expanderMeta = static_cast<Noesis::TypeMeta const*>(
+            expanderReflType);
+        for (auto* metaEntry : expanderMeta->mMetaData) {
+            if (!metaEntry) continue;
+            auto metaTypeName = SafeBaseObjectTypeName_SEH(metaEntry);
+            if (!metaTypeName) continue;
+            if (strstr(metaTypeName, "UIElementData")) {
+                auto elementData = static_cast<Noesis::UIElementData const*>(
+                    metaEntry);
+                auto mutableData = const_cast<Noesis::UIElementData*>(
+                    elementData);
+
+                sExpanderExpandedEvent =
+                    Noesis::UIElementDataHelpers::GetEvent(
+                        elementData, Noesis::Symbol("Expanded"));
+                if (sExpanderExpandedEvent) {
+                    Noesis::EventHandlerInfo expandedInfo;
+                    expandedInfo.handler = Noesis::EventHandler(
+                        kClassExpanderPtr,
+                        &ClassExpanderDelegate::Handler);
+                    expandedInfo.invokeHandledEvents = true;
+                    mutableData->mEventHandlers.Insert(
+                        sExpanderExpandedEvent, expandedInfo);
+                    BG3A_LOG("[BG3Access] Registered class Expanded "
+                        "handler on Expander");
+                }
+
+                sExpanderCollapsedEvent =
+                    Noesis::UIElementDataHelpers::GetEvent(
+                        elementData, Noesis::Symbol("Collapsed"));
+                if (sExpanderCollapsedEvent) {
+                    Noesis::EventHandlerInfo collapsedInfo;
+                    collapsedInfo.handler = Noesis::EventHandler(
+                        kClassExpanderPtr,
+                        &ClassExpanderDelegate::Handler);
+                    collapsedInfo.invokeHandledEvents = true;
+                    mutableData->mEventHandlers.Insert(
+                        sExpanderCollapsedEvent, collapsedInfo);
+                    BG3A_LOG("[BG3Access] Registered class Collapsed "
+                        "handler on Expander");
+                }
+
+                break;
+            }
+        }
+    }
+    BG3A_TRACE("[BG3Access] Expander events: expanderType=%p "
+        "expanded=%p collapsed=%p",
+        expanderReflType, sExpanderExpandedEvent, sExpanderCollapsedEvent);
 
     // Discover GotFocus event from UIElement type's UIElementData.
     // Register class handler with invokeHandledEvents=true.
@@ -7901,6 +8026,127 @@ static float SafeGetFontSize_SEH(Noesis::FrameworkElement* elem)
 // For simple TextBlocks without Inlines, the collection is empty and
 // the function falls through to GetProperty -- same result as before.
 // ---------------------------------------------------------------------------
+
+// AccumulateInlinesText: recursively walk a Noesis Inlines collection
+// (or any BaseCollection of inline-typed objects) and append every
+// reachable Run.Text into `parts`.  LineBreaks contribute a single
+// space.  Spans / Bold / Italic / Hyperlink / etc. recurse into their
+// own Inlines collection.
+//
+// Previously this logic was inlined into ReadTextBlockText_Inner with
+// a hand-rolled 3-level-deep walk.  That worked for simple Darkvision-
+// style strings but truncated to a single trailing fragment for
+// deeper nesting (e.g. Resistance's spell description, which
+// CtxTransStringRunGeneratorBehavior generates with 4+ levels of
+// nested Span/Run wrappers).
+//
+// Safety:
+//   * MAX_INLINES_DEPTH caps recursion at 20 levels.  Real Larian
+//     content has been observed at 4-5 deep; 20 is comfortable
+//     headroom while still bounding stack use to a couple KB even
+//     under pathological / hostile input.  Returns early without
+//     reading anything past the cap (better to miss tail content
+//     than to stack-overflow).
+//   * MAX_INLINES_PER_LEVEL caps the loop at 256 items per
+//     collection.  Generated Run lists are typically <30; 256
+//     covers any plausible case while preventing a malformed huge
+//     collection from running away.
+//   * Outer SEH boundary at SafeReadTextBlockText_SEH catches any
+//     access fault deeper in (stale pointer, broken class table,
+//     etc.).  This function itself contains std::string with
+//     destructors, so it CANNOT host a __try block directly --
+//     MSVC C2712.  Instead each Noesis access goes through the
+//     existing Safe*_SEH helpers, and the unprotected calls
+//     (SafeCollectionCount, ReadPropertyAsString,
+//     SafeBaseObjectTypeName_SEH, SafeGetClassType_SEH,
+//     prop->Property->Get / GetCopy) are exactly the same set the
+//     prior hand-rolled walk used -- if any of these were unsafe
+//     in the old code they were already unsafe.  The change is
+//     scope (deeper nesting allowed), not safety surface.
+static void AccumulateInlinesText(
+    Noesis::BaseCollection* coll, std::string& parts, int depth)
+{
+    static constexpr int MAX_INLINES_DEPTH = 20;
+    static constexpr int MAX_INLINES_PER_LEVEL = 256;
+    if (!coll) return;
+    if (depth >= MAX_INLINES_DEPTH) {
+        BG3A_LOG("[BG3Access] AccumulateInlinesText: depth cap (%d) hit"
+            " -- truncating", MAX_INLINES_DEPTH);
+        return;
+    }
+    auto& types = Noesis::gStaticSymbols.Types;
+    auto& classes = Noesis::gStaticSymbols.TypeClasses;
+    int rawCount = SafeCollectionCount(coll);
+    int count = rawCount;
+    if (count > MAX_INLINES_PER_LEVEL) {
+        BG3A_LOG("[BG3Access] AccumulateInlinesText: clamped count %d"
+            " -> %d at depth %d", rawCount,
+            MAX_INLINES_PER_LEVEL, depth);
+        count = MAX_INLINES_PER_LEVEL;
+    }
+    for (int i = 0; i < count; i++) {
+        auto inlineObj = SafeCollectionGetItem_SEH(coll, (uint32_t)i);
+        if (!inlineObj) continue;
+        auto typeName = SafeBaseObjectTypeName_SEH(inlineObj);
+        if (!typeName) {
+            inlineObj->Release();
+            continue;
+        }
+        if (strstr(typeName, "Run")) {
+            auto runText = ReadPropertyAsString(inlineObj, "Text");
+            if (!runText.empty()
+                && runText.find("[ForceUpdate]") == std::string::npos) {
+                parts += runText;
+            }
+        } else if (strstr(typeName, "LineBreak")) {
+            parts += " ";
+        } else {
+            // Span / Bold / Italic / Hyperlink / etc. -- read its
+            // Inlines property and recurse.
+            auto classType = SafeGetClassType_SEH(inlineObj);
+            if (classType) {
+                auto const& cls = Noesis::gClassCache.GetClass(classType);
+                bg3se::FixedString fsInlines("Inlines");
+                auto prop = cls.Names.try_get(fsInlines);
+                if (prop && prop->Property) {
+                    Noesis::BaseCollection* childColl = nullptr;
+                    auto childType =
+                        UnwrapType(prop->Property->GetContentType());
+                    auto childTypeOfType = childType
+                        ? childType->GetClassType() : nullptr;
+                    if (childTypeOfType == types.TypePtr.Type) {
+                        auto ptrVal = reinterpret_cast<
+                            Noesis::Ptr<Noesis::BaseRefCounted>*>(
+                            const_cast<void*>(
+                                prop->Property->Get(inlineObj)));
+                        if (ptrVal) childColl =
+                            static_cast<Noesis::BaseCollection*>(
+                                static_cast<Noesis::BaseObject*>(
+                                    ptrVal->GetPtr()));
+                    } else if (childTypeOfType == types.TypePointer.Type) {
+                        Noesis::BaseObject* raw = nullptr;
+                        prop->Property->GetCopy(inlineObj, &raw);
+                        if (raw) childColl =
+                            static_cast<Noesis::BaseCollection*>(raw);
+                    } else if (childType
+                        && Noesis::TypeHelpers::IsDescendantOf(
+                            childType, classes.BaseCollection.Type)) {
+                        childColl = static_cast<Noesis::BaseCollection*>(
+                            const_cast<Noesis::BaseObject*>(
+                                reinterpret_cast<Noesis::BaseObject const*>(
+                                    prop->Property->Get(inlineObj))));
+                    }
+                    if (childColl) {
+                        AccumulateInlinesText(
+                            childColl, parts, depth + 1);
+                    }
+                }
+            }
+        }
+        inlineObj->Release();
+    }
+}
+
 static std::string ReadTextBlockText_Inner(Noesis::FrameworkElement* elem, bool skipToString)
 {
     if (!elem) return {};
@@ -7942,133 +8188,13 @@ static std::string ReadTextBlockText_Inner(Noesis::FrameworkElement* elem, bool 
             if (coll) {
                 int count = SafeCollectionCount(coll);
                 if (count > 0) {
+                    // Recursive walk -- handles arbitrary depth of
+                    // Span / Bold / Italic / Hyperlink nesting, capped
+                    // at MAX_INLINES_DEPTH (20) to bound stack use.
+                    // See AccumulateInlinesText above for safety
+                    // details.  Starts at depth 0.
                     std::string parts;
-                    for (int i = 0; i < count; i++) {
-                        auto inlineObj = SafeCollectionGetItem_SEH(coll, (uint32_t)i);
-                        if (!inlineObj) continue;
-
-                        auto typeName = SafeBaseObjectTypeName_SEH(inlineObj);
-                        if (!typeName) { inlineObj->Release(); continue; }
-
-                        if (strstr(typeName, "Run")) {
-                            auto runText = ReadPropertyAsString(inlineObj, "Text");
-                            if (!runText.empty()
-                                && runText.find("[ForceUpdate]") == std::string::npos) {
-                                parts += runText;
-                            }
-                        } else if (strstr(typeName, "LineBreak")) {
-                            parts += " ";
-                        } else {
-                            // Hyperlink, Bold, Italic, Span, etc.
-                            // These contain child Runs in their own Inlines
-                            // collection.  Access via the same class cache.
-                            auto spanClassType = SafeGetClassType_SEH(inlineObj);
-                            if (!spanClassType) { inlineObj->Release(); continue; }
-                            auto& spanCls = Noesis::gClassCache.GetClass(spanClassType);
-                            bg3se::FixedString fsSpanInlines("Inlines");
-                            auto spanProp = spanCls.Names.try_get(fsSpanInlines);
-                            if (spanProp && spanProp->Property) {
-                                Noesis::BaseCollection* spanColl = nullptr;
-                                auto spanType = UnwrapType(
-                                    spanProp->Property->GetContentType());
-                                auto spanTypeOfType = spanType
-                                    ? spanType->GetClassType() : nullptr;
-                                if (spanTypeOfType == types.TypePtr.Type) {
-                                    auto ptrVal = reinterpret_cast<
-                                        Noesis::Ptr<Noesis::BaseRefCounted>*>(
-                                        const_cast<void*>(
-                                            spanProp->Property->Get(inlineObj)));
-                                    if (ptrVal) spanColl =
-                                        static_cast<Noesis::BaseCollection*>(
-                                            static_cast<Noesis::BaseObject*>(
-                                                ptrVal->GetPtr()));
-                                } else if (spanTypeOfType == types.TypePointer.Type) {
-                                    Noesis::BaseObject* raw = nullptr;
-                                    spanProp->Property->GetCopy(inlineObj, &raw);
-                                    if (raw) spanColl =
-                                        static_cast<Noesis::BaseCollection*>(raw);
-                                } else if (spanType && Noesis::TypeHelpers::IsDescendantOf(
-                                               spanType, classes.BaseCollection.Type)) {
-                                    spanColl = static_cast<Noesis::BaseCollection*>(
-                                        const_cast<Noesis::BaseObject*>(
-                                            reinterpret_cast<Noesis::BaseObject const*>(
-                                                spanProp->Property->Get(inlineObj))));
-                                }
-                                if (spanColl) {
-                                    int spanCount = SafeCollectionCount(spanColl);
-                                    for (int si = 0; si < spanCount; si++) {
-                                        auto spanChild = SafeCollectionGetItem_SEH(
-                                            spanColl, (uint32_t)si);
-                                        if (!spanChild) continue;
-                                        auto childType =
-                                            SafeBaseObjectTypeName_SEH(spanChild);
-                                        if (!childType) {
-                                            spanChild->Release();
-                                            continue;
-                                        }
-                                        if (strstr(childType, "Run")) {
-                                            auto childText = ReadPropertyAsString(
-                                                spanChild, "Text");
-                                            if (!childText.empty()
-                                                && childText.find("[ForceUpdate]")
-                                                    == std::string::npos) {
-                                                parts += childText;
-                                            }
-                                        } else if (strstr(childType, "Span")) {
-                                            // Nested Span (CtxTransStringRunGeneratorBehavior
-                                            // wraps static text in child Spans containing Runs).
-                                            // Recurse one more level to find the Runs.
-                                            auto innerClassType = SafeGetClassType_SEH(spanChild);
-                                            if (innerClassType) {
-                                                auto& innerCls = Noesis::gClassCache.GetClass(innerClassType);
-                                                bg3se::FixedString fsInner("Inlines");
-                                                auto innerProp = innerCls.Names.try_get(fsInner);
-                                                if (innerProp && innerProp->Property) {
-                                                    Noesis::BaseCollection* innerColl = nullptr;
-                                                    auto innerType = UnwrapType(innerProp->Property->GetContentType());
-                                                    auto innerTypeOfType = innerType ? innerType->GetClassType() : nullptr;
-                                                    if (innerTypeOfType == types.TypePtr.Type) {
-                                                        auto pv = reinterpret_cast<Noesis::Ptr<Noesis::BaseRefCounted>*>(
-                                                            const_cast<void*>(innerProp->Property->Get(spanChild)));
-                                                        if (pv) innerColl = static_cast<Noesis::BaseCollection*>(
-                                                            static_cast<Noesis::BaseObject*>(pv->GetPtr()));
-                                                    } else if (innerTypeOfType == types.TypePointer.Type) {
-                                                        Noesis::BaseObject* raw = nullptr;
-                                                        innerProp->Property->GetCopy(spanChild, &raw);
-                                                        if (raw) innerColl = static_cast<Noesis::BaseCollection*>(raw);
-                                                    } else if (innerType && Noesis::TypeHelpers::IsDescendantOf(
-                                                                   innerType, classes.BaseCollection.Type)) {
-                                                        innerColl = static_cast<Noesis::BaseCollection*>(
-                                                            const_cast<Noesis::BaseObject*>(
-                                                                reinterpret_cast<Noesis::BaseObject const*>(
-                                                                    innerProp->Property->Get(spanChild))));
-                                                    }
-                                                    if (innerColl) {
-                                                        int innerCount = SafeCollectionCount(innerColl);
-                                                        for (int ii = 0; ii < innerCount; ii++) {
-                                                            auto innerChild = SafeCollectionGetItem_SEH(innerColl, (uint32_t)ii);
-                                                            if (!innerChild) continue;
-                                                            auto innerChildType = SafeBaseObjectTypeName_SEH(innerChild);
-                                                            if (innerChildType && strstr(innerChildType, "Run")) {
-                                                                auto innerRunText = ReadPropertyAsString(innerChild, "Text");
-                                                                if (!innerRunText.empty()
-                                                                    && innerRunText.find("[ForceUpdate]") == std::string::npos) {
-                                                                    parts += innerRunText;
-                                                                }
-                                                            }
-                                                            innerChild->Release();
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        spanChild->Release();
-                                    }
-                                }
-                            }
-                        }
-                        inlineObj->Release();
-                    }
+                    AccumulateInlinesText(coll, parts, 0);
                     // Collapse multiple spaces.
                     std::string result;
                     bool lastWasSpace = true;  // trim leading

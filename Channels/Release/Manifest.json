@@ -5,7 +5,15 @@
     "Resources": [
         {
             "Name": "ScriptExtender",
-            "Versions": []
+            "Versions": [
+                {
+                    "MinGameVersion": "1.0.0.0",
+                    "Version": "0.1.0.1",
+                    "URL": "https://github.com/IndomitableHeart/bg3se-SR/releases/download/v0.1.0-alpha.1/ScriptExtender-v0.1.0.zip",
+                    "Digest": "71f7a8490ac05f50ea4e2d67af6942092fb4e3858b6ce42ebad6571817651c42",
+                    "BuildDate": 133935385200000000
+                }
+            ]
         }
     ]
 }

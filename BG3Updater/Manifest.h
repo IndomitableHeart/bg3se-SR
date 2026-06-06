@@ -45,9 +45,24 @@ struct Manifest
         }
     };
 
+    // Resource type strings.  Type field on Resource determines which
+    // code path the loader uses.  Default (empty / missing) is the
+    // existing extender DLL flow so Norbyte-style manifests stay
+    // compatible.
+    static constexpr char const* TypeExtenderBin = "ExtenderBin";
+    static constexpr char const* TypeGameMod = "GameMod";
+
     struct Resource
     {
         std::string Name;
+        // Empty string means TypeExtenderBin (the historical default).
+        // TypeGameMod indicates the resource is a game-side mod folder
+        // that should be extracted into InstallPath under the BG3 root.
+        std::string Type;
+        // For TypeGameMod: install destination relative to BG3 root
+        // (e.g. "Data/Mods/BG3Access_a8cddf0c-...").  Unused for
+        // TypeExtenderBin (loader uses its private cache instead).
+        std::string InstallPath;
         std::unordered_map<std::string, ResourceVersion> ResourceVersions;
 
         std::optional<Manifest::ResourceVersion> FindResourceVersionWithOverrides(VersionNumber const& gameVersion,

@@ -192,31 +192,51 @@ bool CrashReporter::ShowUploadProgressDialog()
     return SUCCEEDED(hr);
 }
 
+// BG3Access fork: crash reports are NOT auto-uploaded.  The original
+// flow (ShowUploadConfirmationDialog -> ShowUploadProgressDialog ->
+// MinidumpUploaderThread) sent dumps to Norbyte's intake server, which
+// is wrong for users of this fork -- their crashes are caused by
+// BG3Access code, not stock Script Extender, and Norbyte has no
+// context for them.  Instead we just tell the user where the dump
+// file lives and ask them to email it to the BG3Access maintainer.
+// The upload functions (ShowUploadConfirmationDialog, MinidumpUploader
+// Thread, etc.) are left intact as dead code -- easy to re-enable if
+// we ever stand up our own intake endpoint.
 void CrashReporter::Report()
 {
     DWORD attributes = GetFileAttributes(reportPath_.c_str());
     if (attributes == INVALID_FILE_ATTRIBUTES) return;
 
-    if (quiet_ || ShowUploadConfirmationDialog()) {
-        if (!quiet_) {
-            ShowUploadProgressDialog();
-        } else {
-            CreateThread(NULL, 0, &MinidumpUploaderThread, this, 0, NULL);
-            while (!uploadFinished_) {
-                Sleep(50);
-            }
-        }
+    if (quiet_) return;
 
-        if (!resultText_.empty()) {
-            if (!quiet_) {
-                if (uploadSucceeded_) {
-                    MessageBoxW(NULL, resultText_.c_str(), L"Script Extender Crash",
-                        MB_OK | MB_ICONINFORMATION | MB_TASKMODAL | MB_SETFOREGROUND | MB_TOPMOST);
-                } else {
-                    MessageBoxW(NULL, resultText_.c_str(), L"Script Extender Crash",
-                        MB_OK | MB_ICONWARNING | MB_TASKMODAL | MB_SETFOREGROUND | MB_TOPMOST);
-                }
-            }
-        }
+    std::wstring message = L"A crash dump was saved to:\r\n";
+    message += miniDumpPath_;
+    message += L"\r\n\r\n";
+    message += L"Please email this file to jlove42010@gmail.com so the "
+        L"BG3Access maintainer can diagnose the issue.  Including a "
+        L"short note about what you were doing when it crashed (which "
+        L"menu, which spell, which save file, etc.) is very helpful.";
+
+    auto bt = GetBacktrace();
+    if (!bt.empty()) {
+        message += L"\r\n\r\nBacktrace (you may copy this into the email "
+            L"body as well):\r\n";
+        message += FromUTF8(bt);
     }
+
+    TASKDIALOGCONFIG config;
+    memset(&config, 0, sizeof(config));
+    config.cbSize = sizeof(TASKDIALOGCONFIG);
+    config.hwndParent = NULL;
+    config.hInstance = NULL;
+    config.pszWindowTitle = L"BG3Access Crash";
+    config.pszMainInstruction = L"BG3Access has unexpectedly crashed.";
+    config.pszContent = message.c_str();
+    config.pszMainIcon = TD_WARNING_ICON;
+    config.dwCommonButtons = TDCBF_OK_BUTTON;
+    config.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION;
+    config.cxWidth = 260;
+
+    int button;
+    TaskDialogIndirect(&config, &button, NULL, NULL);
 }

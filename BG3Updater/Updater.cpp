@@ -1,6 +1,7 @@
 #include "stdafx.h"
 #include "Updater.h"
 #include "HttpFetcher.h"
+#include "GameModUpdater.h"
 #include "resource.h"
 #include "ExtenderAPI.h"
 #include <Shlwapi.h>
@@ -157,6 +158,11 @@ void ScriptExtenderUpdater::FetchUpdates()
 
     if (!config_.DisableUpdates) {
         updateResult_ = TryToUpdate();
+        // GameMod updates run independently of the extender update.
+        // We want them to happen even when the extender flow was
+        // skipped (DebugLoadSE) or short-circuited.  Both updates
+        // share the same manifest, fetched inside TryToUpdate.
+        TryUpdateGameMods();
         // Ensure that we don't keep dangling HTTP connections open to the update server forever
         fetcher_.Cleanup();
     } else {
@@ -358,8 +364,66 @@ OperationResult ScriptExtenderUpdater::TryToUpdate()
     cache_->SaveManifestIfNecessary();
 
     updateManifest_ = manifest;
+
+    // Defense-in-depth cleanup: wipe leftover .staging / .backup
+    // folders and Updates temp dir contents from any previous
+    // interrupted run.  Runs once per launch, before any update
+    // work, so we never accumulate cruft across launches.
+    GameModUpdater::SweepLeftoverState(manifest);
+
+    // When DebugLoadSE is true, the extender is loaded directly
+    // from BG3's bin folder -- the cache fetch flow is bypassed.
+    // Running the extender Update here would just produce a 404 (the
+    // .package upload format isn't what we ship via the installer).
+    // Skip it; mods still update via TryUpdateGameMods.
+    if (config_.DebugLoadSE) {
+        return OperationSuccessful{};
+    }
+
     ResourceUpdater updater(fetcher_, config_, *cache_);
     return updater.Update(manifest, UPDATER_RESOURCE_NAME, gameVersion_);
+}
+
+
+void ScriptExtenderUpdater::TryUpdateGameMods()
+{
+    if (!updateManifest_) {
+        // Manifest fetch failed earlier; nothing we can do.
+        return;
+    }
+
+    GameModUpdater modUpdater(fetcher_, config_);
+    for (auto const& [name, resource] : updateManifest_->Resources) {
+        if (resource.Type != Manifest::TypeGameMod) continue;
+        if (resource.InstallPath.empty()) {
+            DEBUG("Skipping GameMod '%s' with empty InstallPath", name.c_str());
+            continue;
+        }
+
+        // Pick the best version for the current game version, just
+        // like the extender flow does.  Skip if no compatible version
+        // is available.
+        auto version = updateManifest_->FindResourceVersionWithOverrides(
+            name, gameVersion_, config_);
+        if (!version) {
+            DEBUG("No compatible version for GameMod '%s' on game version %s",
+                  name.c_str(), gameVersion_.ToString().c_str());
+            continue;
+        }
+
+        SetStatusText(std::wstring(L"Updating mod: ") + FromStdUTF8(name));
+        auto result = modUpdater.Update(resource, *version);
+        if (!result) {
+            // Mod update failure is logged but does NOT propagate to
+            // updateResult_ -- a broken mod update should not block
+            // the extender from loading, and the user can still play
+            // with the previous version of the mod that's still on
+            // disk (the swap is atomic).  Improving this to surface
+            // a user-visible notice is a TODO; see Updater.h.
+            DEBUG("GameMod '%s' update failed: %s", name.c_str(),
+                  result.error().Message.c_str());
+        }
+    }
 }
     
 void ScriptExtenderUpdater::UpdateFromEmbeddedCache()

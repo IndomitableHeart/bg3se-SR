@@ -123,7 +123,7 @@ $(SolutionDir)\External\protobuf\tools\protobuf\protoc --cpp_out=$(SolutionDir)\
 $(SolutionDir)x64\Release\ResourceBundler.exe "$(ProjectDir)LuaScripts" "$(ProjectDir)Lua.bundle"</Command>
     </PreBuildEvent>
     <PostBuildEvent>
-      <Command>copy /Y "$(TargetPath)" "D:\Apps\Steam\steamapps\common\Baldurs Gate 3\bin\BG3ScriptExtender.dll"</Command>
+      <Command>copy /Y "$(TargetPath)" "D:\SteamLibrary\steamapps\common\Baldurs Gate 3\bin\BG3ScriptExtender.dll"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>

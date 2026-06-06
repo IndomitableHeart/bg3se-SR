@@ -10,6 +10,7 @@
     <ClCompile Include="API.cpp" />
     <ClCompile Include="Cache.cpp" />
     <ClCompile Include="Updater.cpp" />
+    <ClCompile Include="GameModUpdater.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="DWriteWrapper.h" />
@@ -28,6 +29,7 @@
     <ClInclude Include="Result.h" />
     <ClInclude Include="GameVersion.h" />
     <ClInclude Include="ExtenderAPI.h" />
+    <ClInclude Include="GameModUpdater.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="Resources.rc" />

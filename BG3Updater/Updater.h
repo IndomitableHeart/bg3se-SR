@@ -147,6 +147,14 @@ private:
     void OnSDLInit(Uint32, int);
     void UpdateErrorText();
     std::wstring GetDebugDllPath();
+
+    // Iterates updateManifest_ for resources of Type=GameMod and
+    // dispatches each to GameModUpdater.  Independent of the extender
+    // update result -- a failed mod update doesn't break extender
+    // loading and a failed extender update doesn't skip mod updates.
+    // Errors are logged but not surfaced to the extender's error UI;
+    // the mod side speaks status via its own notice file.
+    void TryUpdateGameMods();
 };
 
 void StartUpdaterThread();

@@ -260,6 +260,12 @@ OperationResult ManifestSerializer::Parse(Value const& node, Manifest& manifest)
 OperationResult ManifestSerializer::ParseResource(Value const& node, Manifest::Resource& resource)
 {
     resource.Name = GetStringProperty(node, "Name", "");
+    // Type missing => historical default (ExtenderBin).  Loader treats
+    // empty string the same as Manifest::TypeExtenderBin so Norbyte-era
+    // manifests parse without change.
+    resource.Type = GetStringProperty(node, "Type", "");
+    // Only meaningful when Type == TypeGameMod.  Relative to BG3 root.
+    resource.InstallPath = GetStringProperty(node, "InstallPath", "");
 
     auto versions = node.FindMember("Versions");
     if (versions == node.MemberEnd() || !versions->value.IsArray()) {
@@ -363,6 +369,16 @@ void ManifestSerializer::Stringify(rapidjson::Value& resources, Manifest::Resour
 {
     Value jsonRes{ kObjectType };
     jsonRes.AddMember("Name", resource.Name, alloc);
+    // Only emit Type/InstallPath when non-default so resources that
+    // existed before this schema extension serialize identically to
+    // their old form.  Loaders that don't know about these fields
+    // ignore them; loaders that do treat absence as ExtenderBin.
+    if (!resource.Type.empty()) {
+        jsonRes.AddMember("Type", Value(resource.Type.c_str(), alloc), alloc);
+    }
+    if (!resource.InstallPath.empty()) {
+        jsonRes.AddMember("InstallPath", Value(resource.InstallPath.c_str(), alloc), alloc);
+    }
 
     std::vector<Manifest::ResourceVersion> sortedVersions;
     for (auto const& ver : resource.ResourceVersions) {

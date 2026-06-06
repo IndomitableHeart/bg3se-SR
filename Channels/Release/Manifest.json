@@ -10,9 +10,9 @@
           "Version": "0.1.1.0",
           "MinGameVersion": "4.65.83.0",
           "URL": "https://github.com/IndomitableHeart/bg3se-SR/releases/download/v0.1.1/bg3se-SR-extender-0.1.1.package",
-          "Digest": "108d9bfbc18fc87e7c6eb89ef898f975348e35e6409c6d7ae1e2349a8f0ce869",
-          "Signature": "31534742d5e6d3299dfed04c8552de9288ac29245040321db0bc9d9329a2059b5dd40a8bf3ea3d688117c3f79533c9f8013959ffdd2cc8a0e5db75cdd2b7a8fadb54acbb01e0894800",
-          "BuildDate": 134252472810174128,
+          "Digest": "030195425241d28a56df631dd75e415567509fb4ae986b7b35c1762c279a3a27",
+          "Signature": "31534742a8c67d9e80dccdd3f12efa2f47e91ce5a64ae7862fe541482b73e5c855773b5cf63785ecfa601d3507847b8fd477cb9eb9b428b03e54b7cf6f46757ae963f04c01e0894800",
+          "BuildDate": 134252510713275056,
           "Notice": ""
         }
       ]
@@ -26,9 +26,9 @@
           "Version": "0.1.1.0",
           "MinGameVersion": "4.65.83.0",
           "URL": "https://github.com/IndomitableHeart/BG3Access/releases/download/v0.1.1/BG3Access-mod-0.1.1.package",
-          "Digest": "a9bb21c0cdc13cee52df3a7812ccd5d133c7fb83d73c70d86f7255ec315b4204",
-          "Signature": "31534742f5aa9fb0d3b2e114d20fc153ee3e54548d20de1bce871b447d6a27613f1e71a6bf82ff3d766cc6634f464922f345ee791f8c0cd69ef512d4909322389a000be30176087601",
-          "BuildDate": 134252472802577744,
+          "Digest": "2d2e36d76e3df1b523fed2da6b5ad12a5ee95f89a3169b9a7b58531f213e3db2",
+          "Signature": "315347428c81d95451ddbbdb48f17b808e06a911baffcc2ccd211d277dd1ee70b8004d228790f69a18803a9d870624049d9391a8023a8e1880d5601c0e61a61cc9253a19010cfa7501",
+          "BuildDate": 134252510705878704,
           "Notice": ""
         }
       ]

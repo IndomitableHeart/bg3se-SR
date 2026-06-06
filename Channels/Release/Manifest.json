@@ -7,7 +7,7 @@
       "Name": "ScriptExtender",
       "Versions": [
         {
-          "Version": "0.1.1",
+          "Version": "0.1.1.0",
           "MinGameVersion": "4.65.83.0",
           "URL": "https://github.com/IndomitableHeart/bg3se-SR/releases/download/v0.1.1/bg3se-SR-extender-0.1.1.package",
           "Digest": "108d9bfbc18fc87e7c6eb89ef898f975348e35e6409c6d7ae1e2349a8f0ce869",
@@ -23,7 +23,7 @@
       "InstallPath": "Data/Mods/BG3Access_a8cddf0c-2e61-1b7c-5c0c-275d46073949",
       "Versions": [
         {
-          "Version": "0.1.1",
+          "Version": "0.1.1.0",
           "MinGameVersion": "4.65.83.0",
           "URL": "https://github.com/IndomitableHeart/BG3Access/releases/download/v0.1.1/BG3Access-mod-0.1.1.package",
           "Digest": "a9bb21c0cdc13cee52df3a7812ccd5d133c7fb83d73c70d86f7255ec315b4204",

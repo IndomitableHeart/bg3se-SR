@@ -1,19 +1,37 @@
 {
-    "ManifestVersion": 1,
-    "ManifestMinorVersion": 1,
-    "Partial": false,
-    "Resources": [
+  "ManifestVersion": 1,
+  "ManifestMinorVersion": 1,
+  "Partial": false,
+  "Resources": [
+    {
+      "Name": "ScriptExtender",
+      "Versions": [
         {
-            "Name": "ScriptExtender",
-            "Versions": [
-                {
-                    "MinGameVersion": "1.0.0.0",
-                    "Version": "0.1.0.1",
-                    "URL": "https://github.com/IndomitableHeart/bg3se-SR/releases/download/v0.1.0-alpha.1/ScriptExtender-v0.1.0.zip",
-                    "Digest": "71f7a8490ac05f50ea4e2d67af6942092fb4e3858b6ce42ebad6571817651c42",
-                    "BuildDate": 133935385200000000
-                }
-            ]
+          "Version": "0.1.1",
+          "MinGameVersion": "4.65.83.0",
+          "URL": "https://github.com/IndomitableHeart/bg3se-SR/releases/download/v0.1.1/bg3se-SR-extender-0.1.1.package",
+          "Digest": "108d9bfbc18fc87e7c6eb89ef898f975348e35e6409c6d7ae1e2349a8f0ce869",
+          "Signature": "31534742d5e6d3299dfed04c8552de9288ac29245040321db0bc9d9329a2059b5dd40a8bf3ea3d688117c3f79533c9f8013959ffdd2cc8a0e5db75cdd2b7a8fadb54acbb01e0894800",
+          "BuildDate": 134252472810174128,
+          "Notice": ""
         }
-    ]
+      ]
+    },
+    {
+      "Name": "BG3AccessMod",
+      "Type": "GameMod",
+      "InstallPath": "Data/Mods/BG3Access_a8cddf0c-2e61-1b7c-5c0c-275d46073949",
+      "Versions": [
+        {
+          "Version": "0.1.1",
+          "MinGameVersion": "4.65.83.0",
+          "URL": "https://github.com/IndomitableHeart/BG3Access/releases/download/v0.1.1/BG3Access-mod-0.1.1.package",
+          "Digest": "a9bb21c0cdc13cee52df3a7812ccd5d133c7fb83d73c70d86f7255ec315b4204",
+          "Signature": "31534742f5aa9fb0d3b2e114d20fc153ee3e54548d20de1bce871b447d6a27613f1e71a6bf82ff3d766cc6634f464922f345ee791f8c0cd69ef512d4909322389a000be30176087601",
+          "BuildDate": 134252472802577744,
+          "Notice": ""
+        }
+      ]
+    }
+  ]
 }

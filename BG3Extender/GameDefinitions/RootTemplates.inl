@@ -16,6 +16,23 @@ FixedString GameObjectTemplate::GetTemplateType() const
     return *GetType();
 }
 
+// Norbyte's commit bcf9743c "Various mapping updates" (2026-05-30)
+// added the declaration and a P_GETTER annotation but did not commit
+// the implementation.  P_GETTER expands to take &fun as a function
+// pointer in LuaObjectProxies.cpp, which is a hard linker reference,
+// so this missing definition produces LNK2001.  The last tagged
+// release (v31.1) predates this commit so his users haven't hit it.
+// This will likely be fixed upstream before he cuts the next release;
+// removing this stub once that happens is the right cleanup.
+//
+// Implementation forwards to TemplateHandle.GetType(): the same enum
+// value the existing IncTemplateRef/DecTemplateRef code uses for
+// storage-tier dispatch in this same file (see lines 130-145).
+TemplateType GameObjectTemplate::GetTemplateStorageType() const
+{
+    return TemplateHandle.GetType();
+}
+
 IActionData* ItemTemplate::AddUseAction(ActionDataType type)
 {
     auto action = gExtender->GetUseActionHelpers().Create(type);

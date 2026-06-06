@@ -449,6 +449,27 @@ OperationResult GameModUpdater::Update(Manifest::Resource const& resource,
     auto installPath = bg3Root + L"\\" + FromStdUTF8(resource.InstallPath);
     std::replace(installPath.begin(), installPath.end(), L'/', L'\\');
 
+    // Dev-workspace safety check.  If the install path contains a
+    // .git/ folder, this is almost certainly someone's working
+    // directory rather than a plain install.  The atomic swap deletes
+    // the .backup copy after the swap, which would wipe their .git
+    // history along with any uncommitted files not in the package
+    // (DevConfig.lua, ad-hoc experiments, etc.).  That's destructive
+    // in a way auto-update should never be on a dev box.
+    //
+    // We bail with an informational log instead -- the developer is
+    // working on the mod and doesn't need auto-update anyway; they
+    // deploy their changes manually.  No user-facing error, just a
+    // silent skip with a trace in OsiExtenderUpdater.log.
+    auto gitDirPath = installPath + L"\\.git";
+    if (PathFileExistsW(gitDirPath.c_str())) {
+        DEBUG("Mod '%s' install path contains .git/ -- treating as a"
+              " dev workspace and skipping auto-update.  Delete .git"
+              " or move it elsewhere to enable auto-update.",
+              resource.Name.c_str());
+        return OperationSuccessful{};
+    }
+
     // Comparison: only proceed if the manifest version is strictly
     // newer than what's installed.  Equal version => already up to
     // date.  Older version in manifest => user might be on a beta;

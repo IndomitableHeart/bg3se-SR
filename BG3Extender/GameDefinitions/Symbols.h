@@ -117,7 +117,10 @@ namespace bg3se
         esv::LevelManager** esv__LevelManager{ nullptr };
         ecl::LevelManager** ecl__LevelManager{ nullptr };
         GlobalTemplateManager** ls__GlobalTemplateManager{ nullptr };
-        CacheTemplateManagerBase** esv__CacheTemplateManager{ nullptr };
+        LevelCacheTemplateManager** esv__CacheTemplateManager{ nullptr };
+
+        void** esv__gSurfaceActionFactory{ nullptr };
+        esv::SurfaceActionFactoryCreateProc* esv__SurfaceActionFactory__DoCreateAction{ nullptr };
 
         AiGrid::FindPathProc* eoc__AiGrid__FindPath{ nullptr };
         AiGrid::FindPathImmediateProc* eoc__AiGrid__FindPathImmediate{ nullptr };
@@ -238,28 +241,6 @@ namespace bg3se
                 && *esv__EoCServer != nullptr
                 && (*esv__EoCServer)->GameStateMachine != nullptr) {
                 return (*esv__EoCServer)->GameStateMachine->State;
-            } else {
-                return {};
-            }
-        }
-
-        inline ecs::EntityWorld* GetClientEntityWorld() const
-        {
-            if (ecl__EoCClient != nullptr
-                && *ecl__EoCClient != nullptr
-                && (*ecl__EoCClient)->EntityWorld != nullptr) {
-                return (*ecl__EoCClient)->EntityWorld;
-            } else {
-                return {};
-            }
-        }
-
-        inline ecs::EntityWorld* GetServerEntityWorld() const
-        {
-            if (esv__EoCServer != nullptr
-                && *esv__EoCServer != nullptr
-                && (*esv__EoCServer)->EntityWorld != nullptr) {
-                return (*esv__EoCServer)->EntityWorld;
             } else {
                 return {};
             }

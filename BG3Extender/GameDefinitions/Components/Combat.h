@@ -423,10 +423,10 @@ struct ArchetypeComponent : public BaseComponent
 {
     DEFINE_COMPONENT(ServerAiArchetype, "esv::ai::combat::ArchetypeComponent")
 
-    FixedString field_0;
-    FixedString field_4;
-    FixedString field_8;
-    FixedString field_C;
+    [[bg3::legacy(field_0)]] FixedString ActiveArchetype;
+    [[bg3::legacy(field_4)]] FixedString BaseArchetype;
+    [[bg3::legacy(field_8)]] FixedString ShapeshiftArchetype;
+    [[bg3::legacy(field_C)]] FixedString ArchetypeOverride;
 };
 
 struct ModifierChange
@@ -442,7 +442,8 @@ struct AiModifiersComponent : public BaseComponent
 
     uint8_t field_0;
     HashMap<FixedString, float> Modifiers;
-    //HashMap<FixedString, HashMap<int, ModifierChange>> Changes;
+    // Editor only
+    // HashMap<FixedString, HashMap<int, ModifierChange>> Changes;
 };
 
 END_NS()
@@ -554,7 +555,8 @@ struct TurnBasedComponent : public BaseComponent
 {
     DEFINE_COMPONENT(FTBTurnBased, "esv::ftb::TurnBasedComponent")
 
-    uint64_t Entity;
+    uint8_t field_0;
+    uint32_t field_4;
 };
 
 DEFINE_ONEFRAME_TAG_COMPONENT(esv::ftb, PlayersTurnEndedEventOneFrameComponent, FTBPlayersTurnEndedEvent)
@@ -587,6 +589,89 @@ struct ZoneSystem : public BaseSystem
     [[bg3::hidden]] void* ActivationManager;
     [[bg3::hidden]] void* GameControl;
     [[bg3::hidden]] void* LevelManager;
+};
+
+END_NS()
+
+BEGIN_NS(esv::combat_log)
+
+struct AutomaticDialogRequest
+{
+    EntityHandle Entity;
+    TranslatedFSString field_8;
+    uint8_t field_18;
+    uint8_t field_19;
+    uint8_t field_1A;
+};
+
+
+struct DialogStartRequest
+{
+    EntityHandle Target;
+    EntityHandle FirstSpeaker;
+};
+
+struct HealedRequest
+{
+    ActionOriginator Originator;
+    EntityHandle Cause;
+    CauseType CauseType;
+    EntityHandle Caster;
+    int32_t HealAmount;
+    StatsExpressionResolved HealAmountExpression;
+    Guid SpellCastGuid;
+};
+
+struct StatusAddedRequest
+{
+    ActionOriginator Originator;
+    int64_t field_20;
+    FixedString StatusID;
+    StatusType StatusType;
+    EntityHandle Cause;
+    CauseType CauseType;
+    EntityHandle Target;
+    SurfaceType SourceSurface;
+    Guid SpellCastGuid;
+    ConditionRolls ConditionRolls;
+};
+
+struct StatusRemovedRequest
+{
+    ActionOriginator Originator;
+    FixedString StatusID;
+    StatusType StatusType;
+    EntityHandle Target;
+    EntityHandle Source;
+    Guid SpellCastGuid;
+    ConditionRolls ConditionRolls;
+};
+
+struct StealthSpottedRequest
+{
+    EntityHandle Target;
+    EntityHandle Spotter;
+    uint8_t Obscurity;
+    CauseType CauseType;
+    FixedString Cause;
+};
+
+struct CombatLogSystem : public BaseSystem
+{
+    DEFINE_SYSTEM(ServerCombatLog, "esv::combat_log::CombatLogSystem")
+
+    [[bg3::hidden]] void* DialogEventListenerAdapter_VMT;
+    [[bg3::hidden]] void* EocServer;
+    [[bg3::hidden]] void* FactionContainer;
+    [[bg3::hidden]] void* GlobalSwitches;
+    Array<AutomaticDialogRequest> OnDialogNodeStarted;
+    Array<DialogStartRequest> OnDialogStarted;
+    [[bg3::hidden]] void* SpellPrototypeManager;
+    [[bg3::hidden]] void* pICombatLogHelper;
+    Array<HealedRequest> HealedEntries;
+    Array<StatusRemovedRequest> StatusRemoved;
+    Array<StatusAddedRequest> StatusAdded;
+    Array<StealthSpottedRequest> StealthSpotted;
 };
 
 END_NS()

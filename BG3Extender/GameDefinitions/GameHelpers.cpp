@@ -8,8 +8,10 @@
 #include <GameDefinitions/Dialog.h>
 #include <GameDefinitions/Stats/UseActions.h>
 #include <GameDefinitions/Stats/Functors.h>
+#include <GameDefinitions/Components/ServerData.h>
 
 #include <GameDefinitions/Ai.inl>
+#include <GameDefinitions/Base/Lock.inl>
 
 namespace bg3se
 {
@@ -251,6 +253,119 @@ namespace bg3se
         }
 
         return nullptr;
+    }
+
+    GameObjectTemplate* TryToCacheTemplate(GameObjectTemplate* tmpl)
+    {
+        switch (tmpl->TemplateHandle.GetType()) {
+        case TemplateType::CacheTemplate:
+        case TemplateType::LevelCacheTemplate:
+        {
+            WARN("Cannot cache template '%s' - it is already a cache template!", tmpl->Id.GetString());
+            return tmpl;
+        }
+
+        case TemplateType::RootTemplate:
+        {
+            auto templateMgr = *GetStaticSymbols().esv__CacheTemplateManager;
+            FixedString templateId(Guid::Generate().ToString());
+            return static_cast<CharacterTemplate*>(templateMgr->CacheTemplate(tmpl, tmpl->LevelName, templateId));
+        }
+
+        case TemplateType::GlobalTemplate:
+        {
+            auto templateMgr = *GetStaticSymbols().esv__CacheTemplateManager;
+            auto cached = templateMgr->Templates.get_or_default(tmpl->Id);
+            if (cached) {
+                WARN("Tried to cache global template '%s' multiple times - only a single cached template can exist!", tmpl->Id.GetString());
+                return cached;
+            }
+
+            return static_cast<CharacterTemplate*>(templateMgr->CacheTemplate(tmpl, tmpl->LevelName, tmpl->Id));
+        }
+
+        case TemplateType::LocalTemplate:
+        {
+            auto level = GetStaticSymbols().GetCurrentServerLevel();
+            if (!level) {
+                WARN("Cannot cache local template '%s' - no active level!", tmpl->Id.GetString());
+                return tmpl;
+            }
+
+            auto templateMgr = level->CacheTemplateManager;
+            auto cached = templateMgr->Templates.get_or_default(tmpl->Id);
+            if (cached) {
+                WARN("Tried to cache local template '%s' multiple times - only a single cached template can exist!", tmpl->Id.GetString());
+                return cached;
+            }
+
+            return static_cast<CharacterTemplate*>(templateMgr->CacheTemplate(tmpl, tmpl->LevelName, tmpl->Id));
+        }
+
+        default:
+        {
+            WARN("Trying to cache unsupported handle type %d?", tmpl->TemplateHandle.GetType());
+            return tmpl;
+        }
+        }
+    }
+
+    CharacterTemplate* esv::Character::CreateCacheTemplate()
+    {
+        auto oldTemplate = Template;
+        auto templateMgr = *GetStaticSymbols().esv__CacheTemplateManager;
+        auto newTmpl = static_cast<CharacterTemplate*>(TryToCacheTemplate(Template));
+        if (newTmpl != Template) {
+            DecTemplateRef(Template);
+            IncTemplateRef(newTmpl);
+            Template = newTmpl;
+
+            auto changeSys = gExtender->GetServer().GetEntityHelpers().GetSystem<esv::templates::ChangeSystem>();
+            changeSys->TemplateSwitch.set(field_10, TemplateInfo{
+                .TemplateId = newTmpl->Id,
+                .TemplateType = newTmpl->TemplateHandle.GetType()
+            });
+
+            if (OriginalTemplate == oldTemplate) {
+                DecTemplateRef(OriginalTemplate);
+                IncTemplateRef(newTmpl);
+                OriginalTemplate = newTmpl;
+            }
+
+            if (TemplateUsedForSpells == oldTemplate) {
+                DecTemplateRef(TemplateUsedForSpells);
+                IncTemplateRef(newTmpl);
+                TemplateUsedForSpells = newTmpl;
+            }
+        }
+
+        return newTmpl;
+    }
+
+    ItemTemplate* esv::Item::CreateCacheTemplate()
+    {
+        auto oldTemplate = Template;
+        auto templateMgr = *GetStaticSymbols().esv__CacheTemplateManager;
+        auto newTmpl = static_cast<ItemTemplate*>(TryToCacheTemplate(Template));
+        if (newTmpl != Template) {
+            DecTemplateRef(Template);
+            IncTemplateRef(newTmpl);
+            Template = newTmpl;
+
+            auto changeSys = gExtender->GetServer().GetEntityHelpers().GetSystem<esv::templates::ChangeSystem>();
+            changeSys->TemplateSwitch.set(field_10, TemplateInfo{
+                .TemplateId = newTmpl->Id,
+                .TemplateType = newTmpl->TemplateHandle.GetType()
+            });
+
+            if (OriginalTemplate == oldTemplate) {
+                DecTemplateRef(OriginalTemplate);
+                IncTemplateRef(newTmpl);
+                OriginalTemplate = newTmpl;
+            }
+        }
+
+        return newTmpl;
     }
 
     char const * TempStrings::Make(STDString const & str)
@@ -1062,73 +1177,6 @@ bool AppliedMaterial::SetVirtualTexture(FixedString const& paramName, FixedStrin
 
         ERR("Material has no VT parameter named '%s'", paramName.GetString());
         return false;
-    }
-}
-
-void SRWSpinLock::ReadLock()
-{
-    if (OwningThreadId == 0xffffffffu || OwningThreadId != GetCurrentThreadId()) {
-        ReadWait();
-    }
-}
-
-void SRWSpinLock::ReadUnlock()
-{
-    if (OwningThreadId == 0xffffffffu || OwningThreadId != GetCurrentThreadId()) {
-        se_assert((FastLock & 0x000fffffu) > 0);
-        --FastLock;
-    }
-}
-
-void SRWSpinLock::WriteLock()
-{
-    if (OwningThreadId == 0xffffffffu || OwningThreadId != GetCurrentThreadId()) {
-        WriteWait();
-
-        OwningThreadId = GetCurrentThreadId();
-    }
-
-    ++WriteEnterCount;
-}
-
-void SRWSpinLock::WriteUnlock()
-{
-    se_assert(WriteEnterCount > 0);
-    if (--WriteEnterCount == 0) {
-        se_assert(OwningThreadId == GetCurrentThreadId());
-        se_assert((FastLock & 0xfff00000u) > 0);
-        OwningThreadId = 0xffffffffu;
-        FastLock -= 0x100000u;
-    }
-}
-
-void SRWSpinLock::WriteWait()
-{
-    for (;;) {
-        SpinWait([&] () { return (FastLock & 0xfff00000u) == 0; });
-
-        if ((FastLock.fetch_add(0x100000u) & 0xfff00000u) == 0) {
-            break;
-        }
-
-        FastLock -= 0x100000u;
-    }
-
-    if ((FastLock & 0x000fffffu) != 0) {
-        SpinWait([&] () { return (FastLock & 0x000fffffu) == 0; });
-    }
-}
-
-void SRWSpinLock::ReadWait()
-{
-    for (;;) {
-        SpinWait([&] () { return (FastLock & 0xfff00000u) == 0; });
-
-        if ((FastLock.fetch_add(1) & 0xfff00000u) == 0) {
-            break;
-        }
-
-        --FastLock;
     }
 }
 

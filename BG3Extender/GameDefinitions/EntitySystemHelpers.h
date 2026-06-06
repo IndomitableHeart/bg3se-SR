@@ -92,6 +92,46 @@ struct ECSChangeLog
     void AddComponentChange(EntityWorld* world, EntityHandle entity, ComponentTypeIndex type, ComponentChangeFlags flags);
 };
 
+struct ECSChangeTracerOptions
+{
+    bool TrackECB{ true };
+    bool TrackImmediateWorldCache{ true };
+    bool TrackReplication{ true };
+    bool TrackModifications{ false };
+    ComponentTypeMask ExcludeModificationTypes;
+};
+
+class ECSChangeTracer
+{
+public:
+    inline ECSChangeTracer(EntitySystemHelpersBase* ecs)
+        : ecs_(ecs)
+    {}
+
+    inline ECSChangeLog& GetLog()
+    {
+        return log_;
+    }
+
+    inline ECSChangeTracerOptions& GetOptions()
+    {
+        return options_;
+    }
+
+    void StartTracing();
+    void StopTracing();
+    void LogECBChanges();
+    void LogImmediateWorldCacheChanges();
+    void LogComponentModifications();
+    void LogReplicatedChanges();
+
+private:
+    EntitySystemHelpersBase* ecs_;
+    ECSChangeLog log_;
+    bool tracing_{ false };
+    ECSChangeTracerOptions options_;
+};
+
 template <class T>
 void EntityProxyDeleteHelper(T** p)
 {
@@ -110,15 +150,17 @@ public:
 
     struct PerComponentData
     {
-        ComponentTypeIndex ComponentIndex{ UndefinedComponent };
-        ReplicationTypeIndex ReplicationIndex{ UndefinedReplicationComponent };
+        std::optional<ComponentTypeIndex> ComponentIndex;
+        std::optional<ReplicationTypeIndex> ReplicationIndex;
         // ID of ECS query that only returns this single component;
         // this is used to avoid brute-forcing the ECS when looking for all entities with a particular component
         QueryIndex SingleComponentQuery{ UndefinedQuery };
-        uint16_t Size{ 0 };
-        lua::GenericPropertyMap* Properties{ nullptr };
+        uint16_t InlineSize{ 0 };
+        uint16_t ExternalSize{ 0 };
         bool IsProxy{ false };
         bool OneFrame{ false };
+        ExtComponentType Type{ 0 };
+        lua::GenericPropertyMap* Properties{ nullptr };
     };
 
     EntitySystemHelpersBase();
@@ -155,35 +197,29 @@ public:
 
     std::optional<ComponentTypeIndex> GetComponentIndex(ExtComponentType type) const;
 
-    inline std::optional<ComponentTypeIndex> GetComponentIndexUnchecked(ExtComponentType type) const
+    inline ComponentTypeIndex GetComponentIndex(ReplicationTypeIndex index) const
     {
-        auto idx = components_[(unsigned)type].ComponentIndex;
-        if (idx != UndefinedComponent) {
-            return idx;
-        } else {
-            return {};
-        }
+        return ecsComponentData_.Get(index).ComponentType;
     }
 
     inline PerComponentData const* GetComponentMeta(ComponentTypeIndex type) const
     {
-        auto extType = ecsComponentData_.Get(type).ExtType;
-        return extType ? &components_[(unsigned)*extType] : nullptr;
+        auto idx = (uint32_t)SparseHashMapHash(type);
+        if (idx < componentMap_.size()) {
+            return componentMap_[idx];
+        } else {
+            return nullptr;
+        }
     }
 
     inline PerComponentData const& GetComponentMeta(ExtComponentType type) const
     {
-        return components_[(unsigned)type];
-    }
-
-    inline std::size_t GetComponentSize(ExtComponentType type) const
-    {
-        return components_[(unsigned)type].Size;
+        return extComponentMap_[(unsigned)type];
     }
 
     std::optional<ReplicationTypeIndex> GetReplicationIndex(ExtComponentType type) const
     {
-        auto idx = components_[(unsigned)type].ReplicationIndex;
+        auto idx = GetComponentMeta(type).ReplicationIndex;
         if (idx != UndefinedReplicationComponent) {
             return idx;
         } else {
@@ -191,15 +227,10 @@ public:
         }
     }
 
-    lua::GenericPropertyMap* GetPropertyMap(ExtComponentType type) const
-    {
-        return components_[(unsigned)type].Properties;
-    }
-
     void BindPropertyMap(ExtComponentType type, lua::GenericPropertyMap* pm)
     {
-        se_assert(components_[(unsigned)type].Properties == nullptr);
-        components_[(unsigned)type].Properties = pm;
+        se_assert(extComponentMap_[(unsigned)type].Properties == nullptr);
+        extComponentMap_[(unsigned)type].Properties = pm;
     }
 
     void ValidatePropertyMapBindings();
@@ -245,9 +276,27 @@ public:
         return static_cast<T*>(CreateComponentRaw(entity, T::ComponentType));
     }
 
-    void* CreateComponentRaw(EntityHandle entity, ExtComponentType type);
+    template <class T>
+    inline T* CreateComponentImmediate(EntityHandle entity)
+    {
+        return static_cast<T*>(CreateComponentImmediateRaw(entity, T::ComponentType));
+    }
 
-    virtual EntityWorld* GetEntityWorld() const = 0;
+    void* CreateComponentRaw(EntityHandle entity, ExtComponentType type);
+    void* CreateComponentImmediateRaw(EntityHandle entity, ExtComponentType type);
+    bool RemoveComponent(EntityHandle entity, ExtComponentType type);
+
+    inline bool HasEntityWorld() const
+    {
+        return World != nullptr;
+    }
+
+    inline EntityWorld* GetEntityWorld() const
+    {
+        assert(World != nullptr); // Should not be called before helpers are initialized
+        return World;
+    }
+
     virtual ExtensionStateBase* GetExtensionState() const = 0;
 
     virtual std::optional<EntityHandle> NetIdToEntity(NetId netId) const = 0;
@@ -266,14 +315,9 @@ public:
         }
     }
 
-    inline void EnableLogging(bool enable)
+    inline ECSChangeTracer& GetTracer()
     {
-        logging_ = enable;
-    }
-
-    inline ECSChangeLog& GetLog()
-    {
-        return log_;
+        return tracer_;
     }
 
     BitSet<> * GetReplicationFlags(EntityHandle const& entity, ExtComponentType type);
@@ -283,6 +327,9 @@ public:
     void NotifyReplicationFlagsDirtied();
 
     void* GetRawComponent(EntityHandle entityHandle, ExtComponentType type);
+    void* GetRawComponent(EntityHandle entityHandle, PerComponentData const& meta);
+    bool MarkComponentAsChanged(EntityHandle entityHandle, ExtComponentType type);
+    bool WasComponentChanged(EntityHandle entityHandle, ExtComponentType type);
     void* GetRawSingleton(ExtComponentType type);
     EntityHandle GetSingletonEntity(ExtComponentType type);
     ecs::SystemTypeEntry* GetSystemEntry(ExtSystemType type);
@@ -307,7 +354,8 @@ public:
         return GetSingletonEntity(T::ComponentType);
     }
 
-    void Update();
+    void Bind();
+    void PreUpdate();
     void PostUpdate();
     void OnFlushECBs();
     void OnInit();
@@ -316,6 +364,10 @@ public:
     bool SetSystemUpdateHook(SystemTypeIndex system, std::function<SystemHookProc> preUpdate, std::function<SystemHookProc> postUpdate);
 
 protected:
+    // Fetch EntityWorld from EocServer/EocClient; needed to bootstrap entity helpers
+    // so we can cache the EntityWorld pointer
+    virtual EntityWorld* GetEngineEntityWorld() const = 0;
+
     void MapComponentIndices(char const* componentName, ExtComponentType type, std::size_t size, bool isProxy, bool oneFrame);
     void MapResourceManagerIndex(char const* componentName, ExtResourceManagerType type);
     void MapSystemIndex(char const* systemName, ExtSystemType type);
@@ -324,8 +376,8 @@ protected:
     void ValidateMappedComponentSizes();
     bool ValidateMappedComponentSize(ecs::EntityWorld* world, ComponentTypeIndex typeId, ExtComponentType extType);
     void ValidateECBFlushChanges();
-    void ValidateEntityChanges();
-    void ValidateEntityChanges(ImmediateWorldCache::Changes& changes);
+    void ValidateImmediateWorldCacheChanges();
+    void ValidateImmediateWorldCacheChanges(ImmediateWorldCache::Changes& changes);
     void UpdateQueryCache();
     void MapSingleComponentQuery(QueryIndex query, ComponentTypeIndex component);
 
@@ -343,6 +395,7 @@ private:
         std::function<SystemHookProc> PostUpdate;
     };
 
+    EntityWorld* World{ nullptr };
     std::unordered_map<STDString, IndexMappings> componentNameToIndexMappings_;
     ECSComponentDataMap ecsComponentData_;
     std::unordered_map<STDString, SystemTypeIndex> systemIndexMappings_;
@@ -353,21 +406,22 @@ private:
     bool initialized_{ false };
     bool queryCacheInitialized_{ false };
     bool validated_{ false };
-    bool logging_{ false };
-
-    std::array<PerComponentData, (size_t)ExtComponentType::Max> components_;
-    std::array<resource::StaticDataTypeIndex, (size_t)ExtResourceManagerType::Max> staticDataIndices_;
-    std::array<SystemTypeIndex, (size_t)ExtSystemType::Max> systemIndices_;
 
     std::unordered_map<BaseSystem*, SystemTypeIndex> systemToId_;
     std::vector<SystemHook> systemHooks_;
 
-    ECSChangeLog log_;
+    std::array<PerComponentData, (size_t)ExtComponentType::Max> extComponentMap_;
+    std::array<resource::StaticDataTypeIndex, (size_t)ExtResourceManagerType::Max> staticDataIndices_;
+    std::array<SystemTypeIndex, (size_t)ExtSystemType::Max> systemIndices_;
+    Array<PerComponentData*> componentMap_;
+
+    ECSChangeTracer tracer_;
 
     void BindSystem(std::string_view name, SystemTypeIndex id);
     void BindStaticData(std::string_view name, resource::StaticDataTypeIndex id);
     void BindComponent(std::string_view name, ComponentTypeIndex id);
     void BindReplication(std::string_view name, ReplicationTypeIndex id);
+    void BindExtComponent(ComponentTypeIndex componentIndex, ExtComponentType type);
     void* GetRawComponent(Guid const& guid, ExtComponentType type);
     void* GetRawComponent(FixedString const& guid, ExtComponentType type);
 
@@ -388,7 +442,7 @@ class ServerEntitySystemHelpers : public EntitySystemHelpersBase
 public:
     void Setup();
 
-    EntityWorld* GetEntityWorld() const override;
+    EntityWorld* GetEngineEntityWorld() const override;
     ExtensionStateBase* GetExtensionState() const override;
     std::optional<EntityHandle> NetIdToEntity(NetId netId) const override;
     std::optional<NetId> EntityToNetId(EntityHandle entity) const override;
@@ -399,7 +453,7 @@ class ClientEntitySystemHelpers : public EntitySystemHelpersBase
 public:
     void Setup();
 
-    EntityWorld* GetEntityWorld() const override;
+    EntityWorld* GetEngineEntityWorld() const override;
     ExtensionStateBase* GetExtensionState() const override;
     std::optional<EntityHandle> NetIdToEntity(NetId netId) const override;
     std::optional<NetId> EntityToNetId(EntityHandle entity) const override;

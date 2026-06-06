@@ -43,6 +43,12 @@ struct Version
 
 MARK_BY_VALUE_TYPE(Version)
 
+struct AABound
+{
+    glm::vec3 Min;
+    glm::vec3 Max;
+};
+
 struct GameRandom
 {
     int* FixedRollList;
@@ -60,13 +66,6 @@ struct CriticalSection : public CRITICAL_SECTION
 {
     __int64 field_28;
     __int64 field_30;
-};
-
-struct SRWLock
-{
-    SRWLOCK SRWLock;
-    int32_t ThreadId;
-    uint32_t EnterCount;
 };
 
 struct AiTilePos

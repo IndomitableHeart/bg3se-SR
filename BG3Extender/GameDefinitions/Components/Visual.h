@@ -120,7 +120,6 @@ struct AnimationBlueprintComponent : public BaseProxyComponent
     [[bg3::hidden]] void* LoadCallback;
     [[bg3::readonly]] int InstanceId;
     [[bg3::readonly]] uint8_t Flags;
-    [[bg3::readonly]] uint64_t field_40;
 };
 
 struct AnimationWaterfallElement
@@ -159,7 +158,6 @@ struct AnimationSetComponent : public BaseComponent
 
     MiniCompactSet<AnimationSetEntry> Entries;
     FixedString FallbackSubSet;
-    [[bg3::hidden]] void* PAD;
 };
 
 DEFINE_TAG_COMPONENT(ls, AnimationUpdateComponent, AnimationUpdate)
@@ -481,7 +479,6 @@ struct DecalComponent : public BaseProxyComponent
     DEFINE_COMPONENT(Decal, "ls::DecalComponent")
 
     DecalObject* Decal;
-    __int64 field_8;
 };
 
 struct CullComponent : public BaseComponent
@@ -580,6 +577,7 @@ struct Construction : public ProtectedGameObject<Construction>
     ConstructionTemplate* Template;
 };
 
+// Editor only system :(
 struct ConstructionSystem : public BaseSystem
 {
     DEFINE_SYSTEM(Construction, "ls::ConstructionSystem")
@@ -769,9 +767,9 @@ struct EquipmentVisualSlot
 {
     EntityHandle Item;
     Array<EntityHandle> SubVisuals;
-    EquipmentVisualSlotRequest* VisualRequest;
+    EquipmentVisualSlotRequest* VisualRequest{ nullptr };
     std::optional<EquipmentVisualRequest> VisualData;
-    [[bg3::legacy(field_20)]] bool Loaded;
+    [[bg3::legacy(field_20)]] bool Loaded{ false };
 };
 
 struct EquipmentVisualsComponent : public BaseComponent

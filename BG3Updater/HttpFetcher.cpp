@@ -52,6 +52,15 @@ OperationResult HttpFetcher::Fetch(std::string const& url, std::vector<char> & r
     curl_easy_setopt(curl_, CURLOPT_FAILONERROR, 1l);
     curl_easy_setopt(curl_, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
     curl_easy_setopt(curl_, CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA | CURLSSLOPT_REVOKE_BEST_EFFORT);
+    // Follow HTTP redirects.  Norbyte's original server (update.norbyte.dev)
+    // serves files directly, so this wasn't needed upstream.  GitHub's
+    // releases/download/... URLs return a 302 to objects.githubusercontent.com,
+    // so without this the loader saves the redirect response (small HTML)
+    // as the .package file, then VerifySignedFile complains "not
+    // cryptographically signed" because the magic bytes aren't at the
+    // expected offset in that HTML blob.  Cap at 8 hops as a sanity bound.
+    curl_easy_setopt(curl_, CURLOPT_FOLLOWLOCATION, 1l);
+    curl_easy_setopt(curl_, CURLOPT_MAXREDIRS, 8l);
 
     if (Timeout) {
         curl_easy_setopt(curl_, CURLOPT_TIMEOUT_MS, *Timeout);

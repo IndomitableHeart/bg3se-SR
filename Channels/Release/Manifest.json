@@ -23,12 +23,12 @@
       "InstallPath": "Data/Mods/BG3Access_a8cddf0c-2e61-1b7c-5c0c-275d46073949",
       "Versions": [
         {
-          "Version": "0.1.4.0",
+          "Version": "0.1.5.0",
           "MinGameVersion": "4.65.83.0",
-          "URL": "https://github.com/IndomitableHeart/BG3Access/releases/download/v0.1.4/BG3Access-mod-0.1.4.package",
-          "Digest": "26ad0298d1e7a7d8239799df78590c57acb75c75d580efe67565a3c1e354447b",
-          "Signature": "3153474228f522d3add3c3f6efb5d9961e74ccdd85c00a3674d6053354a3ca62dca046175a6c0998c6b34e61d4fbbe80a25d0d5df8113ad9dbe992b99ade503f39c360be0162cd6301",
-          "BuildDate": 134253423358312016,
+          "URL": "https://github.com/IndomitableHeart/BG3Access/releases/download/v0.1.5/BG3Access-mod-0.1.5.package",
+          "Digest": "301e2970dc563df25af995f0f5f70e0a2cf4d6d71928e431d5690b2f5dabb1f4",
+          "Signature": "31534742f7c5d9f14a5e4d1e3ad5543b089496dc738ebfe301bfa86cd406b46c06ee897ccc8fa9467cc10da86774c47416fee7107ebed7762f490567777f54f7eb060df301cfe26301",
+          "BuildDate": 134253497000268720,
           "Notice": ""
         }
       ]

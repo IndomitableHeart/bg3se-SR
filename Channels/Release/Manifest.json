@@ -7,12 +7,12 @@
       "Name": "ScriptExtender",
       "Versions": [
         {
-          "Version": "0.1.1.0",
+          "Version": "0.1.3.0",
           "MinGameVersion": "4.65.83.0",
-          "URL": "https://github.com/IndomitableHeart/bg3se-SR/releases/download/v0.1.1/bg3se-SR-extender-0.1.1.package",
-          "Digest": "030195425241d28a56df631dd75e415567509fb4ae986b7b35c1762c279a3a27",
-          "Signature": "31534742a8c67d9e80dccdd3f12efa2f47e91ce5a64ae7862fe541482b73e5c855773b5cf63785ecfa601d3507847b8fd477cb9eb9b428b03e54b7cf6f46757ae963f04c01e0894800",
-          "BuildDate": 134252510713275056,
+          "URL": "https://github.com/IndomitableHeart/bg3se-SR/releases/download/v0.1.3/bg3se-SR-extender-0.1.3.package",
+          "Digest": "b202aefb5f2857fb8bb85f93b24f46124713a05c16ea0a16220a2d88b6a63d0d",
+          "Signature": "31534742b5cc5395d2d87006448d1fb09f491e8784756a0a692b14796b44fdd8b53ad602ce3e4289ca33e4ceb12b118101cb1618fa25e8a1310a70fa9eabc2fb989020260153aa4700",
+          "BuildDate": 134253356411413968,
           "Notice": ""
         }
       ]
@@ -23,12 +23,12 @@
       "InstallPath": "Data/Mods/BG3Access_a8cddf0c-2e61-1b7c-5c0c-275d46073949",
       "Versions": [
         {
-          "Version": "0.1.2.0",
+          "Version": "0.1.3.0",
           "MinGameVersion": "4.65.83.0",
-          "URL": "https://github.com/IndomitableHeart/BG3Access/releases/download/v0.1.2/BG3Access-mod-0.1.2.package",
-          "Digest": "af5c65aba19a4040b306ad080cbfdc57d7dd58234672c9f0865eb92263fe0566",
-          "Signature": "3153474229c088603a268be7abb0911a3e1854b553910e072431694f48ec1d4631d47c3f1a012461d1c80dcca328449b6b011aaf4e8154e6a8319d7595ae0e7edf09fa850190c36301",
-          "BuildDate": 134253280094885952,
+          "URL": "https://github.com/IndomitableHeart/BG3Access/releases/download/v0.1.3/BG3Access-mod-0.1.3.package",
+          "Digest": "a98d832e2662a6aaa5c8b82c90c0737509a5a562df0cb0df8f60a81273cc13f9",
+          "Signature": "31534742db8cba9340cc9531afbe13d14ce18e7d1ff922a312d13317f8e399385456e7cf9b8bccad184d6bfbe7bce4680bee305d0051d16220e91df634a28fa94e66de1f0190c96301",
+          "BuildDate": 134253356404130368,
           "Notice": ""
         }
       ]

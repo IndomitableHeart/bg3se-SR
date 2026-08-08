@@ -58,17 +58,34 @@ bool UpdateTranslatedString(FixedString handle, char const* value)
     return true;
 }
 
-// Resolve a slug / key (e.g. "CRA_Beach_SUB") to its localized string.
-// Larian's UI passes slugs to SetSubRegionName, and the repository's
-// TextToStringKey map bridges those slugs to RuntimeStringHandles.
-// This convenience chains both lookups in one call so Lua can go
-// straight from slug to displayed text.
-//
-// Note: the declaration in ScriptHelpers.h for a similarly named
-// helper is never defined (dead header entry from an older SE
-// revision), so we perform the lookup inline against the repository
-// HashMap directly.  Empty string returned when the slug isn't
-// registered or the resulting handle has no localization entry.
+LegacyMap<FixedString, TranslatedString>* GetAllTranslatedStringKeys(FixedString key)
+{
+    auto repo = GetStaticSymbols().GetTranslatedStringKeyManager();
+    if (!repo) return {};
+
+    return &repo->Keys;
+}
+
+std::optional<TranslatedString> GetTranslatedStringKey(FixedString key)
+{
+    auto repo = GetStaticSymbols().GetTranslatedStringKeyManager();
+    if (!repo) return {};
+
+    auto ts = repo->Keys.try_get(key);
+    return ts ? *ts : std::optional<TranslatedString>{};
+}
+
+bool UpdateTranslatedStringKey(FixedString key, FixedString ts)
+{
+    auto repo = GetStaticSymbols().GetTranslatedStringKeyManager();
+    if (!repo) return false;
+
+    TranslatedString tsk;
+    tsk.Handle.Handle = ts;
+    repo->Keys.insert(key, tsk);
+    return true;
+}
+
 STDString GetTranslatedStringFromKey(FixedString key, std::optional<char const*> fallbackText)
 {
     auto repo = GetStaticSymbols().GetTranslatedStringRepository();
@@ -92,6 +109,9 @@ void RegisterLocalizationLib()
     MODULE_FUNCTION(GetTranslatedString)
     MODULE_FUNCTION(GetTranslatedStringFromKey)
     MODULE_FUNCTION(UpdateTranslatedString)
+    MODULE_FUNCTION(GetAllTranslatedStringKeys)
+    MODULE_FUNCTION(GetTranslatedStringKey)
+    MODULE_FUNCTION(UpdateTranslatedStringKey)
     END_MODULE()
 }
 

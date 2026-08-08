@@ -502,16 +502,16 @@ struct CustomIconsStorageSingletonComponent : public BaseComponent
     HashMap<Guid, ScratchBuffer> Icons;
 };
 
-struct FogVolumeRequestComponent : public MoveableObject
+struct FogVolumeRequestComponent : public BaseComponent
 {
-    DEFINE_PROXY_COMPONENT(FogVolumeRequest, "eoc::FogVolumeRequestComponent")
+    DEFINE_COMPONENT(FogVolumeRequest, "eoc::FogVolumeRequestComponent")
 
     Guid field_0;
 };
 
-struct CombinedLightComponent : public MoveableObject
+struct CombinedLightComponent : public BaseComponent
 {
-    DEFINE_PROXY_COMPONENT(CombinedLight, "eoc::CombinedLightComponent")
+    DEFINE_COMPONENT(CombinedLight, "eoc::CombinedLightComponent")
 
     EntityHandle Entity;
     BYTE TemplateType;
@@ -530,30 +530,30 @@ struct StandardGameObject : public ProtectedGameObject<StandardGameObject>
     uint16_t GameObjectFlags;
 };
 
-struct ConstructionTile : public StandardGameObject
+struct [[bg3::component]] ConstructionTile : public StandardGameObject
 {
-    DEFINE_COMPONENT(ConstructionTile, "ls::ConstructionTile")
+    DEFINE_PROXY_COMPONENT(ConstructionTile, "ls::ConstructionTile")
 
-    Guid InstanceId;
     EntityHandle Entity;
     EntityHandle field_48;
     ConstructionTileTemplate* Template;
-    FixedString Construction;
-    FixedString field_5C;
+    FixedString ParentTemplate;
+    FixedString TileSetResourceId;
     float Scale;
-    uint8_t Flags;
+    ConstructionTileFlags Flags;
 };
 
-struct ConstructionFilling : public StandardGameObject
+struct [[bg3::component]] ConstructionFilling : public StandardGameObject
 {
-    DEFINE_COMPONENT(ConstructionFilling, "ls::ConstructionFilling")
+    DEFINE_PROXY_COMPONENT(ConstructionFilling, "ls::ConstructionFilling")
 
-    struct Guid InstanceId;
+    Guid InstanceId;
     EntityHandle Entity;
-    ConstructionFillingTemplate* Template;
+    // Editor only
+    // ConstructionFillingTemplate* Template;
     RenderableObject* Renderable;
     RenderableObject* Renderable2;
-    FixedString Construction;
+    FixedString ParentTemplate;
     FixedString FadeGroup;
     FixedString Material;
     FixedString Physics;
@@ -562,32 +562,34 @@ struct ConstructionFilling : public StandardGameObject
     bool WalkOn;
     bool SeeThrough;
     bool Fadeable;
-    bool HierarchyOnlyFade;
+    // Editor only
+    // bool HierarchyOnlyFade;
 };
 
-struct Construction : public ProtectedGameObject<Construction>
+struct [[bg3::component]] Construction : public ProtectedGameObject<Construction>
 {
-    DEFINE_COMPONENT(Construction, "ls::Construction")
+    DEFINE_PROXY_COMPONENT(Construction, "ls::Construction")
 
     [[bg3::hidden]] void* field_0;
-    [[bg3::hidden]] UnknownSignal field_8;
+    // Editor only
+    // [[bg3::hidden]] UnknownSignal field_8;
     Array<EntityHandle> Tiles;
     Array<EntityHandle> Filling;
     Guid InstanceId;
-    ConstructionTemplate* Template;
+    // Editor only
+    // ConstructionTemplate* Template;
 };
 
-// Editor only system :(
 struct ConstructionSystem : public BaseSystem
 {
-    DEFINE_SYSTEM(Construction, "ls::ConstructionSystem")
-
-    HashMap<Guid, EntityHandle> Constructions;
-    HashMap<Guid, EntityHandle> Tiles;
-    HashMap<Guid, EntityHandle> Fillings;
-    HashMap<Guid, EntityHandle> ConstructionUpdateRequests;
+    // Editor only
+    // HashMap<Guid, EntityHandle> Constructions;
+    // HashMap<Guid, EntityHandle> Tiles;
+    // HashMap<Guid, EntityHandle> Fillings;
+    // HashMap<Guid, EntityHandle> ConstructionUpdateRequests;
     [[bg3::hidden]] void* TransformSystem;
-    [[bg3::hidden]] void* PhysicsLoaderSystem;
+    // Editor only
+    // [[bg3::hidden]] void* PhysicsLoaderSystem;
     [[bg3::hidden]] void* PhysicsRequestSystem;
     [[bg3::hidden]] void* VisualChangeRequestSystem;
     [[bg3::hidden]] void* OcclusionSystem;
@@ -595,7 +597,152 @@ struct ConstructionSystem : public BaseSystem
 
 DEFINE_TAG_COMPONENT(ls, IsSeeThroughComponent, IsSeeThrough)
 
+
+struct HLODInstanceData
+{
+    Guid UUID;
+    int Level;
+    // Editor only
+    // uint64_t VersionHash;
+    Array<Guid> Children;
+    Array<Guid> Objects;
+};
+
+struct HLODComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(HLOD, "ls::HLODComponent")
+
+    [[bg3::hidden]] LevelBase* Level;
+    HLODInstanceData Instance;
+    float CullDistanceBias;
+    FixedString UUID;
+    Array<EntityHandle> Children;
+    // Editor only
+    // uint64_t RecursiveHash;
+    // uint64_t BaseHash;
+    // bool Enabled;
+};
+
+struct HLODChildComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(HLODChild, "ls::HLODChildComponent")
+
+    EntityHandle Parent;
+    // Editor only
+    // uint64_t Hash;
+};
+
+struct ClusterBoundComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(ClusterBound, "ls::ClusterBoundComponent")
+
+    AABound Bounds;
+};
+
+struct ClusterBoundMaxComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(ClusterBoundMax, "ls::ClusterBoundMaxComponent")
+
+    float BoundMax;
+};
+
+struct ClusterChildComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(ClusterChild, "ls::ClusterChildComponent")
+
+    EntityHandle Parent;
+};
+
+struct ClusterChildIndexedComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(ClusterChildIndexed, "ls::ClusterChildIndexedComponent")
+
+    int X;
+    int Y;
+    int Z;
+    int Radius;
+};
+
+struct ClusterContainerComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(ClusterContainer, "ls::ClusterContainerComponent")
+
+    HashMap<glm::ivec4, EntityHandle> Clusters;
+};
+
+
+struct ClusterDistMinComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(ClusterDistMin, "ls::ClusterDistMinComponent")
+
+    float DistMin;
+};
+
+struct ClusterDistMaxComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(ClusterDistMax, "ls::ClusterDistMaxComponent")
+
+    float DistMax;
+};
+
+struct ClusterPositionXComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(ClusterPositionX, "ls::ClusterPositionXComponent")
+
+    float X;
+};
+
+struct ClusterPositionYComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(ClusterPositionY, "ls::ClusterPositionYComponent")
+
+    float Y;
+};
+
+struct ClusterPositionZComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(ClusterPositionZ, "ls::ClusterPositionZComponent")
+
+    float Z;
+};
+
+struct ClusterRadiusComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(ClusterRadius, "ls::ClusterRadiusComponent")
+
+    float Radius;
+};
+
+DEFINE_TAG_COMPONENT(ls, ClusterComponent, Cluster)
+DEFINE_TAG_COMPONENT(ls, ClusterAttachRequestComponent, ClusterAttachRequest)
+
+struct LocalBoundComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(LocalBound, "ls::LocalBoundComponent")
+
+    AABound Bounds;
+};
+
+struct OcclusionComponent : public BaseComponent
+{
+    DEFINE_COMPONENT(Occlusion, "ls::OcclusionComponent")
+
+    [[bg3::hidden]] void* OcclusionModel;
+};
+
 END_SE()
+
+BEGIN_NS(ecl)
+
+struct ConstructionSystem : public bg3se::ConstructionSystem
+{
+    DEFINE_SYSTEM(ClientConstruction, "ecl::ConstructionSystem")
+
+    bool RequestSetSeeThrough;
+    bool EnableSeeThrough;
+};
+
+END_NS()
 
 BEGIN_NS(animation)
 

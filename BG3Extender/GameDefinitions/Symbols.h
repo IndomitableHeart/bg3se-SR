@@ -56,6 +56,7 @@ namespace bg3se
         ecl::DragDropManager** ls__gDragDropManager{ nullptr };
 
         TranslatedStringRepository** ls__gTranslatedStringRepository{ nullptr };
+        TranslatedStringKeyManager** ls__gTranslatedStringKeyManager{ nullptr };
 
         GameStateEventManager** ecl__gGameStateEventManager{ nullptr };
         GameStateEventManager** esv__gGameStateEventManager{ nullptr };
@@ -68,10 +69,6 @@ namespace bg3se
 
         ecs::EntityWorld::UpdateProc* ecs__EntityWorld__Update{ nullptr };
         ecs::EntityWorld::FlushECBsProc* ecs__EntityWorld__FlushECBs{ nullptr };
-
-        /*esv::SurfaceActionFactory** esv__SurfaceActionFactory{nullptr};
-        esv::SurfaceActionFactory::CreateActionProc* esv__SurfaceActionFactory__CreateAction{ nullptr };
-        esv::SurfaceManager::AddActionProc* esv__SurfaceManager__AddAction{ nullptr };*/
 
         stats::SpellPrototypeManager** eoc__SpellPrototypeManager{ nullptr };
         stats::SpellPrototype::InitProc* eoc__SpellPrototype__Init{ nullptr };
@@ -255,14 +252,14 @@ namespace bg3se
             }
         }
 
-        /*inline esv::SurfaceActionFactory* GetSurfaceActionFactory() const
+        inline TranslatedStringKeyManager* GetTranslatedStringKeyManager() const
         {
-            if (esv__SurfaceActionFactory != nullptr) {
-                return *esv__SurfaceActionFactory;
+            if (ls__gTranslatedStringKeyManager != nullptr) {
+                return *ls__gTranslatedStringKeyManager;
             } else {
-                return {};
+                return nullptr;
             }
-        }*/
+        }
 
         inline esv::LevelManager* GetServerLevelManager() const
         {
@@ -329,6 +326,7 @@ namespace bg3se
         void CanonicalizePath(STDString & path) const;
         STDString ToPath(StringView path, PathRootType root, bool canonicalize = true) const;
         FileReaderPin MakeFileReader(StringView path, PathRootType root = PathRootType::Data, bool canonicalize = true) const;
+        FileReaderPin MakeFileReaderAbsolute(StringView path) const;
         void DestroyFileReader(FileReader* reader);
         bool FileExists(StringView path, PathRootType root = PathRootType::Data, bool canonicalize = true) const;
     };

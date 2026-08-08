@@ -10513,6 +10513,25 @@ struct HUDWidgetPointers {
     Noesis::Visual* cursorText;
 };
 
+static void TryAssignHUDWidgetByName(
+    HUDWidgetPointers& result,
+    Noesis::Visual* widget,
+    int& foundCount)
+{
+    if (!widget) return;
+    if (!SafeIsUIWidgetType_SEH(widget) || !IsVisibleDP(widget)) return;
+
+    auto name = ReadPropertyAsString(
+        static_cast<Noesis::FrameworkElement*>(widget), "Name");
+    if (name == "PartyLine_c") {
+        if (!result.partyLine) { result.partyLine = widget; foundCount++; }
+    } else if (name == "TargetInfo_c") {
+        if (!result.targetInfo) { result.targetInfo = widget; foundCount++; }
+    } else if (name == "CursorText_c") {
+        if (!result.cursorText) { result.cursorText = widget; foundCount++; }
+    }
+}
+
 // Inner function: single-pass widget lookup for all HUD widgets.
 // Uses std::string (C++ destructor) so it CANNOT live inside __try.
 static HUDWidgetPointers FindHUDWidgets_Inner()
@@ -10523,23 +10542,34 @@ static HUDWidgetPointers FindHUDWidgets_Inner()
     if (!root) return result;
 
     InitFocusProperties(root);
+
+    int foundCount = 0;
+
+    // Fast path: use the event-maintained widget array.  This avoids
+    // GetVisualChildrenCount/GetVisualChild during normal HUD reads.
+    Noesis::Visual* trackedWidgets[32];
+    bool trackedVisible[32];
+    auto trackedCount = ReadTrackedWidgets_SEH(
+        trackedWidgets, trackedVisible, 32);
+    for (int widgetIndex = (int)trackedCount - 1;
+         widgetIndex >= 0 && foundCount < 3; widgetIndex--) {
+        if (!trackedVisible[widgetIndex]) continue;
+        TryAssignHUDWidgetByName(
+            result, trackedWidgets[widgetIndex], foundCount);
+    }
+    if (foundCount >= 3) return result;
+
+    // Fallback: seed-time or handler-missed cases can still be recovered
+    // from the top-level widget container without entering widget subtrees.
     auto container = FindWidgetContainer(root);
     if (!container) return result;
 
     auto widgetCount = SafeGetVisualChildrenCount_SEH(container);
-    int foundCount = 0;
 
     for (int widgetIndex = (int)widgetCount - 1;
          widgetIndex >= 0 && foundCount < 3; widgetIndex--) {
         auto widget = SafeGetVisualChild_SEH(container, widgetIndex);
-        if (!widget) continue;
-        if (!SafeIsUIWidgetType_SEH(widget) || !IsVisibleDP(widget)) continue;
-
-        auto name = ReadPropertyAsString(
-            static_cast<Noesis::FrameworkElement*>(widget), "Name");
-        if (name == "PartyLine_c")  { result.partyLine  = widget; foundCount++; }
-        else if (name == "TargetInfo_c") { result.targetInfo = widget; foundCount++; }
-        else if (name == "CursorText_c") { result.cursorText = widget; foundCount++; }
+        TryAssignHUDWidgetByName(result, widget, foundCount);
     }
     return result;
 }
@@ -11011,6 +11041,101 @@ UserReturn ReadDCPath(
     return ReadDCPath_SEH(L, elem, path);
 }
 
+// ReadTargetHudDCSnapshot: safe combat-target HUD DataContext snapshot.
+//
+// Lua needs current TargetInfo_c / CursorText_c values during D-pad
+// targeting, but must not hold Noesis objects across frames.  This helper
+// locates the top-level HUD widgets once, reads known DataContext paths
+// immediately, and returns plain Lua tables keyed by the original DC path.
+static char const* const kTargetHudTargetDCPaths[] = {
+    "CurrentPlayer.CurrentRegularOrCombatTurnTarget.Name",
+    "CurrentPlayer.CurrentRegularOrCombatTurnTarget.Stats.Health.Value",
+    "CurrentPlayer.CurrentRegularOrCombatTurnTarget.Type",
+    "CurrentPlayer.CurrentRegularOrCombatTurnTarget.Stats.Level.Value",
+    "CurrentPlayer.CurrentRegularOrCombatTurnTarget.Title",
+    "CurrentPlayer.CurrentTarget.EntityHandle",
+    "CurrentPlayer.CurrentTarget.Name",
+};
+
+static char const* const kTargetHudCursorDCPaths[] = {
+    "CurrentPlayer.UIData.ActiveTask.PreviewDescription",
+    "CurrentPlayer.SelectedCharacter.PlayerCharacterProperties.CurrentSpellTask.Name",
+    "CurrentPlayer.SelectedCharacter.PlayerCharacterProperties.CurrentSpellTask.ActionId",
+    "CurrentPlayer.UIData.ActiveTask.TaskObject",
+    "CurrentPlayer.IsRequestingPing",
+    "CurrentPlayer.UIData.HitChanceDesc.ShowDescription",
+    "CurrentPlayer.UIData.HitChanceDesc.TotalHitChance",
+    "CurrentPlayer.UIData.Cursor.Distance",
+    "CurrentPlayer.UIData.HitChanceDesc.Advantages",
+    "CurrentPlayer.UIData.HitChanceDesc.Disadvantages",
+    "CurrentPlayer.UIData.ActiveTask.Info",
+    "CurrentPlayer.UIData.ActiveTask.AoOWarning",
+    "CurrentPlayer.UIData.ActiveTask.SurfaceMessage",
+    "CurrentPlayer.UIData.SurfaceInformation.HasSurface",
+    "CurrentPlayer.UIData.SurfaceInformation.Header",
+    "CurrentPlayer.SelectedCharacter.PlayerCharacterProperties.CurrentSpellTask.IsConcentrationSpell",
+    "CurrentPlayer.SelectedCharacter.ConcentrationSpell.Name",
+    "CurrentPlayer.SelectedCharacter.PlayerCharacterProperties.ModifiedCapabilities",
+    "CurrentPlayer.UIData.ActiveTask.TargetCanBeHealed",
+    "CurrentPlayer.UIData.ActiveTask.TargetHealBlockCause",
+    "CurrentPlayer.CurrentRegularOrCombatTurnTarget.Stats.ArmorClass.Value",
+    "CurrentPlayer.SelectedCharacter.Stats.Level.Value",
+    "CurrentPlayer.CurrentRegularOrCombatTurnTarget.PlayerRelation",
+    "CurrentPlayer.UIData.ActiveTask.ContainerState",
+};
+
+static void PushDCPathTable(
+    lua_State* L,
+    Noesis::Visual* widget,
+    char const* const* paths,
+    int pathCount)
+{
+    lua_createtable(L, 0, pathCount);
+    if (!widget) return;
+
+    auto elem = static_cast<Noesis::FrameworkElement*>(widget);
+    for (int i = 0; i < pathCount; i++) {
+        auto path = paths[i];
+        ReadDCPath_SEH(L, elem, path);
+        lua_setfield(L, -2, path);
+    }
+}
+
+UserReturn ReadTargetHudDCSnapshot(lua_State* L)
+{
+    auto widgets = FindHUDWidgets_SEH();
+    auto targetReader = widgets.targetInfo
+        ? widgets.targetInfo : widgets.cursorText;
+    auto cursorReader = widgets.cursorText
+        ? widgets.cursorText : widgets.targetInfo;
+
+    lua_createtable(L, 0, 4);
+
+    lua_pushboolean(L, widgets.targetInfo != nullptr);
+    lua_setfield(L, -2, "targetWidgetFound");
+
+    lua_pushboolean(L, widgets.cursorText != nullptr);
+    lua_setfield(L, -2, "cursorWidgetFound");
+
+    PushDCPathTable(
+        L,
+        targetReader,
+        kTargetHudTargetDCPaths,
+        (int)(sizeof(kTargetHudTargetDCPaths)
+            / sizeof(kTargetHudTargetDCPaths[0])));
+    lua_setfield(L, -2, "target");
+
+    PushDCPathTable(
+        L,
+        cursorReader,
+        kTargetHudCursorDCPaths,
+        (int)(sizeof(kTargetHudCursorDCPaths)
+            / sizeof(kTargetHudCursorDCPaths[0])));
+    lua_setfield(L, -2, "cursor");
+
+    return 1;
+}
+
 // SEH-wrapped pipeline for ReadElementPath: walk path segments
 // starting from the element itself (NOT from its DataContext).
 // Each segment is looked up via TraverseDCPath_Inner against the
@@ -11131,6 +11256,7 @@ void RegisterUILib()
     MODULE_FUNCTION(GetTooltipPopupRoot)
     // HUD info reader (on-demand, called from RS direction handler)
     MODULE_FUNCTION(ReadHUDInfo)
+    MODULE_FUNCTION(ReadTargetHudDCSnapshot)
     // DC path reader (bypasses TextBlock binding-propagation lag by
     // reading the underlying ViewModel fields directly).  Used by
     // TargetSelect for combat cursor info that updates synchronously

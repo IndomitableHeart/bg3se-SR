@@ -7,12 +7,12 @@
       "Name": "ScriptExtender",
       "Versions": [
         {
-          "Version": "0.1.3.0",
+          "Version": "0.1.5.0",
           "MinGameVersion": "4.65.83.0",
-          "URL": "https://github.com/IndomitableHeart/bg3se-SR/releases/download/v0.1.3/bg3se-SR-extender-0.1.3.package",
-          "Digest": "b202aefb5f2857fb8bb85f93b24f46124713a05c16ea0a16220a2d88b6a63d0d",
-          "Signature": "31534742b5cc5395d2d87006448d1fb09f491e8784756a0a692b14796b44fdd8b53ad602ce3e4289ca33e4ceb12b118101cb1618fa25e8a1310a70fa9eabc2fb989020260153aa4700",
-          "BuildDate": 134253356411413968,
+          "URL": "https://github.com/IndomitableHeart/bg3se-SR/releases/download/v0.1.5/bg3se-SR-extender-0.1.5.package",
+          "Digest": "4f2116298f06857b3239819a488862218e0c32a01f7b158a11954b8fcb4b27f0",
+          "Signature": "31534742374feaa978964f85de03fd2c5426df0e250501461ac8b18d3bade80626e56874f0760350895962ddc9fd0a63120f5d163189dcf1d1b4ad01dc4619afc100090f01f4744800",
+          "BuildDate": 134307832521266048,
           "Notice": ""
         }
       ]

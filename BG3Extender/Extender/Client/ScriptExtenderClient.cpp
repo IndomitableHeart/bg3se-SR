@@ -1,4 +1,7 @@
 #include <stdafx.h>
+#if defined(BG3ACCESS_NATIVE_UI_TRACE)
+#include <Extender/Client/AccessibilityTrace/NativeUITrace.h>
+#endif
 #include <Extender/Client/ScriptExtenderClient.h>
 #include <Extender/ScriptExtender.h>
 #include <Extender/Version.h>
@@ -87,11 +90,17 @@ void ScriptExtender::Initialize()
     gameStateMachineUpdate_.SetPrePostHook(&ScriptExtender::OnPreUpdate, &ScriptExtender::OnUpdate, this);
 
     sdl_.EnableHooks();
+#if defined(BG3ACCESS_NATIVE_UI_TRACE)
+    AccessibilityTrace::Initialize();
+#endif
 }
 
 void ScriptExtender::Shutdown()
 {
     DEBUG("ecl::ScriptExtender::Shutdown: Exiting");
+#if defined(BG3ACCESS_NATIVE_UI_TRACE)
+    AccessibilityTrace::Shutdown();
+#endif
     sdl_.DisableHooks();
     ContextGuardAnyThread _(ContextType::Client);
     ResetExtensionState();
@@ -241,6 +250,9 @@ void ScriptExtender::OnGameStateChanged(GameState fromState, GameState toState)
 
     case GameState::LoadModule:
         gExtender->InitRuntimeLogging();
+#if defined(BG3ACCESS_NATIVE_UI_TRACE)
+        AccessibilityTrace::LogStartupSummary();
+#endif
         break;
 
     case GameState::LoadSession:

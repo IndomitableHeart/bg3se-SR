@@ -1,0 +1,658 @@
+{
+  "schema_version": 1,
+  "milestone": "V6",
+  "evidence_level": 1,
+  "renderer": "dx11",
+  "program": "bg3_dx11.exe",
+  "binary": {
+    "path": "D:\\SteamLibrary\\steamapps\\common\\Baldurs Gate 3\\bin\\bg3_dx11.exe",
+    "file_size": 104363072,
+    "sha256": "e899c67cb90b9c6b0f052e3f758ba8615bc2012e52561c2af2e6a1e06ef61a2f",
+    "product_version": "4.1.1.7398727",
+    "image_base": "0x140000000"
+  },
+  "analysis": {
+    "ghidra_version": "12.1.2 PUBLIC",
+    "project": "D:\\Repositories\\bg3se-SR\\tools\\ghidra_projects\\bg3_accessibility",
+    "program_analyzed_before_v6": true,
+    "full_auto_analysis_rerun": false,
+    "signature_scan_scope": "initialized executable memory blocks in the exact analyzed DX11 program"
+  },
+  "candidates": [
+    {
+      "id": "A-UIWIDGET-CLOSE-COMMIT",
+      "compatible_implementation_locations": [
+        "integrated_se",
+        "se_loaded_companion",
+        "trace_only_standalone"
+      ],
+      "preferred_trace_implementation_location": {
+        "location": "integrated_se",
+        "reason": "The modified extender already owns Detours, startup and shutdown ordering, logging, and automatic native delivery."
+      },
+      "category": "A",
+      "renderer": "dx11",
+      "program": "bg3_dx11.exe",
+      "module": "bg3_dx11.exe",
+      "rva": "0x2110840",
+      "absolute_address": "0x142110840",
+      "recovered_name": "ls.UIWidget close cleanup and WidgetClosing raise (inferred); Ghidra FUN_142110840",
+      "confidence": "high",
+      "semantic_payload_available": [
+        "UIWidget pointer in RCX",
+        "WidgetClosing routed-event identity",
+        "close teardown phase"
+      ],
+      "expected_frequency": "Low; once per concrete UIWidget close path.",
+      "expected_thread": "Client UI thread is the static expectation; runtime thread is unverified.",
+      "lock_reentrancy_concern": "The event is raised before this function enters its own UIWidget critical section, but an outer caller lock cannot be excluded statically.",
+      "representative_xrefs": [
+        "Only direct call from manager-like close owner at RVA 0x20CB780",
+        "Reads WidgetClosing event storage at RVA 0x5F9F150",
+        "Clears focus and context-menu dependency properties during teardown"
+      ],
+      "signature": {
+        "bytes": "48 89 5C 24 08 48 89 6C 24 20 56 57 41 54 41 56 41 57 48 83 EC 50 48 8B F1 E8 00 00 00 00 48 8B F8",
+        "mask": "xxxxxxxxxxxxxxxxxxxxxxxxxx????xxx",
+        "pattern": "48 89 5C 24 08 48 89 6C 24 20 56 57 41 54 41 56 41 57 48 83 EC 50 48 8B F1 E8 ?? ?? ?? ?? 48 8B F8"
+      },
+      "signature_uniqueness_count": 1,
+      "proposed_trace_fields": [
+        "sequence",
+        "thread_id",
+        "candidate_rva",
+        "widget_pointer"
+      ],
+      "proposed_production_use": "A proven trace could replace some close inference and stale panel-handler cleanup, but it cannot replace open discovery by itself.",
+      "reasons_for_hooking": [
+        "The function owns a semantically named WidgetClosing raise and teardown.",
+        "The UIWidget pointer is available at entry.",
+        "The signature is unique in the exact binary."
+      ],
+      "reasons_against_hooking": [
+        "No paired semantic widget-open hub was recovered.",
+        "The function does not expose a screen name or DataContext at entry.",
+        "Runtime thread and outer lock state remain unverified."
+      ],
+      "production_recommendation": "blocked_pending_runtime_trace"
+    },
+    {
+      "id": "A-NOESIS-UNLOADED-TRANSITION",
+      "compatible_implementation_locations": [
+        "integrated_se",
+        "se_loaded_companion",
+        "trace_only_standalone"
+      ],
+      "preferred_trace_implementation_location": {
+        "location": "integrated_se",
+        "reason": "The existing extender already registers FrameworkElement Loaded and Unloaded class handlers, so a native detour should remain subordinate to that host."
+      },
+      "category": "A",
+      "renderer": "dx11",
+      "program": "bg3_dx11.exe",
+      "module": "bg3_dx11.exe",
+      "rva": "0x45AFAE0",
+      "absolute_address": "0x1445AFAE0",
+      "recovered_name": "Noesis FrameworkElement unload transition (inferred); Ghidra FUN_1445afae0",
+      "confidence": "high",
+      "semantic_payload_available": [
+        "FrameworkElement pointer in RCX",
+        "Unloaded routed-event identity",
+        "DataContext clearing path"
+      ],
+      "expected_frequency": "Moderate during template and visual lifecycle changes; not limited to top-level screens.",
+      "expected_thread": "Noesis UI/layout thread is the static expectation; runtime thread is unverified.",
+      "lock_reentrancy_concern": "Runs inside Noesis lifecycle machinery with unknown parent layout and binding locks.",
+      "representative_xrefs": [
+        "Reads Unloaded event storage at RVA 0x5F7ACE0",
+        "TextBlock primary vtable points to it at the inherited lifecycle slot",
+        "Clears DataContext when the inherited-state flag requires it"
+      ],
+      "signature": {
+        "bytes": "48 89 5C 24 08 48 89 74 24 10 57 B8 40 00 00 00 E8 00 00 00 00 48 2B E0 48 8B 15 00 00 00 00 44 8D 40 C8 48 8B F9",
+        "mask": "xxxxxxxxxxxxxxxxx????xxxxxx????xxxxxxx",
+        "pattern": "48 89 5C 24 08 48 89 74 24 10 57 B8 40 00 00 00 E8 ?? ?? ?? ?? 48 2B E0 48 8B 15 ?? ?? ?? ?? 44 8D 40 C8 48 8B F9"
+      },
+      "signature_uniqueness_count": 1,
+      "proposed_trace_fields": [
+        "sequence",
+        "thread_id",
+        "element_pointer",
+        "candidate_rva"
+      ],
+      "proposed_production_use": "None at this stage; the existing class-handler route already reports Loaded and Unloaded with safer host-owned object retention.",
+      "reasons_for_hooking": [
+        "The exact inherited unload transition is recovered rather than guessed from a nearby string.",
+        "The signature is unique."
+      ],
+      "reasons_against_hooking": [
+        "It is generic FrameworkElement lifecycle, not a screen manager.",
+        "It can fire for template descendants and filler elements.",
+        "Calling Noesis inspection APIs here would violate the unknown-lock blocker."
+      ],
+      "production_recommendation": "blocked_redundant_and_lock_sensitive"
+    },
+    {
+      "id": "B-LSLISTBOX-LOCAL-FOCUS-COMMIT",
+      "compatible_implementation_locations": [
+        "integrated_se",
+        "se_loaded_companion",
+        "trace_only_standalone"
+      ],
+      "preferred_trace_implementation_location": {
+        "location": "integrated_se",
+        "reason": "The extender already transports focus facts and can log the two entry pointers without calling Lua or Noesis APIs from the hook."
+      },
+      "category": "B",
+      "renderer": "dx11",
+      "program": "bg3_dx11.exe",
+      "module": "bg3_dx11.exe",
+      "rva": "0x2150550",
+      "absolute_address": "0x142150550",
+      "recovered_name": "ls.LSListBox LocalFocus commit and LocalFocusChanged raise (inferred); Ghidra FUN_142150550",
+      "confidence": "high",
+      "semantic_payload_available": [
+        "LSListBox pointer in RCX",
+        "candidate new focus pointer in RDX",
+        "old LocalFocus pointer at object offset 0x10",
+        "LocalFocus and LocalFocusChanged registered identities"
+      ],
+      "expected_frequency": "Low; one call per LSListBox local-focus commitment.",
+      "expected_thread": "Client UI thread is the static expectation; runtime thread is unverified.",
+      "lock_reentrancy_concern": "No explicit critical section appears in the function, but it calls Noesis dependency-property and routed-event machinery.",
+      "representative_xrefs": [
+        "Reads LocalFocus storage at RVA 0x5F9F720",
+        "Reads LocalFocusChanged storage at RVA 0x5F9F728",
+        "Normalizes and reference-counts old and new focus objects before raising the event"
+      ],
+      "signature": {
+        "bytes": "40 53 55 48 83 EC 78 48 8B D9 48 89 BC 24 A0 00 00 00 33 C9 48 8B FA E8 00 00 00 00 48 8B D7 48 8B C8 E8 00 00 00 00",
+        "mask": "xxxxxxxxxxxxxxxxxxxxxxxx????xxxxxxx????",
+        "pattern": "40 53 55 48 83 EC 78 48 8B D9 48 89 BC 24 A0 00 00 00 33 C9 48 8B FA E8 ?? ?? ?? ?? 48 8B D7 48 8B C8 E8 ?? ?? ?? ??"
+      },
+      "signature_uniqueness_count": 1,
+      "proposed_trace_fields": [
+        "sequence",
+        "thread_id",
+        "listbox_pointer",
+        "old_focus_pointer",
+        "new_focus_pointer"
+      ],
+      "proposed_production_use": "After runtime proof, replace LSListBox-oriented LocalFocus polling and some settle-based focus inference.",
+      "reasons_for_hooking": [
+        "Old and proposed new semantic focus objects are available before Noesis calls.",
+        "The function commits LocalFocus and raises LocalFocusChanged.",
+        "The signature is unique."
+      ],
+      "reasons_against_hooking": [
+        "Coverage is limited to ls.LSListBox.",
+        "Some radial or template-specific controls may use other focus mechanisms.",
+        "Runtime ordering relative to existing GotFocus and SelectionChanged handlers is unknown."
+      ],
+      "production_recommendation": "promising_pending_runtime_trace"
+    },
+    {
+      "id": "B-LSTREEVIEW-LOCAL-FOCUS-COMMIT",
+      "compatible_implementation_locations": [
+        "integrated_se",
+        "se_loaded_companion",
+        "trace_only_standalone"
+      ],
+      "preferred_trace_implementation_location": {
+        "location": "integrated_se",
+        "reason": "The modified extender already owns focus transport and its Detours lifecycle."
+      },
+      "category": "B",
+      "renderer": "dx11",
+      "program": "bg3_dx11.exe",
+      "module": "bg3_dx11.exe",
+      "rva": "0x2171080",
+      "absolute_address": "0x142171080",
+      "recovered_name": "ls.LSTreeView LocalFocus commit and LocalFocusChanged raise (inferred); Ghidra FUN_142171080",
+      "confidence": "high",
+      "semantic_payload_available": [
+        "LSTreeView pointer in RCX",
+        "candidate new focus pointer in RDX",
+        "old LocalFocus pointer at object offset 0x10",
+        "LocalFocus and LocalFocusChanged registered identities"
+      ],
+      "expected_frequency": "Low; one call per LSTreeView local-focus commitment.",
+      "expected_thread": "Client UI thread is the static expectation; runtime thread is unverified.",
+      "lock_reentrancy_concern": "No explicit critical section appears, but the function enters Noesis property and event code.",
+      "representative_xrefs": [
+        "Reads LocalFocus storage at RVA 0x5F9F9F8",
+        "Reads LocalFocusChanged storage at RVA 0x5F9F9E8",
+        "Parallel structure to the independently recovered LSListBox commit"
+      ],
+      "signature": {
+        "bytes": "48 89 5C 24 10 48 89 6C 24 18 48 89 74 24 20 57 48 83 EC 60 48 8B F9 48 8D A9 58 FD FF FF 33 C9 48 8B F2 E8 00 00 00 00",
+        "mask": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx????",
+        "pattern": "48 89 5C 24 10 48 89 6C 24 18 48 89 74 24 20 57 48 83 EC 60 48 8B F9 48 8D A9 58 FD FF FF 33 C9 48 8B F2 E8 ?? ?? ?? ??"
+      },
+      "signature_uniqueness_count": 1,
+      "proposed_trace_fields": [
+        "sequence",
+        "thread_id",
+        "tree_pointer",
+        "old_focus_pointer",
+        "new_focus_pointer"
+      ],
+      "proposed_production_use": "After runtime proof, replace LSTreeView LocalFocus polling and some visual-tree rediscovery.",
+      "reasons_for_hooking": [
+        "It carries both old and proposed new focus objects.",
+        "Its registered properties and event establish semantics independently of string proximity.",
+        "The signature is unique."
+      ],
+      "reasons_against_hooking": [
+        "Coverage is limited to ls.LSTreeView.",
+        "It is not a universal logical-focus setter.",
+        "Runtime frequency and ordering are unverified."
+      ],
+      "production_recommendation": "promising_pending_runtime_trace"
+    },
+    {
+      "id": "B-NOESIS-SELECTOR-PROPERTY-CHANGE",
+      "compatible_implementation_locations": [
+        "integrated_se",
+        "se_loaded_companion",
+        "trace_only_standalone"
+      ],
+      "preferred_trace_implementation_location": {
+        "location": "integrated_se",
+        "reason": "The extender already registers Selector.SelectionChanged and can compare native evidence without creating a second UI event owner."
+      },
+      "category": "B",
+      "renderer": "dx11",
+      "program": "bg3_dx11.exe",
+      "module": "bg3_dx11.exe",
+      "rva": "0x4641B20",
+      "absolute_address": "0x144641B20",
+      "recovered_name": "Noesis::Selector::OnPropertyChanged (vtable and property-flow inference); Ghidra FUN_144641b20",
+      "confidence": "high",
+      "semantic_payload_available": [
+        "Selector pointer in RCX",
+        "DependencyPropertyChangedEventArgs pointer in RDX",
+        "SelectedIndex and SelectedItem old/new value storage",
+        "SelectionChanged routed-event construction"
+      ],
+      "expected_frequency": "Low after an early SelectedIndex or SelectedItem filter; generic property changes also enter the function.",
+      "expected_thread": "Noesis UI thread is the static expectation; runtime thread is unverified.",
+      "lock_reentrancy_concern": "Runs inside dependency-property change propagation; logging only bounded pointer and scalar fields is acceptable for a trace, while Noesis traversal is blocked.",
+      "representative_xrefs": [
+        "Compares SelectedIndex storage at RVA 0x5F7BBB8",
+        "Compares SelectedItem storage at RVA 0x5F7BBC0",
+        "Constructs and dispatches SelectionChanged storage at RVA 0x5F7BBE0"
+      ],
+      "signature": {
+        "bytes": "48 89 5C 24 08 48 89 74 24 10 57 B8 70 00 00 00 E8 00 00 00 00 48 2B E0 48 8B FA 48 8B D9 E8 00 00 00 00 84 C0",
+        "mask": "xxxxxxxxxxxxxxxxx????xxxxxxxxxx????xx",
+        "pattern": "48 89 5C 24 08 48 89 74 24 10 57 B8 70 00 00 00 E8 ?? ?? ?? ?? 48 2B E0 48 8B FA 48 8B D9 E8 ?? ?? ?? ?? 84 C0"
+      },
+      "signature_uniqueness_count": 1,
+      "proposed_trace_fields": [
+        "sequence",
+        "thread_id",
+        "selector_pointer",
+        "property_pointer",
+        "old_value_bits",
+        "new_value_bits"
+      ],
+      "proposed_production_use": "Potential universal Selector fact source, but the current class handler already provides a safer event-driven path and should remain until runtime evidence shows missing payload or coverage.",
+      "reasons_for_hooking": [
+        "The function covers Noesis Selector rather than one BG3 template.",
+        "The changed-property arguments distinguish selection from unrelated properties.",
+        "The signature is unique."
+      ],
+      "reasons_against_hooking": [
+        "The existing SelectionChanged class handler already covers this semantic event.",
+        "It runs inside property propagation.",
+        "Raw old/new value decoding depends on the selected property's value representation."
+      ],
+      "production_recommendation": "blocked_until_incremental_value_over_existing_handler_is_proven"
+    },
+    {
+      "id": "B-SOFTWARE-CURSOR-TARGET-COMMIT",
+      "compatible_implementation_locations": [
+        "integrated_se",
+        "se_loaded_companion",
+        "trace_only_standalone"
+      ],
+      "preferred_trace_implementation_location": {
+        "location": "integrated_se",
+        "reason": "A future call-site or filtered setter trace should share the extender's existing client lifecycle and logging."
+      },
+      "category": "B",
+      "renderer": "dx11",
+      "program": "bg3_dx11.exe",
+      "module": "bg3_dx11.exe",
+      "rva": "0x2174980",
+      "absolute_address": "0x142174980",
+      "recovered_name": "ls.SoftwareCursor TopFocusedElement refresh and commit (inferred); Ghidra FUN_142174980",
+      "confidence": "medium",
+      "semantic_payload_available": [
+        "SoftwareCursor pointer in RCX",
+        "computed TopFocusedElement in a local variable before the final property setter",
+        "hover and tooltip state transitions"
+      ],
+      "expected_frequency": "Potentially once per cursor refresh or input update; runtime volume is unknown.",
+      "expected_thread": "Client UI/input thread is the static expectation; runtime thread is unverified.",
+      "lock_reentrancy_concern": "The function traverses candidates and calls Noesis focus, hover, tooltip, and dependency-property machinery.",
+      "representative_xrefs": [
+        "Final write uses TopFocusedElement storage at RVA 0x5F9FAD0",
+        "Called from RVA 0x2173F60 and the property callback at RVA 0x2175260",
+        "Paired cleanup path at RVA 0x2174D30"
+      ],
+      "signature": {
+        "bytes": "40 55 53 56 57 41 54 41 55 41 56 41 57 48 8B EC 48 83 EC 68 4C 8B F1 45 33 ED 44 89 6D 50 4C 39 A9 F8 02 00 00",
+        "mask": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "pattern": "40 55 53 56 57 41 54 41 55 41 56 41 57 48 8B EC 48 83 EC 68 4C 8B F1 45 33 ED 44 89 6D 50 4C 39 A9 F8 02 00 00"
+      },
+      "signature_uniqueness_count": 1,
+      "proposed_trace_fields": [
+        "sequence",
+        "thread_id",
+        "cursor_pointer",
+        "committed_target_pointer",
+        "empty_target_boolean"
+      ],
+      "proposed_production_use": "If a bounded call-site trace validates semantics, replace Illithid Powers cursor hashing, per-frame target reconstruction, and part of the settle window.",
+      "reasons_for_hooking": [
+        "The function owns the concrete TopFocusedElement commitment.",
+        "The signature is unique.",
+        "The event directly targets a known accessibility gap."
+      ],
+      "reasons_against_hooking": [
+        "The new target is a local, not an entry argument.",
+        "An entry detour cannot log the semantic target without reading after the original or patching a call site.",
+        "The function may be too frequent and lock-sensitive for direct rich logging."
+      ],
+      "production_recommendation": "blocked_pending_bounded_callsite_or_posthook_design"
+    },
+    {
+      "id": "C-LS-VIEWMODEL-INPC-TYPE-LEAD",
+      "compatible_implementation_locations": [
+        "integrated_se",
+        "se_loaded_companion",
+        "trace_only_standalone"
+      ],
+      "preferred_trace_implementation_location": {
+        "location": "integrated_se",
+        "reason": "If a publisher is later recovered, the extender already owns per-instance INPC subscriptions and safe deferred dispatch."
+      },
+      "category": "C",
+      "renderer": "dx11",
+      "program": "bg3_dx11.exe",
+      "module": "bg3_dx11.exe",
+      "rva": "0x2106190",
+      "absolute_address": "0x142106190",
+      "recovered_name": "ls.ViewModel reflection initializer adding INotifyPropertyChanged; Ghidra FUN_142106190",
+      "confidence": "low",
+      "semantic_payload_available": [
+        "Type registration only",
+        "INotifyPropertyChanged interface identity"
+      ],
+      "expected_frequency": "Startup or first-type-use only; not a runtime property publication path.",
+      "expected_thread": "Type/reflection initialization thread; runtime publication thread does not apply.",
+      "lock_reentrancy_concern": "No useful publication hook exists here; the reflection path itself may hold Noesis type locks.",
+      "representative_xrefs": [
+        "Adds INotifyPropertyChanged type storage at RVA 0x60071E0",
+        "ls.ViewModel type storage at RVA 0x60D2798 has 360 registration and cast references",
+        "INotifyPropertyChanged type storage has 526 registration and cast references"
+      ],
+      "signature": {
+        "bytes": "40 53 48 83 EC 20 48 8B D9 33 C9 E8 00 00 00 00 48 8B D0 48 8B CB E8 00 00 00 00 48 8B 05 00 00 00 00 48 85 C0 75 21",
+        "mask": "xxxxxxxxxxxx????xxxxxxx????xxx????xxxxx",
+        "pattern": "40 53 48 83 EC 20 48 8B D9 33 C9 E8 ?? ?? ?? ?? 48 8B D0 48 8B CB E8 ?? ?? ?? ?? 48 8B 05 ?? ?? ?? ?? 48 85 C0 75 21"
+      },
+      "signature_uniqueness_count": 2,
+      "proposed_trace_fields": [],
+      "proposed_production_use": "None. Continue the existing per-instance INPC subscriptions and owned property-change accumulation.",
+      "reasons_for_hooking": [
+        "It proves that Larian ViewModels share the INotifyPropertyChanged interface contract."
+      ],
+      "reasons_against_hooking": [
+        "It is reflection setup, not property publication.",
+        "The signature has two matches in the exact binary.",
+        "It carries no ViewModel instance, property symbol, or value."
+      ],
+      "production_recommendation": "blocked_nonunique_and_not_a_runtime_hub"
+    },
+    {
+      "id": "D-LS-TICKBEHAVIOR-COMMAND-DISPATCH",
+      "compatible_implementation_locations": [
+        "integrated_se",
+        "se_loaded_companion",
+        "trace_only_standalone"
+      ],
+      "preferred_trace_implementation_location": {
+        "location": "integrated_se",
+        "reason": "The owning behavior and its dependencies already run inside the game and can be mapped by the extender, but this entry point is not the first trace choice."
+      },
+      "category": "D",
+      "renderer": "dx11",
+      "program": "bg3_dx11.exe",
+      "module": "bg3_dx11.exe",
+      "rva": "0x157E440",
+      "absolute_address": "0x14157E440",
+      "recovered_name": "ls.TickBehavior command dispatch callback (inferred); Ghidra FUN_14157e440",
+      "confidence": "high",
+      "semantic_payload_available": [
+        "TickBehavior pointer in RCX",
+        "Command, CommandParameter, and CommandTarget dependency properties are read into locals",
+        "ICommand versus RoutedCommand dispatch branch"
+      ],
+      "expected_frequency": "Low; activation ticks for controls using ls.TickBehavior.",
+      "expected_thread": "Client UI thread is the static expectation; runtime thread is unverified.",
+      "lock_reentrancy_concern": "Reads dependency properties and calls CanExecute and Execute inside the behavior callback.",
+      "representative_xrefs": [
+        "Reads Command storage at RVA 0x5F9E968",
+        "Reads CommandParameter storage at RVA 0x5F9E970",
+        "Reads CommandTarget storage at RVA 0x5F9E978",
+        "Calls RoutedCommand CanExecute at RVA 0x464C9E0 and Execute at RVA 0x464CAB0"
+      ],
+      "signature": {
+        "bytes": "48 89 5C 24 10 48 89 6C 24 18 48 89 74 24 20 57 41 56 41 57 48 83 EC 30 0F 29 74 24 20 4C 8B F1 33 F6 48 81 C1 20 01 00 00",
+        "mask": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "pattern": "48 89 5C 24 10 48 89 6C 24 18 48 89 74 24 20 57 41 56 41 57 48 83 EC 30 0F 29 74 24 20 4C 8B F1 33 F6 48 81 C1 20 01 00 00"
+      },
+      "signature_uniqueness_count": 1,
+      "proposed_trace_fields": [
+        "sequence",
+        "thread_id",
+        "behavior_pointer"
+      ],
+      "proposed_production_use": "Possible coverage for non-routed ICommand activation after a safe payload-recovery strategy exists.",
+      "reasons_for_hooking": [
+        "It covers both routed and non-routed ICommand dispatch owned by TickBehavior.",
+        "The signature is unique."
+      ],
+      "reasons_against_hooking": [
+        "Command and parameter are locals, not entry arguments.",
+        "Recovering them in a hook would require dependency-property reads in the unknown context.",
+        "It covers only activation routed through ls.TickBehavior."
+      ],
+      "production_recommendation": "blocked_entry_payload_insufficient"
+    },
+    {
+      "id": "D-NOESIS-ROUTEDCOMMAND-EXECUTE",
+      "compatible_implementation_locations": [
+        "integrated_se",
+        "se_loaded_companion",
+        "trace_only_standalone"
+      ],
+      "preferred_trace_implementation_location": {
+        "location": "integrated_se",
+        "reason": "The modified extender can reuse CoreLib Wrappers, Microsoft Detours, BG3A_LOG, client initialization, and shutdown without a new loader or updater asset."
+      },
+      "category": "D",
+      "renderer": "dx11",
+      "program": "bg3_dx11.exe",
+      "module": "bg3_dx11.exe",
+      "rva": "0x464CAB0",
+      "absolute_address": "0x14464CAB0",
+      "recovered_name": "Noesis::RoutedCommand::Execute(BaseComponent*, UIElement*) const (vtable/header/call-flow inference); Ghidra FUN_14464cab0",
+      "confidence": "high",
+      "semantic_payload_available": [
+        "RoutedCommand pointer in RCX",
+        "command parameter pointer in RDX",
+        "target UIElement pointer in R8",
+        "Executed routed-event construction and dispatch"
+      ],
+      "expected_frequency": "Low; one call per routed command execution.",
+      "expected_thread": "Client UI thread is the static expectation; runtime thread is unverified.",
+      "lock_reentrancy_concern": "No explicit lock appears before entry. The function enters routed-event dispatch; the trace must log only bounded scalar and pointer fields and must not call Lua, Tolk, or Noesis APIs.",
+      "representative_xrefs": [
+        "Called by ls.TickBehavior at RVA 0x157E440",
+        "Called by Larian UI path at RVA 0x214E8A0",
+        "Paired with RoutedCommand::CanExecute at RVA 0x464C9E0",
+        "Builds Executed routed-event args and routes them to the target"
+      ],
+      "signature": {
+        "bytes": "4D 85 C0 0F 84 00 00 00 00 53 B8 50 00 00 00 E8 00 00 00 00 48 2B E0 49 8B D8 48 89 5C 24 20 48 8B 05 00 00 00 00",
+        "mask": "xxxxx????xxxxxxx????xxxxxxxxxxxxxx????",
+        "pattern": "4D 85 C0 0F 84 ?? ?? ?? ?? 53 B8 50 00 00 00 E8 ?? ?? ?? ?? 48 2B E0 49 8B D8 48 89 5C 24 20 48 8B 05 ?? ?? ?? ??"
+      },
+      "signature_uniqueness_count": 1,
+      "proposed_trace_fields": [
+        "trace_session",
+        "candidate_id",
+        "sequence",
+        "thread_id",
+        "resolved_rva",
+        "command_pointer",
+        "parameter_pointer",
+        "target_pointer"
+      ],
+      "proposed_production_use": "First trace candidate. If coverage is demonstrated, emit an owned command fact to the extender's client transport after returning to a safe host context.",
+      "reasons_for_hooking": [
+        "All three useful semantic pointers are entry arguments.",
+        "The event is bounded and low frequency.",
+        "The signature is unique and the first instructions are relocatable by Microsoft Detours.",
+        "The function has several independent callers beyond one template."
+      ],
+      "reasons_against_hooking": [
+        "It covers RoutedCommand, not every ICommand implementation.",
+        "Pointer identities alone do not provide accessible names.",
+        "Runtime thread, volume, and ordering remain unverified."
+      ],
+      "production_recommendation": "trace_first_then_reassess"
+    },
+    {
+      "id": "E-NOESIS-BINDINGEXPRESSION-UPDATE-TARGET",
+      "compatible_implementation_locations": [
+        "integrated_se",
+        "se_loaded_companion",
+        "trace_only_standalone"
+      ],
+      "preferred_trace_implementation_location": {
+        "location": "integrated_se",
+        "reason": "Any future filtered experiment must share the extender's exact symbol and lifecycle gate; this function is not approved for the first trace."
+      },
+      "category": "E",
+      "renderer": "dx11",
+      "program": "bg3_dx11.exe",
+      "module": "bg3_dx11.exe",
+      "rva": "0x465B530",
+      "absolute_address": "0x14465B530",
+      "recovered_name": "Noesis::BindingExpression::UpdateTarget() const; Ghidra FUN_14465b530",
+      "confidence": "high",
+      "semantic_payload_available": [
+        "BindingExpression pointer in RCX",
+        "target object and dependency property available only through object fields",
+        "target invalidation and evaluation trigger"
+      ],
+      "expected_frequency": "Potentially high across all active bindings.",
+      "expected_thread": "Noesis binding/UI thread is the static expectation; runtime thread is unverified.",
+      "lock_reentrancy_concern": "Runs inside binding invalidation and evaluation with unknown Noesis locks and reentrancy state.",
+      "representative_xrefs": [
+        "BindingExpression vtable RVA 0x5322448 slot 9 points to this function",
+        "Calls internal invalidation at RVA 0x465EAA0",
+        "Calls target evaluation path at RVA 0x465EA00"
+      ],
+      "signature": {
+        "bytes": "40 53 B8 20 00 00 00 E8 00 00 00 00 48 2B E0 48 8B D9 48 8B 49 18 48 85 C9 74 37 48 83 7B 20 00 74 30",
+        "mask": "xxxxxxxx????xxxxxxxxxxxxxxxxxxxxxx",
+        "pattern": "40 53 B8 20 00 00 00 E8 ?? ?? ?? ?? 48 2B E0 48 8B D9 48 8B 49 18 48 85 C9 74 37 48 83 7B 20 00 74 30"
+      },
+      "signature_uniqueness_count": 1,
+      "proposed_trace_fields": [
+        "sequence",
+        "thread_id",
+        "binding_expression_pointer"
+      ],
+      "proposed_production_use": "None without a property-specific prefilter proven to execute before logging and without safe target/value recovery.",
+      "reasons_for_hooking": [
+        "The vtable establishes the exact UpdateTarget identity.",
+        "It is a broad binding target update point.",
+        "The signature is unique."
+      ],
+      "reasons_against_hooking": [
+        "It is too broad and likely hot.",
+        "The final converted value is not an entry argument.",
+        "Filtering requires dereferencing binding internals inside an unknown lock."
+      ],
+      "production_recommendation": "blocked_hot_and_entry_payload_insufficient"
+    },
+    {
+      "id": "E-NOESIS-TEXTBLOCK-PROPERTY-CHANGE",
+      "compatible_implementation_locations": [
+        "integrated_se",
+        "se_loaded_companion",
+        "trace_only_standalone"
+      ],
+      "preferred_trace_implementation_location": {
+        "location": "integrated_se",
+        "reason": "A future Text-only trace can reuse the extender's Detours and logging, but it must not decode Noesis strings inside the hook until lock safety is proven."
+      },
+      "category": "E",
+      "renderer": "dx11",
+      "program": "bg3_dx11.exe",
+      "module": "bg3_dx11.exe",
+      "rva": "0x464F990",
+      "absolute_address": "0x14464F990",
+      "recovered_name": "Noesis::TextBlock::OnPropertyChanged(DependencyPropertyChangedEventArgs const&); Ghidra FUN_14464f990",
+      "confidence": "high",
+      "semantic_payload_available": [
+        "TextBlock pointer in RCX",
+        "DependencyPropertyChangedEventArgs pointer in RDX",
+        "Text dependency-property identity at RVA 0x5F7BE10",
+        "new final Text value storage in the changed-value arguments"
+      ],
+      "expected_frequency": "Moderate after an immediate Text-property filter; all TextBlock property changes enter the function.",
+      "expected_thread": "Noesis UI/layout thread is the static expectation; runtime thread is unverified.",
+      "lock_reentrancy_concern": "Runs during dependency-property notification and text-layout invalidation. No Lua, Tolk, tree walk, reflection, or Noesis string conversion is safe here without additional proof.",
+      "representative_xrefs": [
+        "TextBlock primary vtable RVA 0x531EBA8 slot 7 points to this function",
+        "Branches explicitly on Text storage at RVA 0x5F7BE10",
+        "Marks text layout and formatting state dirty after the commit"
+      ],
+      "signature": {
+        "bytes": "48 89 5C 24 08 48 89 6C 24 10 56 57 41 56 B8 20 00 00 00 E8 00 00 00 00 48 2B E0 48 8B DA 48 8B F9 E8 00 00 00 00 84 C0",
+        "mask": "xxxxxxxxxxxxxxxxxxxx????xxxxxxxxxx????xx",
+        "pattern": "48 89 5C 24 08 48 89 6C 24 10 56 57 41 56 B8 20 00 00 00 E8 ?? ?? ?? ?? 48 2B E0 48 8B DA 48 8B F9 E8 ?? ?? ?? ?? 84 C0"
+      },
+      "signature_uniqueness_count": 1,
+      "proposed_trace_fields": [
+        "sequence",
+        "thread_id",
+        "textblock_pointer",
+        "property_pointer",
+        "old_value_storage_pointer",
+        "new_value_storage_pointer"
+      ],
+      "proposed_production_use": "Fallback only for final localized text that cannot be obtained from semantic ViewModel facts or targeted readers.",
+      "reasons_for_hooking": [
+        "It sees the TextBlock after the final dependency-property value has changed.",
+        "The Text property can be filtered immediately.",
+        "The vtable identity and registered storage independently establish semantics.",
+        "The signature is unique."
+      ],
+      "reasons_against_hooking": [
+        "It is lower-level than command, focus, or ViewModel facts.",
+        "It can be noisy across decorative and transient text.",
+        "Safely copying the final Noesis string needs ABI and lock proof not established here."
+      ],
+      "production_recommendation": "blocked_fallback_pending_filtered_trace_and_safe_value_copy"
+    }
+  ]
+}

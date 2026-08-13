@@ -30,6 +30,7 @@
     <PlatformToolset>v145</PlatformToolset>
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
+    <VCToolsVersion>14.50.35717</VCToolsVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings">
@@ -42,7 +43,10 @@
   <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Game Release|x64'">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
-  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Label="UserMacros">
+    <BG3AccessibilityNativeTrace Condition="'$(BG3AccessibilityNativeTrace)'==''">false</BG3AccessibilityNativeTrace>
+    <BG3AccessibilityNativeTraceDefinitions Condition="'$(Configuration)|$(Platform)'=='Game Debug|x64' and '$(BG3AccessibilityNativeTrace)'=='true'">BG3ACCESS_NATIVE_UI_TRACE;</BG3AccessibilityNativeTraceDefinitions>
+  </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Game Debug|x64'">
     <LinkIncremental>true</LinkIncremental>
     <TargetName>BG3ScriptExtender</TargetName>
@@ -58,7 +62,7 @@
       <PrecompiledHeader>Use</PrecompiledHeader>
       <WarningLevel>Level3</WarningLevel>
       <Optimization>Disabled</Optimization>
-      <PreprocessorDefinitions>ENABLE_SDL;ENABLE_IMGUI;ENABLE_UI;NS_STATIC_LIBRARY;_SILENCE_CXX20_IS_POD_DEPRECATION_WARNING;_SILENCE_STDEXT_HASH_DEPRECATION_WARNINGS;GOOGLE_PROTOBUF_NO_RTTI;IMGUI_DISABLE_OBSOLETE_FUNCTIONS;BG3ACCESS_VERBOSE;_DEBUG;_WINDOWS;_USRDLL;OSI_EOCAPP;OSIINTERFACE_EXPORTS;_SILENCE_CXX17_ITERATOR_BASE_CLASS_DEPRECATION_WARNING;_SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING;_ITERATOR_DEBUG_LEVEL=0;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>$(BG3AccessibilityNativeTraceDefinitions)ENABLE_SDL;ENABLE_IMGUI;ENABLE_UI;NS_STATIC_LIBRARY;_SILENCE_CXX20_IS_POD_DEPRECATION_WARNING;_SILENCE_STDEXT_HASH_DEPRECATION_WARNINGS;GOOGLE_PROTOBUF_NO_RTTI;IMGUI_DISABLE_OBSOLETE_FUNCTIONS;BG3ACCESS_VERBOSE;_DEBUG;_WINDOWS;_USRDLL;OSI_EOCAPP;OSIINTERFACE_EXPORTS;_SILENCE_CXX17_ITERATOR_BASE_CLASS_DEPRECATION_WARNING;_SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING;_ITERATOR_DEBUG_LEVEL=0;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <SDLCheck>true</SDLCheck>
       <AdditionalIncludeDirectories>$(ProjectDir);$(SolutionDir);$(SolutionDir)External\protobuf\include;$(SolutionDir)External\glm;$(SolutionDir)External\Detours\include;$(SolutionDir)External\lua-5.3.6\src;$(SolutionDir)External\rapidjson-master\include;$(SolutionDir)External\NoesisGUI-NativeSDK-win-3.1.7-Indie\Include;$(SolutionDir)External\VulkanSDK\Include;$(SolutionDir)External\SDL2-2.30.1\include;$(SolutionDir)External\imgui;$(SolutionDir)External\optick-master\src</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
@@ -128,6 +132,7 @@ $(SolutionDir)x64\Release\ResourceBundler.exe "$(ProjectDir)LuaScripts" "$(Proje
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="Extender\BuildInfo.h" />
+    <ClInclude Include="Extender\Client\AccessibilityTrace\NativeUITrace.h" />
     <ClInclude Include="Extender\Client\ClientNetworking.h" />
     <ClInclude Include="Extender\Client\ExtensionStateClient.h" />
     <ClInclude Include="Extender\Client\IMGUI\Backends.h" />
@@ -358,6 +363,9 @@ $(SolutionDir)x64\Release\ResourceBundler.exe "$(ProjectDir)LuaScripts" "$(Proje
     <ClInclude Include="stdafx.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="Extender\Client\AccessibilityTrace\NativeUITrace.cpp">
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Game Release|x64'">true</ExcludedFromBuild>
+    </ClCompile>
     <ClCompile Include="Extender\Client\ClientNetworking.cpp" />
     <ClCompile Include="Extender\Client\ExtensionStateClient.cpp" />
     <ClCompile Include="Extender\Client\ScriptExtenderClient.cpp" />
@@ -598,6 +606,9 @@ $(SolutionDir)x64\Release\ResourceBundler.exe "$(ProjectDir)LuaScripts" "$(Proje
   <ItemGroup>
     <Natvis Include="BG3SE.natvis" />
   </ItemGroup>
+  <Target Name="ValidateBG3AccessibilityNativeTrace" BeforeTargets="PrepareForBuild" Condition="'$(BG3AccessibilityNativeTrace)'=='true'">
+    <Error Condition="'$(Configuration)|$(Platform)'!='Game Debug|x64'" Text="BG3AccessibilityNativeTrace is diagnostic-only and requires Game Debug|x64." />
+  </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>

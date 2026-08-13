@@ -107,6 +107,9 @@
     <ClCompile Include="Extender\Client\ScriptExtenderClient.cpp">
       <Filter>Extender\Client</Filter>
     </ClCompile>
+    <ClCompile Include="Extender\Client\AccessibilityTrace\NativeUITrace.cpp">
+      <Filter>Extender\Client</Filter>
+    </ClCompile>
     <ClCompile Include="Extender\Shared\Console.cpp">
       <Filter>Extender\Shared</Filter>
     </ClCompile>
@@ -309,6 +312,9 @@
       <Filter>Extender\Shared</Filter>
     </ClInclude>
     <ClInclude Include="Extender\Client\ExtensionStateClient.h">
+      <Filter>Extender\Client</Filter>
+    </ClInclude>
+    <ClInclude Include="Extender\Client\AccessibilityTrace\NativeUITrace.h">
       <Filter>Extender\Client</Filter>
     </ClInclude>
     <ClInclude Include="Extender\Server\ExtensionStateServer.h">

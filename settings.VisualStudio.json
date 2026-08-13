@@ -1,0 +1,15 @@
+/* Visual Studio Settings File */
+{
+  "debugging.symbols.load.includedModules": [
+    {
+      "enabled": true,
+      "location": "DWrite.dll"
+    }
+  ],
+  "debugging.symbols.location.searchPaths": [
+    {
+      "enabled": true,
+      "location": "D:\\Repositories\\bg3se-SR\\x64\\Game Debug"
+    }
+  ]
+}
